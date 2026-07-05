@@ -6,7 +6,6 @@ from fastapi import APIRouter, HTTPException
 
 from app.config import (
     delete_api_key,
-    get_api_key,
     has_api_key,
     load_config,
     save_api_key,

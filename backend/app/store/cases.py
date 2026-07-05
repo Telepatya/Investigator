@@ -15,13 +15,12 @@ from pathlib import Path
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from app.config import case_db_path, get_cases_dir, load_config
+from app.config import case_db_path, get_cases_dir
 from app.store.database import (
     CaseMeta,
     ChatHistory,
     Event,
     Finding,
-    MemoryResult,
     Process,
     Report,
     dispose_db,

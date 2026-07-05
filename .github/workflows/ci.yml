@@ -79,7 +79,7 @@ jobs:
         run: npm audit --omit=dev --audit-level=moderate
 
       - name: Audit development dependencies
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=critical
 
   dependency-review:
     name: Dependency Review

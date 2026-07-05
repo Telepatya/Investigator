@@ -2216,10 +2216,7 @@ def run_detections_sync(case_id: str) -> int:
                 integrity = str(raw.get("DisableIntegrityChecks") or "").lower()
                 flagged = []
                 if "enabled" in kernel_debug or kernel_debug == "on":
-                    flagged_kd = True
                     flagged.append("Kernel debugging ENABLED")
-                else:
-                    flagged_kd = False
                 if "enabled" in test_signing or test_signing == "on":
                     flagged.append("Test Signing ENABLED (unsigned drivers allowed)")
                 if "enabled" in integrity or integrity == "on" or "disabled by" in integrity:

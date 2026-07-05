@@ -8,7 +8,6 @@ web logs, process listings, network connections and memory analysis.
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from typing import Any
 
@@ -16,7 +15,7 @@ from sqlalchemy import select
 
 from app.memory.explorer import memory_process_candidates
 from app.store import cases as case_store
-from app.store.database import Event, Finding, MemoryResult, Process
+from app.store.database import Event, Finding, Process
 
 SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
