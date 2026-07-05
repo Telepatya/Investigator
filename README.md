@@ -63,6 +63,16 @@ Open **Settings**:
 3. **Run AI analysis** — correlates everything into a report, timeline narrative, and per-finding verdicts.
 4. Explore the **Overview**, **Timeline**, **Process Map**, **Memory**, **Findings**, and **Events** tabs, export the **Report**, or interrogate the case in **AI Chat**.
 
+## Correlation model
+
+Investigator is built around correlation-first analysis. Raw evidence is normalized into common tables for events, processes, memory findings, detections, entities, and report evidence. The deterministic engine then links those records by time, process identity, command line, file path, network endpoint, user, service name, registry key, memory session, and MITRE ATT&CK technique.
+
+Correlation is used to reduce noisy one-off alerts. A single suspicious command, YARA match, handle, network connection, or memory anomaly is treated as a lead. Confidence increases when independent sources agree, such as a process tree plus Sysmon event, a memory VAD plus thread start address, a YARA match plus extracted process/module details, or persistence plus later execution. Benign developer and forensic tooling should usually stay as low-confidence or contextual unless there is stronger evidence of compromise.
+
+The LLM layer runs after deterministic parsing and detection. It receives normalized findings, source events, memory context, process trees, entity relationships, and database search tools. During report generation and chat, the model can query the case database for supporting rows before writing conclusions. This is intended to make the report cautious: findings should describe what was observed, what it may indicate, what evidence supports it, and what follow-up would confirm or dismiss it.
+
+Memory correlation combines MemProcFS process, module, VAD, thread, handle, service, driver, network, forensic CSV, event log, and YARA outputs. When possible, memory findings are attached back to concrete entities such as a process, module, file, service, registry item, command line, or connection. If the source cannot be confidently resolved, Investigator keeps the finding as a standalone memory result instead of inventing a relationship.
+
 ## Requirements
 
 - Python 3.11+
