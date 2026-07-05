@@ -1,0 +1,41 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+*.pyo
+backend/test_data/
+.pytest_cache/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+.pnpm-store/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local app data (should never be committed)
+.investigator/
+cases/
+**/uploads/
+**/derived/
+**/case.db
+*.db
+*.sqlite
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.evtx
+*.raw
+*.dmp
+*.mem
+*.vmem
+*.lime
+*.dd
+
+# Local workspace/test artifacts
+.agents/
+testing/

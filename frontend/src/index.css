@@ -1,0 +1,106 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: radial-gradient(1200px 800px at 15% -10%, #131a2b 0%, #0a0c12 45%, #070810 100%);
+  color: #dfe4ee;
+  font-family: "Inter", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #232a38;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2e3646;
+  background-clip: content-box;
+}
+
+@layer components {
+  .glass {
+    @apply bg-base-800/70 backdrop-blur-xl border border-white/5;
+  }
+  .card {
+    @apply glass rounded-xl shadow-lg;
+  }
+  .btn {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-accent-cyan/90 text-base-900 hover:bg-accent-cyan hover:shadow-glow;
+  }
+  .btn-ghost {
+    @apply btn bg-white/5 text-ink-100 hover:bg-white/10;
+  }
+  .btn-danger {
+    @apply btn bg-sev-critical/80 text-white hover:bg-sev-critical;
+  }
+  .input {
+    @apply w-full bg-base-900/60 border border-white/10 rounded-lg px-3 py-2 text-sm text-ink-50 outline-none focus:border-accent-cyan/60 focus:ring-1 focus:ring-accent-cyan/40 transition;
+  }
+  .label {
+    @apply block text-xs font-semibold uppercase tracking-wider text-ink-300 mb-1.5;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium;
+  }
+}
+
+.vis-timeline {
+  border: none !important;
+  font-family: "Inter", sans-serif !important;
+}
+.vis-item {
+  border-radius: 6px;
+  border-width: 0;
+  font-size: 11px;
+}
+.vis-time-axis .vis-text {
+  color: #8b96b0 !important;
+}
+.vis-time-axis .vis-grid.vis-minor {
+  border-color: rgba(255, 255, 255, 0.04) !important;
+}
+.vis-time-axis .vis-grid.vis-major {
+  border-color: rgba(255, 255, 255, 0.08) !important;
+}
+.vis-panel.vis-center,
+.vis-panel.vis-left,
+.vis-panel.vis-right,
+.vis-panel.vis-top,
+.vis-panel.vis-bottom {
+  border-color: rgba(255, 255, 255, 0.06) !important;
+}
+.vis-labelset .vis-label {
+  color: #b7c0d4 !important;
+  font-size: 11px;
+}
+
+.react-flow__node {
+  font-family: "Inter", sans-serif;
+}
+.react-flow__attribution {
+  display: none;
+}

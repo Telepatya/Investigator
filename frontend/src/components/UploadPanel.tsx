@@ -1,0 +1,213 @@
+import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Upload, HardDrive, FileArchive, Loader2, X } from "lucide-react";
+import { api, uploadFile, wsUrl } from "../lib/api";
+import type { Progress } from "../lib/types";
+
+export function UploadPanel({ caseId }: { caseId: string }) {
+  const qc = useQueryClient();
+  const [open, setOpen] = useState(false);
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const [fileType, setFileType] = useState<"artifact" | "memory">("artifact");
+  const [memoryOptions, setMemoryOptions] = useState({
+    forensicTimeline: false,
+    eventlogs: false,
+  });
+  const [progress, setProgress] = useState<Progress | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const ws = new WebSocket(wsUrl(`/cases/${caseId}/ingestion-ws`));
+    ws.onmessage = (ev) => {
+      const p: Progress = JSON.parse(ev.data);
+      setProgress(p);
+      if (p.done) {
+        qc.invalidateQueries({ queryKey: ["case", caseId] });
+        qc.invalidateQueries({ queryKey: ["cases"] });
+        setTimeout(() => setProgress(null), 4000);
+      } else {
+        qc.invalidateQueries({ queryKey: ["case", caseId] });
+      }
+    };
+    wsRef.current = ws;
+    return () => ws.close();
+  }, [caseId, qc]);
+
+  async function handleFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    for (const file of Array.from(files)) {
+      const isMemory =
+        fileType === "memory" ||
+        /\.(raw|dmp|mem|vmem|lime|bin|img|dd)$/i.test(file.name);
+      setUploadPct(0);
+      try {
+        await uploadFile(
+          caseId,
+          file,
+          isMemory ? "memory" : "artifact",
+          (pct) => setUploadPct(pct),
+          isMemory ? memoryOptions : {},
+        );
+      } finally {
+        setUploadPct(null);
+      }
+    }
+    setOpen(false);
+    qc.invalidateQueries({ queryKey: ["case", caseId] });
+  }
+
+  const busy =
+    uploadPct !== null ||
+    (progress && !progress.done && progress.phase !== "idle");
+
+  return (
+    <>
+      <button className="btn-primary" onClick={() => setOpen(true)}>
+        <Upload size={16} /> Upload evidence
+      </button>
+
+      {busy && progress && (
+        <div className="fixed bottom-5 right-5 z-50 card p-4 w-80">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-sm font-medium text-ink-100 flex items-center gap-2">
+              <Loader2 size={14} className="animate-spin text-accent-cyan" />
+              {progress.phase}
+            </span>
+            <span className="text-xs text-ink-400">
+              {progress.percent >= 0 ? `${Math.round(progress.percent)}%` : ""}
+            </span>
+          </div>
+          <div className="text-xs text-ink-400 mb-2 truncate">{progress.message}</div>
+          <div className="h-1.5 bg-base-900 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-accent-cyan transition-all"
+              style={{ width: `${progress.percent >= 0 ? progress.percent : 30}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {open && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="card p-6 w-full max-w-lg">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-lg font-semibold text-ink-50">Upload evidence</h2>
+              <button className="text-ink-400 hover:text-ink-100" onClick={() => setOpen(false)}>
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              <button
+                onClick={() => setFileType("artifact")}
+                className={`p-3 rounded-lg border text-left transition ${
+                  fileType === "artifact"
+                    ? "border-accent-cyan/50 bg-accent-cyan/10"
+                    : "border-white/5 bg-white/5"
+                }`}
+              >
+                <FileArchive size={18} className="text-accent-cyan" />
+                <div className="text-sm font-medium text-ink-100 mt-1.5">Velociraptor</div>
+                <div className="text-[11px] text-ink-500">ZIP, JSON, JSONL, CSV, EVTX</div>
+              </button>
+              <button
+                onClick={() => setFileType("memory")}
+                className={`p-3 rounded-lg border text-left transition ${
+                  fileType === "memory"
+                    ? "border-accent-violet/50 bg-accent-violet/10"
+                    : "border-white/5 bg-white/5"
+                }`}
+              >
+                <HardDrive size={18} className="text-accent-violet" />
+                <div className="text-sm font-medium text-ink-100 mt-1.5">Memory dump</div>
+                <div className="text-[11px] text-ink-500">RAW, DMP, MEM, VMEM, LIME</div>
+              </button>
+            </div>
+
+            {fileType === "memory" && (
+              <div className="mb-4 space-y-2">
+                <label className="flex items-start gap-3 rounded-lg border border-white/5 bg-white/[0.03] p-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-1 accent-cyan-400"
+                    checked={memoryOptions.forensicTimeline}
+                    onChange={(e) =>
+                      setMemoryOptions((prev) => ({ ...prev, forensicTimeline: e.target.checked }))
+                    }
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm text-ink-100">Parse forensic timeline</span>
+                    <span className="block text-xs text-ink-500">
+                      Copies MemProcFS forensic CSVs, including timeline rows.
+                    </span>
+                  </span>
+                </label>
+                <label className="flex items-start gap-3 rounded-lg border border-white/5 bg-white/[0.03] p-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="mt-1 accent-cyan-400"
+                    checked={memoryOptions.eventlogs}
+                    onChange={(e) =>
+                      setMemoryOptions((prev) => ({ ...prev, eventlogs: e.target.checked }))
+                    }
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm text-ink-100">Extract event logs</span>
+                    <span className="block text-xs text-ink-500">
+                      Copies EVTX files exposed from memory.
+                    </span>
+                  </span>
+                </label>
+              </div>
+            )}
+
+            <div
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOver(false);
+                handleFiles(e.dataTransfer.files);
+              }}
+              onClick={() => inputRef.current?.click()}
+              className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition ${
+                dragOver ? "border-accent-cyan bg-accent-cyan/5" : "border-white/10 hover:border-white/20"
+              }`}
+            >
+              <Upload size={28} className="mx-auto text-ink-400" />
+              <div className="text-sm text-ink-200 mt-3 font-medium">
+                Drop files here or click to browse
+              </div>
+              <div className="text-xs text-ink-500 mt-1">
+                {fileType === "memory"
+                  ? "Large memory dumps are streamed to disk."
+                  : "Multiple files supported."}
+              </div>
+              <input
+                ref={inputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(e) => handleFiles(e.target.files)}
+              />
+            </div>
+
+            {uploadPct !== null && (
+              <div className="mt-4">
+                <div className="text-xs text-ink-400 mb-1">Uploading… {Math.round(uploadPct)}%</div>
+                <div className="h-1.5 bg-base-900 rounded-full overflow-hidden">
+                  <div className="h-full bg-accent-cyan transition-all" style={{ width: `${uploadPct}%` }} />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
