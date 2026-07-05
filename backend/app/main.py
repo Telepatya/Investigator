@@ -112,11 +112,8 @@ if FRONTEND_DIST.exists():
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str) -> FileResponse:
         # SPA fallback for client-side routes; never serve files outside dist
-        candidate = (FRONTEND_DIST / full_path).resolve()
-        if (
-            candidate.is_relative_to(FRONTEND_DIST)
-            and candidate.is_file()
-        ):
+        candidate = os.path.realpath(os.path.join(FRONTEND_DIST, full_path))
+        if candidate.startswith(str(FRONTEND_DIST) + os.sep) and os.path.isfile(candidate):
             return FileResponse(candidate)
         return FileResponse(FRONTEND_DIST / "index.html")
 
