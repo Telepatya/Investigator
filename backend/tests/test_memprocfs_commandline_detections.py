@@ -124,13 +124,13 @@ class MemProcFSCommandlineDetectionTests(unittest.TestCase):
             host=None,
             source="mem-atlas:forensic/csv/timeline_all.csv",
             category="filesystem",
-            entity=r"\Users\roeif\AppData\Local\Temp\tool.exe",
+            entity=r"\Users\analyst\AppData\Local\Temp\tool.exe",
             severity="info",
             summary="MemProcFS NTFS: tool.exe",
             raw={
                 "Type": "NTFS",
                 "Action": "CRE",
-                "Text": r"\1\Users\roeif\AppData\Local\Temp\tool.exe",
+                "Text": r"\1\Users\analyst\AppData\Local\Temp\tool.exe",
                 "memprocfs_csv": "timeline_all.csv",
             },
         ))

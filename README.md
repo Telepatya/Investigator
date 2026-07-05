@@ -2,7 +2,7 @@
 
 **Made by Roei.f**
 
-A fully local DFIR workstation. Ingest Velociraptor collections and raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama or remote OpenAI / Gemini / Claude) reconstruct the machine's story — a full timeline, interactive process maps, MITRE ATT&CK coverage, and a written incident report.
+A fully local DFIR workstation. Ingest Velociraptor(Events & Artifacts) collections and raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama or remote OpenAI / Gemini / Claude) reconstruct the machine's story — a full timeline, interactive process maps, MITRE ATT&CK coverage, and a written incident Summary.
 
 Everything runs on your machine. API keys are stored in your OS credential vault, never on disk in plaintext.
 
@@ -13,7 +13,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 ## Features
 
 - **Bring your own AI.** Ollama (on-device) with live model discovery, or OpenAI, Anthropic, and Google Gemini with per-provider model catalogs and a connection tester.
-- **Velociraptor ingestion.** Offline-collector ZIPs, JSON/JSONL artifact results, CSV, and EVTX are parsed and normalized into a unified event model with full-text search.
+- **Velociraptor ingestion.** Offline-collector ZIPs, JSON/JSONL artifact results, CSV, and EVTX are parsed and normalized into a unified event model with full-text search (Can also be fed Events, Logs and such Manually).
 - **Memory forensics.** MemProcFS process, module, VAD, thread, handle, network, service, and driver maps feed deterministic injection, hollowing, suspicious service, network, and driver heuristics. Executable private-memory candidates are checked against VAD shape, module load order, live thread start addresses, network context, and machine-wide prevalence before escalation.
 - **APT hunting.** YARA sweep of memory using a bundled C2 / offensive-tooling ruleset (Cobalt Strike, Meterpreter, Sliver/Covenant/Havoc, Mimikatz, Rubeus, reflective loaders, shellcode markers) plus your own rules directory.
 - **Deterministic detection engine.** LOLBins, suspicious parent/child chains, masquerading, execution from staging directories, persistence, log clearing, and C2 beaconing — every finding mapped to MITRE ATT&CK before the LLM ever runs.
@@ -83,7 +83,7 @@ Investigator is built around correlation-first analysis. Raw evidence is normali
 
 Correlation is used to reduce noisy one-off alerts. A single suspicious command, YARA match, handle, network connection, or memory anomaly is treated as a lead. Confidence increases when independent sources agree, such as a process tree plus Sysmon event, a memory VAD plus thread start address, a YARA match plus extracted process/module details, or persistence plus later execution. Benign developer and forensic tooling should usually stay as low-confidence or contextual unless there is stronger evidence of compromise.
 
-The LLM layer runs after deterministic parsing and detection. It receives normalized findings, source events, memory context, process trees, entity relationships, and database search tools. During report generation and chat, the model can query the case database for supporting rows before writing conclusions. This is intended to make the report cautious: findings should describe what was observed, what it may indicate, what evidence supports it, and what follow-up would confirm or dismiss it.
+The LLM layer runs after deterministic parsing and detection. It receives normalized findings, source events, memory context, process trees, entity relationships, and database search tools. During report generation and chat, the model can query the case database for supporting rows before writing conclusions. This is intended to make the report cautious: findings should describe what was observed, what it may indicate, what evidence supports it, and what follow-up would confirm or dismiss it - Always Take AI Verdicts & Output with a grain of salt.
 
 Memory correlation combines MemProcFS process, module, VAD, thread, handle, service, driver, network, forensic CSV, event log, and YARA outputs. When possible, memory findings are attached back to concrete entities such as a process, module, file, service, registry item, command line, or connection. If the source cannot be confidently resolved, Investigator keeps the finding as a standalone memory result instead of inventing a relationship.
 
