@@ -6,6 +6,10 @@ A fully local DFIR workstation. Ingest Velociraptor collections and raw memory d
 
 Everything runs on your machine. API keys are stored in your OS credential vault, never on disk in plaintext.
 
+<p align="center">
+  <img src="main.png" alt="Investigator main case overview" width="920">
+</p>
+
 ## Features
 
 - **Bring your own AI.** Ollama (on-device) with live model discovery, or OpenAI, Anthropic, and Google Gemini with per-provider model catalogs and a connection tester.
@@ -15,6 +19,12 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - **Deterministic detection engine.** LOLBins, suspicious parent/child chains, masquerading, execution from staging directories, persistence, log clearing, and C2 beaconing — every finding mapped to MITRE ATT&CK before the LLM ever runs.
 - **AI orchestration.** Map-reduce analysis over the evidence produces an executive summary, a timeline narrative, and per-finding verdicts. During correlation, verdicts, and chat the model can query the case database itself (full-text event search, process trees, memory correlation data, findings, aggregates) through a provider-agnostic tool loop — it pulls the actual log lines behind a claim before committing to it. A retrieval-augmented chat answers questions using the case's own data and keeps a compact rolling memo of long conversations so context truncation doesn't lose the investigation thread.
 - **Slick UI.** Dark, glassmorphic React interface: cases dashboard, overview with verdict banner and ATT&CK heat map, zoomable timeline, interactive React Flow process map with per-process dossiers, memory results, findings, event explorer, report export, and streaming AI chat.
+
+## Screenshots
+
+| Entity map | Timeline |
+| --- | --- |
+| <img src="entitymap.png" alt="Interactive entity map with process relationships" width="460"> | <img src="timeline.png" alt="Investigation timeline view" width="460"> |
 
 ## Quick start
 
@@ -66,6 +76,10 @@ Open **Settings**:
 ## Correlation model
 
 Investigator is built around correlation-first analysis. Raw evidence is normalized into common tables for events, processes, memory findings, detections, entities, and report evidence. The deterministic engine then links those records by time, process identity, command line, file path, network endpoint, user, service name, registry key, memory session, and MITRE ATT&CK technique.
+
+<p align="center">
+  <img src="correlation1.png" alt="Investigator correlation and analysis view" width="920">
+</p>
 
 Correlation is used to reduce noisy one-off alerts. A single suspicious command, YARA match, handle, network connection, or memory anomaly is treated as a lead. Confidence increases when independent sources agree, such as a process tree plus Sysmon event, a memory VAD plus thread start address, a YARA match plus extracted process/module details, or persistence plus later execution. Benign developer and forensic tooling should usually stay as low-confidence or contextual unless there is stronger evidence of compromise.
 
