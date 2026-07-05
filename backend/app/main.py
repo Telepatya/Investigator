@@ -64,9 +64,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Local-only tool: restrict cross-origin reads to our own frontend origins
+# (built app served by this backend, plus the Vite dev server).
+_PORT = os.environ.get("INVESTIGATOR_PORT", "8400")
+ALLOWED_ORIGINS = [
+    f"http://localhost:{_PORT}",
+    f"http://127.0.0.1:{_PORT}",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,7 +101,7 @@ async def health() -> dict:
 
 
 # Serve built frontend if present
-FRONTEND_DIST = Path(__file__).parent.parent.parent / "frontend" / "dist"
+FRONTEND_DIST = (Path(__file__).parent.parent.parent / "frontend" / "dist").resolve()
 if FRONTEND_DIST.exists():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
@@ -101,9 +111,9 @@ if FRONTEND_DIST.exists():
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str) -> FileResponse:
-        # SPA fallback for client-side routes
-        candidate = FRONTEND_DIST / full_path
-        if candidate.exists() and candidate.is_file():
+        # SPA fallback for client-side routes; never serve files outside dist
+        candidate = os.path.realpath(os.path.join(FRONTEND_DIST, full_path))
+        if candidate.startswith(str(FRONTEND_DIST) + os.sep) and os.path.isfile(candidate):
             return FileResponse(candidate)
         return FileResponse(FRONTEND_DIST / "index.html")
 
