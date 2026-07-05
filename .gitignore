@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 backend/test_data/
 .pytest_cache/
+.ruff_cache/
 
 # Node / frontend
 frontend/node_modules/
@@ -17,6 +18,16 @@ frontend/dist/
 Thumbs.db
 
 # Local app data (should never be committed)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
 .investigator/
 cases/
 **/uploads/
@@ -35,6 +46,15 @@ cases/
 *.vmem
 *.lime
 *.dd
+*.aff4
+*.E01
+*.ex01
+*.ad1
+*.pcap
+*.pcapng
+*.zip
+*.7z
+*.rar
 
 # Local workspace/test artifacts
 .agents/

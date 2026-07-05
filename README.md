@@ -43,6 +43,7 @@ Options:
 python run.py --dev          # backend + Vite dev server with hot reload (frontend on :5173)
 python run.py --port 9000    # use a different port
 python run.py --skip-build   # skip rebuilding the frontend
+python run.py --allow-unlocked-deps  # temporary local fallback if Python lock files are not generated yet
 ```
 
 ### Manual start
@@ -50,14 +51,34 @@ python run.py --skip-build   # skip rebuilding the frontend
 ```powershell
 cd backend
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-memory.lock
 .\.venv\Scripts\python.exe -m app.main   # serves API on :8400 (and the built UI if present)
 
 # in another terminal, for UI development:
 cd frontend
-npm install
+npm ci
 npm run dev                               # http://localhost:5173, proxies /api to :8400
 ```
+
+## Dependency Security
+
+Investigator is designed to install reproducible dependencies from lock files, not from floating package ranges. Human-edited Python dependencies live in:
+
+- `backend/requirements.in` for the core backend.
+- `backend/requirements-memory.in` for MemProcFS and YARA memory-forensics extras.
+- `backend/requirements-dev.in` for development and CI tools.
+
+Generate and commit hashed locks after changing any dependency:
+
+```powershell
+cd backend
+python -m pip install uv
+.\scripts\update-locks.ps1
+```
+
+The launcher installs from `backend/requirements-memory.lock` with `pip --require-hashes` and reruns the install only when that lock file changes. The frontend uses the committed `frontend/package-lock.json` and installs with `npm ci`.
+
+Use `python run.py --allow-unlocked-deps` only as a temporary local workaround while creating the first lock files. Do not use that mode for releases or normal installs.
 
 ## Configure the AI
 
@@ -91,7 +112,7 @@ Memory correlation combines MemProcFS process, module, VAD, thread, handle, serv
 
 - Python 3.11+
 - Node.js 18+
-- Optional but recommended: `memprocfs` and `yara-python` (installed automatically by `run.py`). Without them, Velociraptor artifact analysis still works; raw memory-dump parsing and YARA scanning are skipped and reported in the UI health status.
+- Optional but recommended: `memprocfs` and `yara-python` in `backend/requirements-memory.lock`. Without them, Velociraptor artifact analysis still works; raw memory-dump parsing and YARA scanning are skipped and reported in the UI health status.
 
 ## Architecture
 
