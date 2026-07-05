@@ -26,7 +26,7 @@ from app.memory.forensics import (
 from app.memory.memprocfs_runner import MemProcFSRunner, is_memprocfs_available
 from app.memory.yara_scanner import get_scanner
 from app.store import cases as case_store
-from app.store.database import Event, MemoryResult, Process
+from app.store.database import MemoryResult, Process
 
 ProgressCallback = Callable[[str, float, str, bool, str | None], Any]
 

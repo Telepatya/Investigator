@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from typing import Any
 
-from app.config import AppConfig, get_api_key, load_config
+from app.config import AppConfig, load_config
 from app.models.schemas import ModelInfo, ProviderType
 
 

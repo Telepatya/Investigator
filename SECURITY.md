@@ -50,7 +50,7 @@ should still review `git status` and staged diffs before every push.
 API keys configured in the application are stored in the operating system
 credential vault, not in the repository.
 
-## Repository Protections
+## Repository Protection
 
 The project is intended to use:
 
