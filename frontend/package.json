@@ -17,7 +17,7 @@
     "react-router-dom": "^6.28.0",
     "reactflow": "^11.11.4",
     "recharts": "^2.13.3",
-    "vis-data": "^7.1.9",
+    "vis-data": "^8.0.4",
     "vis-timeline": "^7.7.3"
   },
   "devDependencies": {
