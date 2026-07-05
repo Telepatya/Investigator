@@ -247,7 +247,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
         else:
             progress("skipped", 100.0, f"Unsupported file type: {suffix}", False, None)
         session.commit()
-    except Exception as e:
+    except Exception:
         session.rollback()
         raise
     finally:

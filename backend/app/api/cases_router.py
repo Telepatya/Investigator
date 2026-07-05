@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
 
 import aiofiles
 from fastapi import APIRouter, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
 
 from app.config import case_uploads_path
@@ -29,7 +27,7 @@ from app.memory.explorer import (
 )
 from app.models.schemas import CaseCreate
 from app.store import cases as case_store
-from app.store.database import Event, Finding, MemoryResult, Process
+from app.store.database import Event, Finding, MemoryResult
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
 

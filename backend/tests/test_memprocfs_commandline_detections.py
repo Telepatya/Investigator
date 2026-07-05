@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402
+
 from datetime import datetime, timezone
 import tempfile
 import sys
