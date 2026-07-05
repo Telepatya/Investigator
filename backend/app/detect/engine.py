@@ -28,8 +28,31 @@ from app.store.database import Event, Finding, MemoryResult, Process
 
 SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 _RANK_TO_SEVERITY = {v: k for k, v in SEVERITY_RANK.items()}
+EVENT_STREAM_BATCH_SIZE = 10000
 _MEMPROCFS_TIMELINE_SOURCE = ":forensic/csv/timeline"
 _EXECUTABLE_ARTIFACT_RE = re.compile(r"\.(?:exe|dll|ps1|bat|cmd|vbs|js|scr|com)$", re.IGNORECASE)
+_USN_EXECUTABLE_ARTIFACT_RE = re.compile(
+    r"\.(?:exe|dll|sys|scr|com|ps1|psm1|bat|cmd|vbs|vbe|js|jse|wsf|wsh|hta|cpl|msi|jar|lnk)$",
+    re.IGNORECASE,
+)
+_USN_SCRIPT_EXTENSIONS = {
+    ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
+    ".wsf", ".wsh", ".hta", ".scr", ".com", ".cpl", ".lnk",
+}
+_USN_DECOY_EXTENSIONS = {
+    ".txt", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".jpg", ".jpeg", ".png", ".gif", ".zip", ".rar", ".7z", ".iso",
+}
+_USN_TEMPORARY_EXTENSIONS = {
+    ".tmp", ".temp", ".partial", ".part", ".crdownload", ".download",
+}
+_USN_USER_WRITABLE_HINTS = tuple(SUSPICIOUS_EXECUTION_DIRS) + (
+    r"\users\public",
+    r"\downloads",
+    r"\desktop",
+    r"\appdata\local",
+    r"\appdata\roaming",
+)
 _TASK_ACTION_RE = re.compile(r"^(?P<name>.*?)\s+-\s+\[(?P<action>.*?)\]\s+\((?P<meta>.*?)\)\s*$")
 _TASK_ARTIFACT_HINTS = (
     r"\windows\system32\tasks\\",
@@ -188,6 +211,231 @@ def _event_command_text(event: Event, raw: dict[str, Any]) -> str:
 
 def _timeline_action_word(action: str) -> str:
     return {"CRE": "created", "MOD": "modified", "DEL": "deleted"}.get(action.upper(), action.lower())
+
+
+def _is_usn_journal_event(event: Event, raw: dict[str, Any]) -> bool:
+    source = (event.source or "").lower()
+    return bool(raw.get("usn_journal")) or (
+        any(hint in source for hint in ("usn", "$j", "journal"))
+        and bool(_field(raw, "Reason", "UpdateReason", "USNReason", "UsnReasonTokens"))
+    )
+
+
+def _usn_reason_tokens(raw: dict[str, Any]) -> set[str]:
+    tokens = raw.get("UsnReasonTokens")
+    if isinstance(tokens, list):
+        return {str(t).upper() for t in tokens if str(t).strip()}
+    reason = _field(raw, "Reason", "UpdateReason", "USNReason")
+    if not reason:
+        return set()
+    try:
+        number = int(reason, 16) if str(reason).lower().startswith("0x") else int(reason)
+    except ValueError:
+        number = None
+    if number is not None:
+        bit_names = {
+            0x00000100: "FILE_CREATE",
+            0x00000200: "FILE_DELETE",
+            0x00001000: "RENAME_OLD_NAME",
+            0x00002000: "RENAME_NEW_NAME",
+            0x80000000: "CLOSE",
+        }
+        return {name for bit, name in bit_names.items() if number & bit}
+    return {
+        token.upper()
+        for token in re.split(r"[^A-Za-z0-9_]+", reason)
+        if token and token.upper() not in {"USN", "REASON"}
+    }
+
+
+def _usn_path(event: Event, raw: dict[str, Any]) -> str:
+    return _field(
+        raw,
+        "UsnPath", "FullPath", "OSPath", "Path", "TargetFilename", "TargetPath",
+        "FilePath", "Name", "FileName", "Filename",
+    ) or (event.entity or "")
+
+
+def _usn_file_reference(raw: dict[str, Any]) -> str:
+    ref = _field(
+        raw,
+        "UsnFileReference", "FileReferenceNumber", "FileReference", "FileId",
+        "FileID", "FileIdentifier", "MFTReference", "MFTId", "MFTID", "FRN",
+    )
+    if not ref:
+        return ""
+    if ":" in ref:
+        return ref
+    seq = _field(raw, "Sequence", "SequenceNumber", "Seq", "MFTSequence")
+    return f"{ref}:{seq}" if seq else ref
+
+
+def _extension(path: str) -> str:
+    base = _basename(path)
+    m = re.search(r"(\.[A-Za-z0-9]{1,12})$", base)
+    return m.group(1).lower() if m else ""
+
+
+def _is_usn_executable_path(path: str) -> bool:
+    return bool(_USN_EXECUTABLE_ARTIFACT_RE.search(path or ""))
+
+
+def _is_user_writable_path(path: str) -> bool:
+    npath = _normalize_path(path)
+    return any(hint in npath for hint in _USN_USER_WRITABLE_HINTS)
+
+
+def _is_double_extension(path: str) -> bool:
+    base = _basename(path)
+    parts = base.lower().split(".")
+    if len(parts) < 3:
+        return False
+    return f".{parts[-2]}" in _USN_DECOY_EXTENSIONS and f".{parts[-1]}" in _USN_SCRIPT_EXTENSIONS
+
+
+def _is_powershell_policy_test_artifact(path: str) -> bool:
+    base = _basename(path).lower()
+    return base.startswith("__psscriptpolicytest_") and ".ps1" in base
+
+
+def _is_high_value_usn_rename(old_path: str, new_path: str) -> bool:
+    if not _is_usn_executable_path(new_path):
+        return False
+    old_ext = _extension(old_path)
+    new_ext = _extension(new_path)
+    if not new_ext or old_ext == new_ext:
+        return False
+    if old_ext in _USN_TEMPORARY_EXTENSIONS:
+        return False
+    if _is_double_extension(new_path):
+        return True
+    return old_ext in _USN_DECOY_EXTENSIONS and new_ext in _USN_SCRIPT_EXTENSIONS
+
+
+def _usn_create_severity(path: str) -> str | None:
+    if not _is_usn_executable_path(path) or not _is_user_writable_path(path):
+        return None
+    if _is_powershell_policy_test_artifact(path):
+        return None
+    if _is_double_extension(path):
+        return "low"
+    return None
+
+
+def _check_usn_journal_event(
+    session,
+    existing: set[tuple[str, str]],
+    event: Event,
+    raw: dict[str, Any],
+    evidence: dict[str, Any],
+) -> None:
+    if not _is_usn_journal_event(event, raw):
+        return
+    tokens = _usn_reason_tokens(raw)
+    path = _usn_path(event, raw)
+    if not path or not _is_usn_executable_path(path):
+        return
+    if "FILE_CREATE" in tokens:
+        severity = _usn_create_severity(path)
+        if not severity:
+            return
+        reason = (
+            "Context: $J USN journal recorded executable/script creation in a "
+            "user-writable path; kept for timeline and execution correlation"
+        )
+        _escalate_event(session, event, severity, reason)
+
+
+def _analyze_usn_rename_chains(
+    session,
+    existing: set[tuple[str, str]],
+    usn_events: list[Event],
+) -> None:
+    old_by_ref: dict[str, Event] = {}
+    fallback_old: list[Event] = []
+
+    def event_sort_key(event: Event) -> tuple[str, int]:
+        ts = event.timestamp.isoformat() if event.timestamp else ""
+        return (ts, event.id or 0)
+
+    for event in sorted(usn_events, key=event_sort_key):
+        raw = event.raw or {}
+        tokens = _usn_reason_tokens(raw)
+        if not (tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}):
+            continue
+        ref = _usn_file_reference(raw)
+        path = _usn_path(event, raw)
+        if "RENAME_OLD_NAME" in tokens:
+            if ref:
+                old_by_ref[ref] = event
+            elif len(fallback_old) < 200:
+                fallback_old.append(event)
+            continue
+        if "RENAME_NEW_NAME" not in tokens:
+            continue
+        old_event = old_by_ref.get(ref) if ref else (fallback_old.pop() if fallback_old else None)
+        if old_event is None:
+            continue
+        old_raw = old_event.raw or {}
+        old_path = _usn_path(old_event, old_raw)
+        if not path or not old_path:
+            continue
+        new_exec = _is_usn_executable_path(path)
+        old_exec = _is_usn_executable_path(old_path)
+        if not new_exec and not old_exec:
+            continue
+        ext_changed = _extension(path) != _extension(old_path)
+        suspicious_path = _is_user_writable_path(path) or _is_user_writable_path(old_path)
+        double_ext = _is_double_extension(path)
+        high_value_rename = _is_high_value_usn_rename(old_path, path)
+        if not high_value_rename:
+            continue
+        severity = "medium"
+        signals = []
+        if ref:
+            signals.append("same FileReferenceNumber links old and new names")
+        if double_ext:
+            signals.append("new name uses a decoy/double extension")
+        elif ext_changed:
+            signals.append("rename changed a decoy document/archive/media extension into a script extension")
+        if suspicious_path:
+            signals.append("rename occurred in a user-writable or staging path")
+        _add_finding(
+            session,
+            existing,
+            title="USN Journal: file renamed to executable/script extension",
+            description=(
+                f"The NTFS $UsnJrnl:$J journal links a rename from {old_path[:300]} "
+                f"to {path[:300]}. This is useful because the journal preserves old/new "
+                "names for the same file reference, exposing extension flips that normal "
+                "directory listings miss. Treat as a medium-confidence lead until execution "
+                "or download evidence corroborates it. Signals: " + "; ".join(signals) + "."
+            ),
+            severity=severity,
+            techniques=["T1036", "T1204"],
+            evidence={
+                "entity": path,
+                "old_path": old_path[:700],
+                "new_path": path[:700],
+                "file_reference": ref or None,
+                "old_event_id": old_event.id,
+                "new_event_id": event.id,
+                "signals": signals,
+            },
+            source=f"event:{event.source}",
+        )
+        _escalate_event(
+            session,
+            old_event,
+            severity,
+            "Detection: $J USN journal rename chain old name for executable/script extension flip",
+        )
+        _escalate_event(
+            session,
+            event,
+            severity,
+            "Detection: $J USN journal rename chain new name is executable/script artifact",
+        )
 
 
 def _parse_memprocfs_task_text(text: str) -> dict[str, Any] | None:
@@ -969,6 +1217,213 @@ def _download_origin(raw: dict[str, Any]) -> str | None:
     return m.group(2)[:300] if m else None
 
 
+def _event_needed_for_provenance(event: Event, raw: dict[str, Any]) -> bool:
+    eid = str(raw.get("EventID") or "")
+    if eid and _eid_channel_ok(raw, eid) and eid in {"11", "12", "13", "4697", "7045"}:
+        return True
+    if _field(raw, "DownloadedFilePath", "Download Path", "TargetPath") and (
+        "download" in (event.source or "").lower() or raw.get("_ZoneIdentifierContent")
+    ):
+        return True
+    if _is_usn_journal_event(event, raw):
+        tokens = _usn_reason_tokens(raw)
+        return bool(
+            tokens & {"FILE_CREATE", "RENAME_NEW_NAME"}
+            and _is_usn_executable_path(_usn_path(event, raw))
+        )
+    return False
+
+
+def _artifact_path_key(path: str) -> str:
+    p = (path or "").strip().strip('"').replace("/", "\\")
+    p = re.sub(r"^\\\\\.\\", "", p)
+    p = re.sub(r"^\\\?\\", "", p)
+    return _normalize_path(p)
+
+
+def _artifact_match_confidence(artifact_path: str, exec_path: str) -> str | None:
+    if not artifact_path or not exec_path:
+        return None
+    artifact_key = _artifact_path_key(artifact_path)
+    exec_key = _artifact_path_key(exec_path)
+    if artifact_key and exec_key and artifact_key == exec_key:
+        return "exact-path"
+    if _basename(artifact_path) != _basename(exec_path):
+        return None
+    tokens = _corr_tokens(_basename(artifact_path))
+    if tokens and tokens & _corr_tokens(_basename(exec_path)):
+        return "distinctive-basename"
+    return None
+
+
+def _collect_file_artifacts(events: list[Event]) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    seen: set[tuple[int | None, str, str]] = set()
+    for event in events:
+        raw = event.raw or {}
+        path = ""
+        kind = ""
+        origin = None
+        dl_path = _field(raw, "DownloadedFilePath", "Download Path", "TargetPath")
+        if dl_path and ("download" in (event.source or "").lower() or raw.get("_ZoneIdentifierContent")):
+            path = dl_path
+            kind = "download"
+            origin = _download_origin(raw)
+        elif _is_usn_journal_event(event, raw):
+            tokens = _usn_reason_tokens(raw)
+            if not (tokens & {"FILE_CREATE", "RENAME_NEW_NAME"}):
+                continue
+            path = _usn_path(event, raw)
+            kind = "USN rename" if "RENAME_NEW_NAME" in tokens else "USN create"
+            if not _is_user_writable_path(path):
+                continue
+        if not path:
+            continue
+        base = _basename(path)
+        if base in _PAIRING_GENERIC_HOSTS or not _DOWNLOAD_PAYLOAD_RE.search(base):
+            continue
+        key = (event.id, kind, _artifact_path_key(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        artifacts.append({
+            "event": event,
+            "path": path,
+            "base": base,
+            "kind": kind,
+            "origin": origin,
+        })
+    return artifacts
+
+
+def _correlate_file_execution_provenance(
+    session,
+    existing: set[tuple[str, str]],
+    events: list[Event],
+    processes: list[Process],
+) -> None:
+    artifacts = _collect_file_artifacts(events)
+    if not artifacts:
+        return
+    executions_by_base: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen_exec: set[tuple[str, int | None, str]] = set()
+    for proc in processes:
+        exec_path = proc.path or proc.name or ""
+        if not exec_path or _basename(exec_path) in _PAIRING_GENERIC_HOSTS:
+            continue
+        key = (proc.session_id, proc.pid, _artifact_path_key(exec_path) or _basename(exec_path))
+        if key in seen_exec:
+            continue
+        seen_exec.add(key)
+        entry = {
+            "path": exec_path,
+            "base": _basename(exec_path),
+            "timestamp": proc.start_time,
+            "severity": proc.severity,
+            "pid": proc.pid,
+            "process": proc.name,
+            "cmdline": proc.cmdline,
+            "session_id": proc.session_id,
+            "event": None,
+        }
+        executions_by_base[entry["base"]].append(entry)
+    for event in events:
+        raw = event.raw or {}
+        eid = str(raw.get("EventID") or "")
+        if eid and not _eid_channel_ok(raw, eid):
+            continue
+        if eid not in {"1", "4688"}:
+            continue
+        image = _field(raw, "Image", "NewProcessName")
+        if not image or _basename(image) in _PAIRING_GENERIC_HOSTS:
+            continue
+        key = ("event", event.id, _artifact_path_key(image) or _basename(image))
+        if key in seen_exec:
+            continue
+        seen_exec.add(key)
+        entry = {
+            "path": image,
+            "base": _basename(image),
+            "timestamp": event.timestamp,
+            "severity": event.severity,
+            "pid": _field(raw, "ProcessId", "NewProcessId") or None,
+            "process": _basename(image),
+            "cmdline": _field(raw, "CommandLine", "Cmdline"),
+            "session_id": None,
+            "event": event,
+        }
+        executions_by_base[entry["base"]].append(entry)
+
+    for artifact in artifacts:
+        event = artifact["event"]
+        best: tuple[float, str, dict[str, Any]] | None = None
+        for execution in executions_by_base.get(artifact["base"], []):
+            confidence = _artifact_match_confidence(artifact["path"], execution["path"])
+            if not confidence:
+                continue
+            if event.timestamp and execution["timestamp"]:
+                gap = (_aware(execution["timestamp"]) - _aware(event.timestamp)).total_seconds()
+                if not (0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S):
+                    continue
+            else:
+                gap = _DOWNLOAD_CORRELATION_WINDOW_S
+            rank = 0 if confidence == "exact-path" else 1
+            score = gap + (rank * _DOWNLOAD_CORRELATION_WINDOW_S)
+            if best is None or score < best[0]:
+                best = (gap, confidence, execution)
+        if not best:
+            continue
+        gap, confidence, execution = best
+        exec_rank = SEVERITY_RANK.get(execution["severity"], 0)
+        artifact_rank = SEVERITY_RANK.get(event.severity, 0)
+        if confidence != "exact-path" and max(exec_rank, artifact_rank) < SEVERITY_RANK["medium"]:
+            continue
+        severity = "high" if max(exec_rank, artifact_rank) >= SEVERITY_RANK["high"] else "medium"
+        gap_txt = "unknown time after" if gap == _DOWNLOAD_CORRELATION_WINDOW_S else (
+            f"{gap/60:.0f} minutes after" if gap < 5400 else f"{gap/3600:.1f} hours after"
+        )
+        _add_finding(
+            session,
+            existing,
+            title=f"File artifact later executed: {artifact['base']}",
+            description=(
+                f"A {artifact['kind']} artifact ({artifact['path'][:300]}) was later executed as "
+                f"{execution['path'][:300]} ({gap_txt} the artifact timestamp). Match confidence: "
+                f"{confidence}. This links filesystem/download evidence to execution, but still "
+                "requires analyst review for expected installers, developer tooling, or admin utilities."
+            ),
+            severity=severity,
+            techniques=["T1204", "T1105"],
+            evidence={
+                "entity": execution["path"],
+                "artifact_path": artifact["path"][:700],
+                "artifact_kind": artifact["kind"],
+                "artifact_event_id": event.id,
+                "execution_path": execution["path"][:700],
+                "execution_pid": execution["pid"],
+                "execution_session_id": execution["session_id"],
+                "execution_event_id": execution["event"].id if execution["event"] else None,
+                "match_confidence": confidence,
+                "gap_seconds": None if gap == _DOWNLOAD_CORRELATION_WINDOW_S else round(gap, 1),
+                "origin_url": artifact["origin"],
+            },
+            source="correlation",
+        )
+        _escalate_event(
+            session,
+            event,
+            severity,
+            f"Correlated: {artifact['kind']} artifact later executed as {execution['base']}",
+        )
+        if execution["event"] is not None:
+            _escalate_event(
+                session,
+                execution["event"],
+                severity,
+                f"Correlated: process execution matched prior {artifact['kind']} artifact",
+            )
+
+
 def _correlate_service_provenance(
     session,
     existing: set[tuple[str, str]],
@@ -983,7 +1438,8 @@ def _correlate_service_provenance(
     installs: dict[str, dict[str, Any]] = {}
     # --- correlation source indexes ---
     downloads: list[tuple[Event, str, set[str]]] = []  # (event, path, tokens)
-    file_creates: dict[str, list[tuple[Event, str]]] = defaultdict(list)  # basename -> (event, creator image)
+    # basename -> (event, creator/provenance label, source label)
+    file_creates: dict[str, list[tuple[Event, str, str]]] = defaultdict(list)
     reg_writes: list[tuple[Event, str, str]] = []  # (event, target_object_lower, writer image)
     proc_creates: list[tuple[Event, str, str]] = []  # (event, image, cmdline)
 
@@ -1015,10 +1471,21 @@ def _correlate_service_provenance(
             if _DOWNLOAD_PAYLOAD_RE.search(base):
                 downloads.append((e, dl_path, _corr_tokens(base)))
             continue
+        if _is_usn_journal_event(e, raw):
+            tokens = _usn_reason_tokens(raw)
+            usn_path = _usn_path(e, raw)
+            usn_base = _basename(usn_path)
+            if (
+                usn_path
+                and _DOWNLOAD_PAYLOAD_RE.search(usn_base)
+                and (tokens & {"FILE_CREATE", "RENAME_NEW_NAME"})
+            ):
+                file_creates[usn_base].append((e, "NTFS $J journal", "USN journal"))
+            continue
         if eid == "11":
             target = _field(raw, "TargetFilename", "Target Filename")
             if target:
-                file_creates[_basename(target)].append((e, _field(raw, "Image")))
+                file_creates[_basename(target)].append((e, _field(raw, "Image"), "Sysmon file-create"))
         elif eid in ("12", "13"):
             target = _field(raw, "TargetObject").lower()
             if "\\services\\" in target:
@@ -1052,16 +1519,19 @@ def _correlate_service_provenance(
 
         # 1. dropper: who wrote the service binary to disk (Sysmon 11)
         droppers: dict[str, list[str]] = defaultdict(list)
+        dropper_sources: dict[str, set[str]] = defaultdict(set)
         for img in slot["images"]:
             base = _basename(_first_exe_token(img))
-            for fc_event, creator in file_creates.get(base, []):
+            for fc_event, creator, source_label in file_creates.get(base, []):
                 if creator and _basename(creator) != "system":
                     droppers[creator].append(base)
+                    dropper_sources[creator].add(source_label)
                     correlated_ids.append(fc_event.id)
         for creator, bases in list(droppers.items())[:3]:
+            source_txt = ", ".join(sorted(dropper_sources.get(creator) or {"file telemetry"}))
             chain_bits.append(
                 f"the service binary ({', '.join(sorted(set(bases))[:3])}) was written to disk "
-                f"by {creator} (Sysmon file-create telemetry)"
+                f"by/observed through {creator} ({source_txt})"
             )
             chain_edges.append({
                 "src_type": "process", "src": creator,
@@ -1515,7 +1985,8 @@ def run_detections_sync(case_id: str) -> int:
         session.commit()
 
         # --- Event heuristics ---
-        events = session.scalars(select(Event)).all()
+        event_stream = session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE))
+        provenance_events: list[Event] = []
         beacon_tracker: dict[str, list[Event]] = defaultdict(list)
         web_ip_tracker: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"total": 0, "errors": 0, "auth_fail": 0, "auth_ok": set(), "events": []}
@@ -1529,13 +2000,21 @@ def run_detections_sync(case_id: str) -> int:
         priv_logons: dict[str, dict[str, Any]] = {}
         # Log-clear events (1102 / wevtutil cl) for the intrusion-window correlation.
         log_clear_marks: list[tuple[Event, str]] = []
+        # NTFS $UsnJrnl:$J rename rows are correlated by FileReferenceNumber after
+        # this event pass, so old/new names become one timeline lead.
+        usn_events: list[Event] = []
 
-        for event in events:
+        for event in event_stream:
             raw = event.raw or {}
+            if _event_needed_for_provenance(event, raw):
+                provenance_events.append(event)
+            is_usn_event = _is_usn_journal_event(event, raw)
             # Memory-pipeline events carry our own descriptive summaries (e.g. "Hidden
             # process detected: lsass.exe ..."); scanning those re-triggers patterns on
             # text that merely describes a finding. Only scan real embedded command lines.
-            if (event.source or "").startswith("memory:") or event.category == "memory":
+            if is_usn_event:
+                summary_text = ""
+            elif (event.source or "").startswith("memory:") or event.category == "memory":
                 summary_text = " ".join(
                     str(v) for v in [raw.get("CommandLine"), raw.get("Cmdline")] if v
                 )
@@ -1545,6 +2024,17 @@ def run_detections_sync(case_id: str) -> int:
                 "event_id": event.id, "entity": event.entity,
                 "source": event.source, "summary": event.summary[:300],
             }
+
+            if is_usn_event:
+                tokens = _usn_reason_tokens(raw)
+                path = _usn_path(event, raw)
+                if tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}:
+                    usn_events.append(event)
+                if _is_usn_executable_path(path) and (
+                    "FILE_CREATE" in tokens or tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}
+                ):
+                    _check_usn_journal_event(session, existing, event, raw, evidence)
+                continue
 
             cross_process_severity = _check_cross_process_event(session, existing, event, raw, evidence)
             if cross_process_severity:
@@ -1817,6 +2307,8 @@ def run_detections_sync(case_id: str) -> int:
                 raddr = str(raw.get("Raddr") or raw.get("raddr") or raw.get("RemoteAddress") or "")
                 if raddr and _addr_scope(raddr) != "local":
                     beacon_tracker[raddr].append(event)
+
+        _analyze_usn_rename_chains(session, existing, usn_events)
 
         # Beacon candidates: >= 5 connections to same endpoint with regular-ish spacing
         # over a meaningful window (a burst within one second is not a beacon).
@@ -2103,22 +2595,28 @@ def run_detections_sync(case_id: str) -> int:
 
         # --- Service provenance: trace installed services back to the dropping /
         # --- installing process and the download the binary came from.
-        _correlate_service_provenance(session, existing, events, processes)
+        _correlate_service_provenance(session, existing, provenance_events, processes)
+        _correlate_file_execution_provenance(session, existing, provenance_events, processes)
 
         # --- Severity taint propagation: events mentioning a flagged process/DLL/file
         # --- name inherit its severity, with provenance recorded on the event.
-        _propagate_flagged_entities(session, events, processes)
+        _propagate_flagged_entities(
+            session,
+            session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)),
+            processes,
+        )
 
         # --- Log-clear-after-activity: a 1102/wevtutil-cl that postdates high/critical
         # --- activity likely caps an active intrusion window (timestamps required).
         if log_clear_marks:
             session.flush()  # the 1102/wevtutil findings may still be pending
-            clear_ids = {id(e) for e, _t in log_clear_marks}
-            hi_events = [
-                e for e in events
-                if e.timestamp and id(e) not in clear_ids
-                and SEVERITY_RANK.get(e.severity, 0) >= SEVERITY_RANK["high"]
-            ]
+            clear_event_ids = {e.id for e, _t in log_clear_marks}
+            hi_events = list(session.scalars(
+                select(Event)
+                .where(Event.severity.in_(["high", "critical"]))
+                .execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)
+            ))
+            hi_events = [e for e in hi_events if e.timestamp and e.id not in clear_event_ids]
             hi_procs = [
                 p for p in processes
                 if p.start_time and SEVERITY_RANK.get(p.severity, 0) >= SEVERITY_RANK["high"]

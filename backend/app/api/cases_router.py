@@ -9,7 +9,7 @@ from pathlib import Path
 import aiofiles
 from fastapi import APIRouter, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
-from sqlalchemy import delete as sqldelete, func, select
+from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
 
 from app.config import case_uploads_path
 from app.detect.entity_graph import build_entity_graph, entity_dossier
@@ -338,6 +338,15 @@ async def run_detections(case_id: str, rebuild: bool = True) -> dict:
             session = case_store.get_session(case_id)
             try:
                 session.execute(sqldelete(Finding))
+                session.execute(
+                    sqlupdate(Event)
+                    .where(
+                        (Event.severity_reason.like("Detection:%"))
+                        | (Event.severity_reason.like("Context:%"))
+                        | (Event.severity_reason.like("Flagged-entity match:%"))
+                    )
+                    .values(severity="info", severity_reason=None)
+                )
                 session.commit()
             finally:
                 session.close()

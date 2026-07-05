@@ -3,18 +3,35 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import traceback
 from pathlib import Path
 from typing import Any, Callable
 
+from sqlalchemy import text
+
 from app.ingest.normalize import parse_timestamp
 from app.ingest.parsers import PARSABLE_EXTENSIONS, _basename, iter_zip_members, parse_file
 from app.store import cases as case_store
-from app.store.database import Process
+from app.store.database import Event, Process
 
 MEMORY_EXTENSIONS = {".raw", ".dmp", ".mem", ".vmem", ".bin", ".img", ".lime", ".dd"}
+DEFAULT_INGEST_BATCH_SIZE = 10000
+MIN_INGEST_BATCH_SIZE = 1000
+MAX_INGEST_BATCH_SIZE = 50000
 
 ProgressCallback = Callable[[str, float, str, bool, str | None], Any]
+
+
+def _ingest_batch_size() -> int:
+    raw = os.environ.get("INVESTIGATOR_INGEST_BATCH_SIZE", "").strip()
+    if not raw:
+        return DEFAULT_INGEST_BATCH_SIZE
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_INGEST_BATCH_SIZE
+    return max(MIN_INGEST_BATCH_SIZE, min(MAX_INGEST_BATCH_SIZE, value))
 
 
 def _is_process_source(source: str) -> bool:
@@ -104,6 +121,30 @@ def _evtx_process_creation(raw: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _add_events_bulk(session, rows: list[dict[str, Any]]) -> None:
+    events = [Event(**row) for row in rows]
+    if not events:
+        return
+    session.add_all(events)
+    session.flush()
+    session.execute(
+        text(
+            "INSERT INTO events_fts(rowid, summary, entity, source, category) "
+            "VALUES (:id, :summary, :entity, :source, :category)"
+        ),
+        [
+            {
+                "id": event.id,
+                "summary": event.summary or "",
+                "entity": event.entity or "",
+                "source": event.source or "",
+                "category": event.category or "",
+            }
+            for event in events
+        ],
+    )
+
+
 def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) -> dict[str, int]:
     """Synchronous ingestion of one uploaded file. Returns counts."""
     session = case_store.get_session(case_id)
@@ -155,8 +196,20 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
 
     def handle_parsed_file(path: Path, source: str) -> None:
         batch = 0
+        batch_size = _ingest_batch_size()
+        pending_events: list[dict[str, Any]] = []
+
+        def flush_batch() -> None:
+            if not pending_events:
+                return
+            _add_events_bulk(session, pending_events)
+            pending_events.clear()
+            session.commit()
+            session.expunge_all()
+            progress("parsing", -1, f"{stats['events']} events from {source}", False, None)
+
         for event_kwargs in parse_file(path, source):
-            case_store.add_event(session, **event_kwargs)
+            pending_events.append(event_kwargs)
             stats["events"] += 1
             batch += 1
             if _is_process_source(source):
@@ -170,10 +223,9 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
                 # Velociraptor JSON exports alike; _evtx_process_creation is a
                 # cheap no-op for anything else.
                 handle_evtx_process(event_kwargs, source)
-            if batch % 2000 == 0:
-                session.commit()
-                progress("parsing", -1, f"{stats['events']} events from {source}", False, None)
-        session.commit()
+            if batch % batch_size == 0:
+                flush_batch()
+        flush_batch()
 
     try:
         suffix = file_path.suffix.lower()

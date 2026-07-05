@@ -68,6 +68,8 @@ def normalize_row(row: dict[str, Any], source: str) -> dict[str, Any]:
     """Convert a raw artifact row into unified Event kwargs."""
     if _is_vr_evtx_row(row):
         return _normalize_vr_evtx_row(row, source)
+    if _is_usn_journal_row(row, source):
+        return _normalize_usn_journal_row(row, source)
     return {
         "timestamp": extract_timestamp(row),
         "host": extract_host(row),
@@ -77,6 +79,139 @@ def normalize_row(row: dict[str, Any], source: str) -> dict[str, Any]:
         "severity": "info",
         "summary": summarize_row(row),
         "raw": _json_safe(row),
+    }
+
+
+_USN_REASON_BITS = {
+    0x00000001: "DATA_OVERWRITE",
+    0x00000002: "DATA_EXTEND",
+    0x00000004: "DATA_TRUNCATION",
+    0x00000100: "FILE_CREATE",
+    0x00000200: "FILE_DELETE",
+    0x00000400: "EA_CHANGE",
+    0x00000800: "SECURITY_CHANGE",
+    0x00001000: "RENAME_OLD_NAME",
+    0x00002000: "RENAME_NEW_NAME",
+    0x00004000: "INDEXABLE_CHANGE",
+    0x00008000: "BASIC_INFO_CHANGE",
+    0x00010000: "HARD_LINK_CHANGE",
+    0x00020000: "COMPRESSION_CHANGE",
+    0x00040000: "ENCRYPTION_CHANGE",
+    0x00080000: "OBJECT_ID_CHANGE",
+    0x00100000: "REPARSE_POINT_CHANGE",
+    0x00200000: "STREAM_CHANGE",
+    0x80000000: "CLOSE",
+}
+
+
+def _row_get(row: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        value = row.get(name)
+        if value not in (None, ""):
+            return value
+    wanted = {name.lower().replace(" ", "").replace("_", "") for name in names}
+    for key, value in row.items():
+        if (
+            isinstance(key, str)
+            and key.lower().replace(" ", "").replace("_", "") in wanted
+            and value not in (None, "")
+        ):
+            return value
+    return None
+
+
+def _usn_reason_tokens(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, list):
+        return [str(v).upper() for v in value if str(v).strip()]
+    text = str(value).strip()
+    try:
+        number = int(text, 16) if text.lower().startswith("0x") else int(text)
+    except ValueError:
+        number = None
+    if number is not None:
+        return [name for bit, name in _USN_REASON_BITS.items() if number & bit]
+    tokens = [
+        token.upper()
+        for token in re.split(r"[^A-Za-z0-9_]+", text)
+        if token and token.upper() not in {"USN", "REASON"}
+    ]
+    return tokens
+
+
+def _usn_action(tokens: list[str]) -> str:
+    token_set = set(tokens)
+    if "RENAME_NEW_NAME" in token_set:
+        return "rename_new"
+    if "RENAME_OLD_NAME" in token_set:
+        return "rename_old"
+    if "FILE_CREATE" in token_set:
+        return "create"
+    if "FILE_DELETE" in token_set:
+        return "delete"
+    if "CLOSE" in token_set and len(token_set) == 1:
+        return "close"
+    if token_set & {"DATA_OVERWRITE", "DATA_EXTEND", "DATA_TRUNCATION", "BASIC_INFO_CHANGE"}:
+        return "modify"
+    return "change"
+
+
+def _usn_path(row: dict[str, Any]) -> str:
+    value = _row_get(
+        row,
+        "FullPath", "OSPath", "Path", "TargetFilename", "TargetPath",
+        "FilePath", "Name", "FileName", "Filename",
+    )
+    return str(value).strip() if value not in (None, "") else ""
+
+
+def _usn_file_reference(row: dict[str, Any]) -> str:
+    value = _row_get(
+        row,
+        "FileReferenceNumber", "FileReference", "FileId", "FileID",
+        "FileIdentifier", "MFTReference", "MFTId", "MFTID", "FRN",
+    )
+    seq = _row_get(row, "Sequence", "SequenceNumber", "Seq", "MFTSequence")
+    if value in (None, ""):
+        return ""
+    ref = str(value).strip()
+    return f"{ref}:{str(seq).strip()}" if seq not in (None, "") else ref
+
+
+def _is_usn_journal_row(row: dict[str, Any], source: str) -> bool:
+    lower_source = (source or "").lower()
+    source_hint = any(hint in lower_source for hint in ("usn", "$j", "journal"))
+    reason = _row_get(row, "Reason", "UpdateReason", "USNReason")
+    return bool(source_hint and reason and _usn_path(row))
+
+
+def _normalize_usn_journal_row(row: dict[str, Any], source: str) -> dict[str, Any]:
+    raw = _json_safe(row)
+    if not isinstance(raw, dict):
+        raw = dict(row)
+    path = _usn_path(row)
+    tokens = _usn_reason_tokens(_row_get(row, "Reason", "UpdateReason", "USNReason"))
+    action = _usn_action(tokens)
+    reason = "|".join(tokens) if tokens else str(_row_get(row, "Reason") or "change")
+    file_ref = _usn_file_reference(row)
+    raw.update({
+        "usn_journal": True,
+        "UsnAction": action,
+        "UsnReasonTokens": tokens,
+        "UsnPath": path,
+        "UsnFileName": _basename(path),
+        "UsnFileReference": file_ref,
+    })
+    return {
+        "timestamp": extract_timestamp(row),
+        "host": extract_host(row),
+        "source": source,
+        "category": "filesystem",
+        "entity": path,
+        "severity": "info",
+        "summary": f"$J USN {action.replace('_', ' ')}: {path} ({reason})",
+        "raw": raw,
     }
 
 
@@ -103,8 +238,14 @@ def parse_jsonl(path: Path, source: str) -> Iterator[dict[str, Any]]:
 
 
 def parse_json(path: Path, source: str) -> Iterator[dict[str, Any]]:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        prefix = f.read(4096).lstrip()
+    if prefix.startswith("["):
+        yield from _parse_json_array_stream(path, source)
+        return
     try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
     except json.JSONDecodeError:
         return
     if isinstance(data, dict):
@@ -113,6 +254,53 @@ def parse_json(path: Path, source: str) -> Iterator[dict[str, Any]]:
         for row in data:
             if isinstance(row, dict):
                 yield normalize_row(row, source)
+
+
+def _parse_json_array_stream(path: Path, source: str) -> Iterator[dict[str, Any]]:
+    """Stream a top-level JSON array without materializing large artifacts."""
+    decoder = json.JSONDecoder()
+    buf = ""
+    in_array = False
+    done = False
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        while not done:
+            chunk = f.read(1024 * 1024)
+            if chunk:
+                buf += chunk
+            elif not buf.strip():
+                break
+
+            while True:
+                buf = buf.lstrip()
+                if not in_array:
+                    if not buf:
+                        break
+                    if buf[0] != "[":
+                        return
+                    buf = buf[1:]
+                    in_array = True
+                    continue
+                if not buf:
+                    break
+                if buf[0] == "]":
+                    done = True
+                    buf = buf[1:]
+                    break
+                if buf[0] == ",":
+                    buf = buf[1:]
+                    continue
+                try:
+                    row, idx = decoder.raw_decode(buf)
+                except json.JSONDecodeError:
+                    if chunk:
+                        break
+                    return
+                buf = buf[idx:]
+                if isinstance(row, dict):
+                    yield normalize_row(row, source)
+            if not chunk and not done:
+                break
 
 
 def parse_csv(path: Path, source: str) -> Iterator[dict[str, Any]]:
@@ -553,15 +741,17 @@ def parse_file(path: Path, source: str | None = None) -> Iterator[dict[str, Any]
     elif suffix == ".json":
         # Velociraptor often writes JSONL with .json extension; sniff first line
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            first = f.readline().strip()
-        if first.startswith("{") and not first.endswith("}"):
+            prefix = f.read(8192).lstrip()
+        if prefix.startswith("["):
+            yield from parse_json(path, src)
+        elif prefix.startswith("{") and "\n" in prefix:
             yield from parse_jsonl(path, src)
         else:
             try:
-                json.loads(first)
-                is_jsonl = first.startswith("{")
+                first, idx = json.JSONDecoder().raw_decode(prefix)
+                is_jsonl = isinstance(first, dict) and prefix[idx:].lstrip().startswith("{")
             except json.JSONDecodeError:
-                is_jsonl = False
+                is_jsonl = prefix.startswith("{")
             if is_jsonl:
                 yield from parse_jsonl(path, src)
             else:

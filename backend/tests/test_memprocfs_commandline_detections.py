@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import tempfile
 import sys
 import types
@@ -33,6 +34,7 @@ sys.modules.setdefault("pydantic", types.SimpleNamespace(
 ))
 
 from app.detect.engine import run_detections_sync
+from app.ingest.parsers import normalize_row
 from app.store import cases, database
 from app.store.database import Event, Finding, MemoryResult, Process
 
@@ -143,6 +145,157 @@ class MemProcFSCommandlineDetectionTests(unittest.TestCase):
         self.assertNotIn("MemProcFS timeline: executable artifact in staging path", titles)
         event = self.session.query(Event).filter(Event.entity.like("%tool.exe")).one()
         self.assertEqual(event.severity, "low")
+
+    def test_usn_journal_rename_to_script_extension_detects_medium(self) -> None:
+        old_event = normalize_row(
+            {
+                "Timestamp": "2026-07-02T06:20:00Z",
+                "MFTId": "123456",
+                "Sequence": "9",
+                "FullPath": r"C:\Users\analyst\Downloads\invoice.pdf",
+                "Reason": ["RENAME_OLD_NAME"],
+            },
+            "Windows.NTFS.USN.csv",
+        )
+        new_event = normalize_row(
+            {
+                "Timestamp": "2026-07-02T06:20:01Z",
+                "MFTId": "123456",
+                "Sequence": "9",
+                "FullPath": r"C:\Users\analyst\Downloads\invoice.pdf.js",
+                "Reason": ["RENAME_NEW_NAME"],
+            },
+            "Windows.NTFS.USN.csv",
+        )
+        self.session.add_all([Event(**old_event), Event(**new_event)])
+        self.session.commit()
+
+        run_detections_sync(self.case["id"])
+
+        findings = list(self.session.query(Finding))
+        rename = [
+            f for f in findings
+            if f.title == "USN Journal: file renamed to executable/script extension"
+        ]
+        self.assertEqual(len(rename), 1)
+        self.assertEqual(rename[0].severity, "medium")
+        self.assertEqual(rename[0].evidence["file_reference"], "123456:9")
+        self.assertIn("invoice.pdf", rename[0].evidence["old_path"])
+        self.assertIn("invoice.pdf.js", rename[0].evidence["new_path"])
+        events = self.session.query(Event).filter(Event.source == "Windows.NTFS.USN.csv").all()
+        self.assertTrue(all(e.severity == "medium" for e in events))
+
+    def test_usn_journal_plain_download_exe_create_is_timeline_only(self) -> None:
+        event_kwargs = normalize_row(
+            {
+                "Timestamp": "2026-07-02T06:22:00Z",
+                "FileReferenceNumber": "777",
+                "FullPath": r"C:\Users\analyst\Downloads\setup.exe",
+                "Reason": "FILE_CREATE|CLOSE",
+            },
+            "Windows.NTFS.USN.csv",
+        )
+        self.session.add(Event(**event_kwargs))
+        self.session.commit()
+
+        run_detections_sync(self.case["id"])
+
+        titles = {f.title for f in self.session.query(Finding)}
+        self.assertNotIn("USN Journal: executable/script file created in staging path", titles)
+        event = self.session.query(Event).filter(Event.entity.like("%setup.exe")).one()
+        self.assertEqual(event.severity, "info")
+        self.assertIn("$J USN create", event.summary)
+
+    def test_usn_journal_powershell_policy_test_create_is_not_a_finding(self) -> None:
+        event_kwargs = normalize_row(
+            {
+                "Timestamp": "2026-07-02T06:22:00Z",
+                "FileReferenceNumber": "778",
+                "FullPath": r"C:\Users\analyst\AppData\Local\Temp\__PSScriptPolicyTest_pisbvaa1.dp1.ps1",
+                "Reason": "FILE_CREATE|CLOSE",
+            },
+            "Windows.Forensics.Usn.json",
+        )
+        self.session.add(Event(**event_kwargs))
+        self.session.commit()
+
+        run_detections_sync(self.case["id"])
+
+        titles = {f.title for f in self.session.query(Finding)}
+        self.assertNotIn("USN Journal: executable/script file created in staging path", titles)
+        event = self.session.query(Event).filter(Event.entity.like("%PSScriptPolicyTest%")).one()
+        self.assertEqual(event.severity, "info")
+
+    def test_usn_journal_temp_to_script_rename_is_timeline_only(self) -> None:
+        old_event = normalize_row(
+            {
+                "Timestamp": "2026-07-02T06:20:00Z",
+                "MFTId": "82686",
+                "Sequence": "14",
+                "FullPath": r"C:\Users\analyst\AppData\Local\Programs\JAM Software\TreeSize Free\HELP_ZH_HANS\is-2BV60.tmp",
+                "Reason": ["RENAME_OLD_NAME"],
+            },
+            "Windows.Forensics.Usn.json",
+        )
+        new_event = normalize_row(
+            {
+                "Timestamp": "2026-07-02T06:20:01Z",
+                "MFTId": "82686",
+                "Sequence": "14",
+                "FullPath": r"C:\Users\analyst\AppData\Local\Programs\JAM Software\TreeSize Free\HELP_ZH_HANS\settings.js",
+                "Reason": ["RENAME_NEW_NAME"],
+            },
+            "Windows.Forensics.Usn.json",
+        )
+        self.session.add_all([Event(**old_event), Event(**new_event)])
+        self.session.commit()
+
+        run_detections_sync(self.case["id"])
+
+        titles = {f.title for f in self.session.query(Finding)}
+        self.assertNotIn("USN Journal: file renamed to executable/script extension", titles)
+        events = self.session.query(Event).filter(Event.source == "Windows.Forensics.Usn.json").all()
+        self.assertTrue(all(e.severity in {"info", "low"} for e in events))
+
+    def test_usn_created_executable_correlates_to_later_process_execution(self) -> None:
+        event_kwargs = normalize_row(
+            {
+                "Timestamp": "2026-07-02T06:22:00Z",
+                "MFTId": 999,
+                "Sequence": 1,
+                "OSPath": r"\\.\C:\Users\analyst\Downloads\setup.exe",
+                "Filename": "setup.exe",
+                "Reason": ["FILE_CREATE", "CLOSE"],
+            },
+            "Windows.Forensics.Usn.json",
+        )
+        self.session.add(Event(**event_kwargs))
+        self.session.add(Process(
+            pid=2000,
+            ppid=1000,
+            name="setup.exe",
+            path=r"C:\Users\analyst\Downloads\setup.exe",
+            cmdline=r"C:\Users\analyst\Downloads\setup.exe /quiet",
+            start_time=datetime(2026, 7, 2, 6, 25, tzinfo=timezone.utc),
+            session_id="evtx-host",
+            flags=[],
+            severity="info",
+            extra={},
+        ))
+        self.session.commit()
+
+        run_detections_sync(self.case["id"])
+
+        matches = [
+            f for f in self.session.query(Finding)
+            if f.title == "File artifact later executed: setup.exe"
+        ]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].severity, "medium")
+        self.assertEqual(matches[0].evidence["artifact_kind"], "USN create")
+        self.assertEqual(matches[0].evidence["match_confidence"], "exact-path")
+        event = self.session.query(Event).filter(Event.entity.like("%setup.exe")).one()
+        self.assertEqual(event.severity, "medium")
 
     def test_weak_memprocfs_findevil_rows_are_context_not_findings(self) -> None:
         self.session.add(MemoryResult(
