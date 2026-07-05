@@ -1,4 +1,4 @@
 -r requirements.in
 
 yara-python>=4.5.0
-memprocfs>=5.0.0
+memprocfs>=5.17.5
