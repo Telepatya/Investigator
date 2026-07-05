@@ -165,7 +165,10 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  health: () => req<{ status: string; memprocfs: boolean; yara: boolean }>("/health"),
+  health: () =>
+    req<{ status: string; brand: string; credit: string; memprocfs: boolean; yara: boolean }>(
+      "/health",
+    ),
 };
 
 export function downloadUrl(path: string): string {

@@ -1,5 +1,7 @@
 # Investigator — AI-Powered Velociraptor & Memory Forensics
 
+**Made by Roei.f**
+
 A fully local DFIR workstation. Ingest Velociraptor collections and raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama or remote OpenAI / Gemini / Claude) reconstruct the machine's story — a full timeline, interactive process maps, MITRE ATT&CK coverage, and a written incident report.
 
 Everything runs on your machine. API keys are stored in your OS credential vault, never on disk in plaintext.
@@ -73,6 +75,10 @@ Open **Settings**:
 - **Frontend** (`frontend/src`): React + TypeScript + Vite + Tailwind, React Flow, vis-timeline, Recharts, TanStack Query.
 
 Cases and config live under `~/.investigator/`.
+
+## Credits
+
+Investigator DFIR is made by Roei.f.
 
 ## Note on detections
 

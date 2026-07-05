@@ -1,6 +1,8 @@
 import { Link, Outlet, useLocation } from "react-router-dom";
 import { ShieldCheck, Settings, FolderSearch } from "lucide-react";
 
+const BRAND_CREDIT = "Made by Roei.f";
+
 export default function App() {
   const loc = useLocation();
   const onSettings = loc.pathname.startsWith("/settings");
@@ -21,6 +23,9 @@ export default function App() {
               </div>
             </div>
           </Link>
+          <div className="hidden md:block text-[10px] uppercase tracking-widest text-ink-500">
+            {BRAND_CREDIT}
+          </div>
           <nav className="flex items-center gap-1.5">
             <Link
               to="/"
@@ -40,6 +45,12 @@ export default function App() {
       <main className="flex-1 max-w-[1600px] w-full mx-auto px-6 py-6">
         <Outlet />
       </main>
+      <div
+        aria-hidden="true"
+        className="pointer-events-none fixed bottom-3 right-4 z-30 select-none text-[10px] uppercase tracking-[0.24em] text-white/15"
+      >
+        {BRAND_CREDIT}
+      </div>
     </div>
   );
 }

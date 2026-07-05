@@ -20,6 +20,10 @@ from app.store.database import dispose_all_db_engines
 
 logger = logging.getLogger(__name__)
 
+APP_TITLE = "Investigator DFIR"
+APP_VERSION = "1.0.0"
+APP_CREDIT = "Made by Roei.f"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,7 +57,12 @@ async def lifespan(app: FastAPI):
         dispose_all_db_engines()
 
 
-app = FastAPI(title="Investigator DFIR", version="1.0.0", lifespan=lifespan)
+app = FastAPI(
+    title=APP_TITLE,
+    version=APP_VERSION,
+    description=APP_CREDIT,
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,6 +83,8 @@ async def health() -> dict:
     from app.memory.yara_scanner import get_scanner
     return {
         "status": "ok",
+        "brand": APP_TITLE,
+        "credit": APP_CREDIT,
         "memprocfs": is_memprocfs_available(),
         "yara": get_scanner().available(),
     }
