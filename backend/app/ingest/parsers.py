@@ -214,7 +214,26 @@ def _normalize_usn_journal_row(row: dict[str, Any], source: str) -> dict[str, An
     }
 
 
+def _is_plain_json(obj: Any) -> bool:
+    """True if obj is composed only of types json.dumps serializes unchanged,
+    so _json_safe can return it as-is without a serialize round-trip."""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return True
+    if isinstance(obj, dict):
+        return all(
+            isinstance(k, str) and _is_plain_json(v) for k, v in obj.items()
+        )
+    if isinstance(obj, list):
+        return all(_is_plain_json(v) for v in obj)
+    return False
+
+
 def _json_safe(obj: Any) -> Any:
+    # Fast path: plain-JSON objects serialize unchanged and json.dumps would
+    # return them as-is, so skip the per-row dumps. Note json.dumps also accepts
+    # int/float dict keys and tuples; those fall through to the exact old path.
+    if _is_plain_json(obj):
+        return obj
     try:
         json.dumps(obj)
         return obj
