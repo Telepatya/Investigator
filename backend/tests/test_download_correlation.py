@@ -114,6 +114,39 @@ class DownloadCorrelationTests(unittest.TestCase):
         proc = next(n for n in graph["nodes"] if n["id"] == "process::velociraptor.exe")
         self.assertTrue(any("later executed" in f["title"] for f in proc["findings"]))
 
+    def test_velociraptor_evidenceofdownload_fields(self) -> None:
+        # Velociraptor Windows.Detection.EvidenceOfDownload emits FullPath + URL /
+        # Referrer columns (no DownloadedFilePath, no Zone.Identifier blob). This
+        # shape must be recognized as a download and correlate to the execution.
+        case = cases.create_case("velo")
+        s = cases.get_session(case["id"])
+        t0 = datetime(2026, 7, 6, 10, 0, 0, tzinfo=timezone.utc)
+        path = "C:\\Users\\v\\Downloads\\rclone.exe"
+        try:
+            cases.add_event(
+                s, timestamp=t0, host="H",
+                source="Windows.Detection.EvidenceOfDownload", category="filesystem",
+                entity=path, severity="info", summary="evidence of download",
+                raw={"FullPath": path, "URL": "https://cdn.evil.example/rclone.exe",
+                     "Referrer": "https://mail.google.com/"},
+            )
+            s.add(Process(
+                pid=606, ppid=None, name="rclone.exe", path=path, cmdline="rclone.exe",
+                session_id="live", flags=[], severity="low", start_time=t0 + timedelta(minutes=6),
+            ))
+            s.commit()
+        finally:
+            s.close()
+
+        run_detections_sync(case["id"])
+        graph = entity_graph.build_entity_graph(case["id"])
+        types_present = {n["type"] for n in graph["nodes"]}
+        self.assertIn("file", types_present)
+        self.assertIn("url", types_present)
+        edges = {(e["source"], e["target"]) for e in graph["edges"]}
+        self.assertIn(("file::rclone.exe", "process::rclone.exe"), edges)
+        self.assertTrue(any(s_.startswith("url::") and d == "file::rclone.exe" for s_, d in edges))
+
 
 if __name__ == "__main__":
     unittest.main()
