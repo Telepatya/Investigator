@@ -186,17 +186,24 @@ export default function EntityMapPage() {
               {TYPE_ICON[t]} {t} ({data.type_counts[t]})
             </button>
           ))}
-          {deadCount > 0 && (
-            <button
-              onClick={() => setShowTerminated((v) => !v)}
-              title="Show terminated processes and stopped services and their relationships"
-              className={`chip transition ${
-                showTerminated ? "bg-accent-cyan/15 text-accent-cyan" : "bg-white/5 text-ink-500"
-              }`}
-            >
-              {showTerminated ? "showing terminated" : "show terminated"} ({deadCount})
-            </button>
-          )}
+          <button
+            onClick={() => deadCount > 0 && setShowTerminated((v) => !v)}
+            disabled={deadCount === 0}
+            title={
+              deadCount === 0
+                ? "No terminated processes or stopped services in this case (dead entities come from memory images, process-exit events, or svcscan)."
+                : "Show terminated processes and stopped services and their relationships"
+            }
+            className={`chip transition ${
+              deadCount === 0
+                ? "bg-white/5 text-ink-600 cursor-not-allowed opacity-60"
+                : showTerminated
+                  ? "bg-accent-cyan/15 text-accent-cyan"
+                  : "bg-white/5 text-ink-500"
+            }`}
+          >
+            {showTerminated && deadCount > 0 ? "showing terminated" : "show terminated"} ({deadCount})
+          </button>
           <select
             className="input w-auto py-1 ml-2"
             value={minSeverity}

@@ -1209,21 +1209,65 @@ _DOWNLOAD_PAYLOAD_RE = re.compile(
 # A download older than this cannot credibly be "the origin" of a service install.
 _DOWNLOAD_CORRELATION_WINDOW_S = 72 * 3600
 
+# Generic installer/payload names too common to correlate on basename alone.
+_COMMON_DOWNLOAD_NAMES = {
+    "setup.exe", "install.exe", "installer.exe", "uninstall.exe", "update.exe",
+    "updater.exe", "download.exe", "file.exe", "tmp.exe", "temp.exe", "test.exe",
+    "new.exe", "main.exe", "run.exe", "start.exe", "launcher.exe", "app.exe",
+    "program.exe", "installer.msi", "setup.msi", "install.msi", "update.msi",
+}
+
+
+# File-path columns a download row may carry. FullPath/OSPath are what
+# Velociraptor's Windows.Detection.EvidenceOfDownload emits; the others cover
+# Zone.Identifier / KAPE / EVTX shapes. Only consulted once a row already looks
+# like download evidence (see _download_evidence), so generic file rows with a
+# FullPath are not mistaken for downloads.
+_DOWNLOAD_PATH_FIELDS = (
+    "DownloadedFilePath", "Download Path", "TargetPath", "FullPath", "OSPath",
+)
+# URL columns various download artifacts use for the origin.
+_DOWNLOAD_URL_FIELDS = (
+    "URL", "Url", "Referrer", "ReferrerUrl", "HostUrl", "DownloadUrl", "SourceUrl", "Uri",
+)
+
 
 def _download_origin(raw: dict[str, Any]) -> str | None:
-    """Referrer/host URL from a Zone.Identifier ADS blob, if present."""
+    """Origin URL of a download: a direct URL/Referrer column when present
+    (Velociraptor EvidenceOfDownload), else parsed from a Zone.Identifier blob."""
+    url = _field(raw, *_DOWNLOAD_URL_FIELDS)
+    if url:
+        return url[:300]
     zone = str(raw.get("_ZoneIdentifierContent") or raw.get("ZoneIdentifierContent") or "")
     m = _ZONE_URL_RE.search(zone)
     return m.group(2)[:300] if m else None
+
+
+def _download_evidence(event: Event, raw: dict[str, Any]) -> tuple[str, str | None]:
+    """(path, origin_url) if a row is download-provenance evidence, else ('', None).
+
+    A row qualifies when its source names a download artifact, or it carries a
+    Zone.Identifier blob or a URL/Referrer column -- then the on-disk path is
+    taken from any of the download path columns. This recognizes Velociraptor
+    EvidenceOfDownload (FullPath + URL) as well as the older DownloadedFilePath
+    shape and raw Zone.Identifier rows.
+    """
+    source = (event.source or "").lower()
+    zone = raw.get("_ZoneIdentifierContent") or raw.get("ZoneIdentifierContent")
+    url = _field(raw, *_DOWNLOAD_URL_FIELDS)
+    if not ("download" in source or zone or url):
+        return "", None
+    path = _field(raw, *_DOWNLOAD_PATH_FIELDS)
+    if not path:
+        return "", None
+    return path, _download_origin(raw)
 
 
 def _event_needed_for_provenance(event: Event, raw: dict[str, Any]) -> bool:
     eid = str(raw.get("EventID") or "")
     if eid and _eid_channel_ok(raw, eid) and eid in {"11", "12", "13", "4697", "7045"}:
         return True
-    if _field(raw, "DownloadedFilePath", "Download Path", "TargetPath") and (
-        "download" in (event.source or "").lower() or raw.get("_ZoneIdentifierContent")
-    ):
+    if _download_evidence(event, raw)[0]:
         return True
     if _is_usn_journal_event(event, raw):
         tokens = _usn_reason_tokens(raw)
@@ -1257,6 +1301,13 @@ def _artifact_match_confidence(artifact_path: str, exec_path: str) -> str | None
     tokens = _corr_tokens(_basename(artifact_path))
     if tokens and tokens & _corr_tokens(_basename(exec_path)):
         return "distinctive-basename"
+    # Looser fallback: an identical basename that is not a generic installer name
+    # (short names like "rat.exe" carry no >=5-char distinctive token but are still
+    # a meaningful match). Bounded by the correlation time window and, for
+    # non-strong matches, the medium-severity gate at the call site.
+    base = _basename(artifact_path).lower()
+    if base and base not in _COMMON_DOWNLOAD_NAMES:
+        return "basename"
     return None
 
 
@@ -1268,11 +1319,11 @@ def _collect_file_artifacts(events: list[Event]) -> list[dict[str, Any]]:
         path = ""
         kind = ""
         origin = None
-        dl_path = _field(raw, "DownloadedFilePath", "Download Path", "TargetPath")
-        if dl_path and ("download" in (event.source or "").lower() or raw.get("_ZoneIdentifierContent")):
+        dl_path, dl_origin = _download_evidence(event, raw)
+        if dl_path:
             path = dl_path
             kind = "download"
-            origin = _download_origin(raw)
+            origin = dl_origin
         elif _is_usn_journal_event(event, raw):
             tokens = _usn_reason_tokens(raw)
             if not (tokens & {"FILE_CREATE", "RENAME_NEW_NAME"}):
@@ -1649,8 +1700,8 @@ def _correlate_service_provenance(
             if client_pid:
                 slot["client_pids"].add(client_pid)
             continue
-        dl_path = _field(raw, "DownloadedFilePath", "Download Path", "TargetPath")
-        if dl_path and ("download" in (e.source or "").lower() or raw.get("_ZoneIdentifierContent")):
+        dl_path, _dl_origin = _download_evidence(e, raw)
+        if dl_path:
             base = _basename(dl_path)
             # Only executable/archive downloads can plausibly originate a service;
             # media/source files sharing a vendor token are coincidence.
