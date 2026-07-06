@@ -2598,9 +2598,13 @@ def run_detections_sync(case_id: str) -> int:
 
         # --- Severity taint propagation: events mentioning a flagged process/DLL/file
         # --- name inherit its severity, with provenance recorded on the event.
+        # NOTE: _propagate_flagged_entities iterates its events argument twice (it
+        # collects taint on the first pass and escalates on the second), so it must
+        # be given a materialized list -- a single-use streaming ScalarResult would
+        # be exhausted after the first pass and silently escalate nothing.
         _propagate_flagged_entities(
             session,
-            session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)),
+            list(session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE))),
             processes,
         )
 
