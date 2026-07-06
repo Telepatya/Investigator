@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+# ruff: noqa: E402
+#
+# Download->execution provenance using the NTFS $UsnJrnl:$J journal:
+#   - follow a downloaded file across a rename (same FileReferenceNumber) to the
+#     name/path it was executed under, and
+#   - flag the file being deleted after execution (cleanup / anti-forensics).
+
+import sys
+import tempfile
+import types
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+
+class _BaseModel:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    @classmethod
+    def model_validate(cls, data):
+        return cls(**data)
+
+    def model_dump_json(self, indent=None):
+        return "{}"
+
+
+sys.modules.setdefault("keyring", types.SimpleNamespace(
+    get_password=lambda *_a, **_k: None,
+    set_password=lambda *_a, **_k: None,
+    delete_password=lambda *_a, **_k: None,
+    errors=types.SimpleNamespace(PasswordDeleteError=Exception),
+))
+sys.modules.setdefault("pydantic", types.SimpleNamespace(
+    BaseModel=_BaseModel,
+    Field=lambda default=None, default_factory=None, **_k: default_factory() if default_factory else default,
+))
+
+from sqlalchemy import select
+from app.detect import entity_graph
+from app.detect.engine import run_detections_sync
+from app.store import cases
+from app.store import database
+from app.store.database import Finding, Process
+
+
+def _edges(graph):
+    return {(e["source"], e["verb"], e["target"]) for e in graph["edges"]}
+
+
+class UsnProvenanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.patches = [
+            patch.object(cases, "get_cases_dir", return_value=self.root),
+            patch.object(cases, "case_db_path", side_effect=lambda cid: self.root / cid / "case.db"),
+        ]
+        for p in self.patches:
+            p.start()
+        self.t0 = datetime(2026, 7, 6, 9, 0, 0, tzinfo=timezone.utc)
+
+    def tearDown(self) -> None:
+        database.dispose_all_db_engines()
+        for p in reversed(self.patches):
+            p.stop()
+        self.tmp.cleanup()
+
+    def _download(self, s, path, ts):
+        cases.add_event(
+            s, timestamp=ts, host="H", source="Windows.Detection.EvidenceOfDownload",
+            category="filesystem", entity=path, severity="info", summary=f"Downloaded {path}",
+            raw={"DownloadedFilePath": path,
+                 "_ZoneIdentifierContent": "[ZoneTransfer]\nZoneId=3\nHostUrl=https://cdn.example/pkg"},
+        )
+
+    def _usn(self, s, path, tokens, frn, ts):
+        cases.add_event(
+            s, timestamp=ts, host="H", source="Windows.Forensics.Usn", category="filesystem",
+            entity=path, severity="info", summary=f"$J {tokens} {path}",
+            raw={"usn_journal": True, "UsnReasonTokens": tokens, "UsnPath": path,
+                 "UsnFileReference": frn},
+        )
+
+    def test_download_renamed_then_executed(self) -> None:
+        case = cases.create_case("rename")
+        s = cases.get_session(case["id"])
+        dl = "C:\\Users\\v\\Downloads\\update_pkg.exe"
+        new = "C:\\Users\\v\\AppData\\Local\\Temp\\payload.exe"
+        try:
+            self._download(s, dl, self.t0)
+            self._usn(s, dl, ["RENAME_OLD_NAME"], "100:1", self.t0 + timedelta(minutes=2))
+            self._usn(s, new, ["RENAME_NEW_NAME"], "100:1", self.t0 + timedelta(minutes=2))
+            s.add(Process(pid=71, ppid=None, name="payload.exe", path=new,
+                          cmdline="payload.exe", session_id="live", flags=[], severity="low",
+                          start_time=self.t0 + timedelta(minutes=10)))
+            s.commit()
+        finally:
+            s.close()
+
+        run_detections_sync(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            f = [f for f in s.scalars(select(Finding))
+                 if f.title.startswith("File artifact later executed")]
+            self.assertTrue(f, "no download->execution finding")
+            fin = f[0]
+            self.assertIn("(renamed)", fin.title)
+            self.assertEqual(fin.evidence["match_confidence"], "usn-rename-chain")
+            self.assertEqual(fin.evidence["renamed_to"], new)
+        finally:
+            s.close()
+
+        edges = _edges(entity_graph.build_entity_graph(case["id"]))
+        self.assertTrue(any(s_ == "file::update_pkg.exe" and v == "renamed to" and d == "file::payload.exe"
+                            for s_, v, d in edges), edges)
+        self.assertTrue(any(s_ == "file::payload.exe" and d == "process::payload.exe"
+                            for s_, v, d in edges), edges)
+
+    def test_download_executed_then_deleted(self) -> None:
+        case = cases.create_case("delete")
+        s = cases.get_session(case["id"])
+        exe = "C:\\Users\\v\\AppData\\Local\\Temp\\dropper.exe"
+        try:
+            self._download(s, exe, self.t0)
+            s.add(Process(pid=88, ppid=None, name="dropper.exe", path=exe,
+                          cmdline="dropper.exe", session_id="live", flags=[], severity="low",
+                          start_time=self.t0 + timedelta(minutes=5)))
+            self._usn(s, exe, ["FILE_DELETE"], "200:1", self.t0 + timedelta(minutes=20))
+            s.commit()
+        finally:
+            s.close()
+
+        run_detections_sync(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            fin = [f for f in s.scalars(select(Finding))
+                   if f.title.startswith("File artifact later executed")][0]
+            self.assertIn("then deleted", fin.title)
+            self.assertTrue(fin.evidence["deleted_after_execution"])
+        finally:
+            s.close()
+
+        edges = _edges(entity_graph.build_entity_graph(case["id"]))
+        self.assertTrue(any(s_ == "process::dropper.exe" and v == "then deleted"
+                            for s_, v, d in edges), edges)
+
+    def test_delete_before_execution_not_flagged(self) -> None:
+        # A delete that predates the execution must not be reported as cleanup.
+        case = cases.create_case("predelete")
+        s = cases.get_session(case["id"])
+        exe = "C:\\Users\\v\\AppData\\Local\\Temp\\tool.exe"
+        try:
+            self._download(s, exe, self.t0)
+            self._usn(s, exe, ["FILE_DELETE"], "300:1", self.t0 + timedelta(minutes=1))
+            s.add(Process(pid=99, ppid=None, name="tool.exe", path=exe,
+                          cmdline="tool.exe", session_id="live", flags=[], severity="low",
+                          start_time=self.t0 + timedelta(minutes=10)))
+            s.commit()
+        finally:
+            s.close()
+
+        run_detections_sync(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            fins = [f for f in s.scalars(select(Finding))
+                    if f.title.startswith("File artifact later executed")]
+            # correlation still fires (exact path), but not marked deleted-after
+            self.assertTrue(fins)
+            self.assertFalse(fins[0].evidence["deleted_after_execution"])
+            self.assertNotIn("then deleted", fins[0].title)
+        finally:
+            s.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

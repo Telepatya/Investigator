@@ -1227,8 +1227,12 @@ def _event_needed_for_provenance(event: Event, raw: dict[str, Any]) -> bool:
         return True
     if _is_usn_journal_event(event, raw):
         tokens = _usn_reason_tokens(raw)
+        # RENAME_OLD_NAME and FILE_DELETE are kept too, so download->execution
+        # provenance can follow a file across renames and notice a post-execution
+        # self-delete. They never become "artifacts" (that path only takes
+        # create/rename-new), so this only widens what provenance can correlate.
         return bool(
-            tokens & {"FILE_CREATE", "RENAME_NEW_NAME"}
+            tokens & {"FILE_CREATE", "RENAME_NEW_NAME", "RENAME_OLD_NAME", "FILE_DELETE"}
             and _is_usn_executable_path(_usn_path(event, raw))
         )
     return False
@@ -1296,6 +1300,81 @@ def _collect_file_artifacts(events: list[Event]) -> list[dict[str, Any]]:
     return artifacts
 
 
+def _collect_usn_renames(events: list[Event]) -> list[dict[str, Any]]:
+    """Pair RENAME_OLD_NAME/RENAME_NEW_NAME USN rows (by FileReferenceNumber) so a
+    downloaded file can be followed to the name/path it was executed under."""
+    old_by_ref: dict[str, Event] = {}
+    fallback_old: list[Event] = []
+    renames: list[dict[str, Any]] = []
+
+    def sort_key(event: Event) -> tuple[str, int]:
+        return (event.timestamp.isoformat() if event.timestamp else "", event.id or 0)
+
+    for event in sorted(events, key=sort_key):
+        raw = event.raw or {}
+        if not _is_usn_journal_event(event, raw):
+            continue
+        tokens = _usn_reason_tokens(raw)
+        if not (tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}):
+            continue
+        ref = _usn_file_reference(raw)
+        path = _usn_path(event, raw)
+        if "RENAME_OLD_NAME" in tokens:
+            if ref:
+                old_by_ref[ref] = event
+            elif len(fallback_old) < 200:
+                fallback_old.append(event)
+            continue
+        old_event = old_by_ref.get(ref) if ref else (fallback_old.pop() if fallback_old else None)
+        if old_event is None:
+            continue
+        old_path = _usn_path(old_event, old_event.raw or {})
+        if not path or not old_path:
+            continue
+        renames.append({
+            "old_path": old_path, "old_base": _basename(old_path),
+            "new_path": path, "new_base": _basename(path),
+            "frn": ref, "timestamp": event.timestamp, "event": event,
+        })
+    return renames
+
+
+def _collect_usn_deletes(events: list[Event]) -> list[dict[str, Any]]:
+    """FILE_DELETE USN rows for executable/script paths, to spot a file removed
+    after it was executed (cleanup / anti-forensics)."""
+    deletes: list[dict[str, Any]] = []
+    for event in events:
+        raw = event.raw or {}
+        if not _is_usn_journal_event(event, raw):
+            continue
+        if "FILE_DELETE" not in _usn_reason_tokens(raw):
+            continue
+        path = _usn_path(event, raw)
+        if not path:
+            continue
+        deletes.append({
+            "path": path, "base": _basename(path),
+            "frn": _usn_file_reference(raw), "timestamp": event.timestamp, "event": event,
+        })
+    return deletes
+
+
+def _deleted_after(execution: dict[str, Any], frn: str, deletes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """A delete of the executed file that postdates the execution, matched by
+    file reference number when available, otherwise by resolved path."""
+    exec_key = _artifact_path_key(execution["path"])
+    exec_ts = _aware(execution["timestamp"]) if execution["timestamp"] else None
+    for d in deletes:
+        if d["timestamp"] is None or exec_ts is None or _aware(d["timestamp"]) <= exec_ts:
+            continue
+        same_file = (frn and d["frn"] and d["frn"] == frn) or (
+            exec_key and _artifact_path_key(d["path"]) == exec_key
+        )
+        if same_file:
+            return d
+    return None
+
+
 def _correlate_file_execution_provenance(
     session,
     existing: set[tuple[str, str]],
@@ -1354,60 +1433,135 @@ def _correlate_file_execution_provenance(
         }
         executions_by_base[entry["base"]].append(entry)
 
+    # USN journal lets us follow a downloaded file across a rename before
+    # execution, and notice it being deleted afterwards.
+    renames = _collect_usn_renames(events)
+    deletes = _collect_usn_deletes(events)
+    renames_by_old_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    renames_by_old_base: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for rn in renames:
+        old_key = _artifact_path_key(rn["old_path"])
+        if old_key:
+            renames_by_old_key[old_key].append(rn)
+        renames_by_old_base[rn["old_base"]].append(rn)
+
     for artifact in artifacts:
         event = artifact["event"]
-        best: tuple[float, str, dict[str, Any]] | None = None
-        for execution in executions_by_base.get(artifact["base"], []):
-            confidence = _artifact_match_confidence(artifact["path"], execution["path"])
-            if not confidence:
-                continue
-            if event.timestamp and execution["timestamp"]:
-                gap = (_aware(execution["timestamp"]) - _aware(event.timestamp)).total_seconds()
-                if not (0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S):
+        artifact_ts = event.timestamp
+
+        def match_execution(match_path: str, base: str) -> tuple[float, str, dict[str, Any]] | None:
+            best_local: tuple[float, str, dict[str, Any]] | None = None
+            for execution in executions_by_base.get(base, []):
+                confidence = _artifact_match_confidence(match_path, execution["path"])
+                if not confidence:
                     continue
-            else:
-                gap = _DOWNLOAD_CORRELATION_WINDOW_S
-            rank = 0 if confidence == "exact-path" else 1
-            score = gap + (rank * _DOWNLOAD_CORRELATION_WINDOW_S)
-            if best is None or score < best[0]:
-                best = (gap, confidence, execution)
+                if artifact_ts and execution["timestamp"]:
+                    gap = (_aware(execution["timestamp"]) - _aware(artifact_ts)).total_seconds()
+                    if not (0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S):
+                        continue
+                else:
+                    gap = _DOWNLOAD_CORRELATION_WINDOW_S
+                rank = 0 if confidence == "exact-path" else 1
+                score = gap + (rank * _DOWNLOAD_CORRELATION_WINDOW_S)
+                if best_local is None or score < best_local[0]:
+                    best_local = (gap, confidence, execution)
+            return best_local
+
+        best = match_execution(artifact["path"], artifact["base"])
+        renamed: dict[str, Any] | None = None
+        # If the download name is never executed directly, follow a rename of the
+        # same file (matched by path, else basename) to the name it ran under.
+        if best is None and renames:
+            candidates = renames_by_old_key.get(_artifact_path_key(artifact["path"]), [])
+            if not candidates:
+                candidates = renames_by_old_base.get(artifact["base"], [])
+            for rn in candidates:
+                cand = match_execution(rn["new_path"], rn["new_base"])
+                if cand and (best is None or cand[0] < best[0]):
+                    best, renamed = cand, rn
         if not best:
             continue
         gap, confidence, execution = best
+        frn = renamed["frn"] if renamed else ""
+        del_rec = _deleted_after(execution, frn, deletes) if deletes else None
+
         exec_rank = SEVERITY_RANK.get(execution["severity"], 0)
         artifact_rank = SEVERITY_RANK.get(event.severity, 0)
-        if confidence != "exact-path" and max(exec_rank, artifact_rank) < SEVERITY_RANK["medium"]:
+        # A rename-before-execution or a delete-after-execution is itself strong
+        # evidence, so (like an exact-path match) it bypasses the low-severity gate.
+        strong = confidence == "exact-path" or renamed is not None or del_rec is not None
+        if not strong and max(exec_rank, artifact_rank) < SEVERITY_RANK["medium"]:
             continue
         severity = "high" if max(exec_rank, artifact_rank) >= SEVERITY_RANK["high"] else "medium"
         gap_txt = "unknown time after" if gap == _DOWNLOAD_CORRELATION_WINDOW_S else (
             f"{gap/60:.0f} minutes after" if gap < 5400 else f"{gap/3600:.1f} hours after"
         )
-        # Surface the provenance as first-class entity-map edges: the downloaded
-        # file (and, when known, the URL it came from) linked to the process that
-        # ran it. Process/file use basenames so the file node and the executed
-        # process node coincide with the ones built from the process table.
-        chain_edges: list[dict[str, str]] = [{
-            "src_type": "file", "src": artifact["base"],
-            "verb": f"{artifact['kind']}, later executed",
-            "dst_type": "process", "dst": execution["base"],
-        }]
+        match_confidence = "usn-rename-chain" if renamed else confidence
+
+        # Entity-map edges: URL -> downloaded file -> (renamed file) -> process,
+        # and a "then deleted" edge when the file was removed post-execution.
+        # Basenames are used so file/process nodes coincide with process-table nodes.
+        exec_base = execution["base"]
+        chain_edges: list[dict[str, str]] = []
         if artifact["origin"]:
-            chain_edges.insert(0, {
+            chain_edges.append({
                 "src_type": "url", "src": artifact["origin"],
                 "verb": "served", "dst_type": "file", "dst": artifact["base"],
             })
+        if renamed and renamed["new_base"] != artifact["base"]:
+            chain_edges.append({
+                "src_type": "file", "src": artifact["base"],
+                "verb": "renamed to", "dst_type": "file", "dst": renamed["new_base"],
+            })
+            chain_edges.append({
+                "src_type": "file", "src": renamed["new_base"],
+                "verb": "later executed", "dst_type": "process", "dst": exec_base,
+            })
+        else:
+            chain_edges.append({
+                "src_type": "file", "src": artifact["base"],
+                "verb": f"{artifact['kind']}, later executed",
+                "dst_type": "process", "dst": exec_base,
+            })
+        if del_rec:
+            chain_edges.append({
+                "src_type": "process", "src": exec_base,
+                "verb": "then deleted", "dst_type": "file", "dst": del_rec["base"],
+            })
+
+        description = (
+            f"A {artifact['kind']} artifact ({artifact['path'][:300]}) was later executed as "
+            f"{execution['path'][:300]} ({gap_txt} the artifact timestamp). Match confidence: "
+            f"{match_confidence}."
+        )
+        if renamed:
+            description += (
+                f" The NTFS $UsnJrnl:$J journal shows the file was renamed from "
+                f"{renamed['old_path'][:200]} to {renamed['new_path'][:200]} (same file reference) "
+                "before execution -- a name change that a directory listing alone would miss."
+            )
+        if del_rec:
+            ddesc = "shortly"
+            if del_rec["timestamp"] and execution["timestamp"]:
+                dgap = (_aware(del_rec["timestamp"]) - _aware(execution["timestamp"])).total_seconds()
+                ddesc = f"{dgap/60:.0f} minutes" if dgap < 5400 else f"{dgap/3600:.1f} hours"
+            description += (
+                f" The file was then deleted (per $J) {ddesc} after execution -- consistent with "
+                "cleanup / anti-forensics."
+            )
+        description += (
+            " This links filesystem/download evidence to execution, but still requires analyst "
+            "review for expected installers, developer tooling, or admin utilities."
+        )
+
         _add_finding(
             session,
             existing,
-            title=f"File artifact later executed: {artifact['base']}",
-            description=(
-                f"A {artifact['kind']} artifact ({artifact['path'][:300]}) was later executed as "
-                f"{execution['path'][:300]} ({gap_txt} the artifact timestamp). Match confidence: "
-                f"{confidence}. This links filesystem/download evidence to execution, but still "
-                "requires analyst review for expected installers, developer tooling, or admin utilities."
-            ),
+            title=f"File artifact later executed: {artifact['base']}"
+            + (" (renamed)" if renamed else "") + (" then deleted" if del_rec else ""),
+            description=description,
             severity=severity,
-            techniques=["T1204", "T1105"],
+            techniques=["T1204", "T1105"] + (["T1036.003"] if renamed else []) + (["T1070.004"] if del_rec else []),
             evidence={
                 "entity": execution["path"],
                 "artifact_path": artifact["path"][:700],
@@ -1417,9 +1571,14 @@ def _correlate_file_execution_provenance(
                 "execution_pid": execution["pid"],
                 "execution_session_id": execution["session_id"],
                 "execution_event_id": execution["event"].id if execution["event"] else None,
-                "match_confidence": confidence,
+                "match_confidence": match_confidence,
                 "gap_seconds": None if gap == _DOWNLOAD_CORRELATION_WINDOW_S else round(gap, 1),
                 "origin_url": artifact["origin"],
+                "renamed_from": renamed["old_path"][:700] if renamed else None,
+                "renamed_to": renamed["new_path"][:700] if renamed else None,
+                "file_reference": frn or None,
+                "deleted_after_execution": bool(del_rec),
+                "delete_event_id": del_rec["event"].id if del_rec else None,
                 "chain_edges": chain_edges,
             },
             source="correlation",
@@ -1428,8 +1587,20 @@ def _correlate_file_execution_provenance(
             session,
             event,
             severity,
-            f"Correlated: {artifact['kind']} artifact later executed as {execution['base']}",
+            f"Correlated: {artifact['kind']} artifact later executed as {execution['base']}"
+            + (" (via USN rename)" if renamed else "")
+            + ("; file deleted afterwards" if del_rec else ""),
         )
+        if renamed:
+            _escalate_event(
+                session, renamed["event"], severity,
+                f"Correlated: USN rename of downloaded file to {renamed['new_base']} before execution",
+            )
+        if del_rec:
+            _escalate_event(
+                session, del_rec["event"], severity,
+                f"Correlated: {execution['base']} deleted after execution (cleanup / anti-forensics)",
+            )
         if execution["event"] is not None:
             _escalate_event(
                 session,
