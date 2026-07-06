@@ -1,4 +1,4 @@
-# Investigator — AI-Powered Velociraptor & Memory Forensics
+# Investigator — Velociraptor & Memory Forensics Gui Tool (With AI Support)
 
 **Made by Roei.f**
 
