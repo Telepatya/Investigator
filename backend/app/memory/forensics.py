@@ -6,9 +6,9 @@ import csv
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from app.config import get_cases_dir
 from app.ingest.normalize import (
@@ -20,7 +20,8 @@ from app.ingest.normalize import (
     truncate,
 )
 from app.ingest.parsers import _basename, parse_file
-from app.store.database import Event, MemoryResult, Process
+from app.store import cases as case_store
+from app.store.database import MemoryResult, Process
 
 
 ProgressCallback = Callable[[str, float, str, bool, str | None], Any]
@@ -151,11 +152,11 @@ def _ingest_csv(session, path: Path, source: str, dump_stem: str, known_pids: se
                 stats["memory_results"] += 1
 
             if len(pending) >= BATCH_SIZE:
-                _add_events_bulk(session, pending)
+                case_store.add_events_bulk(session, pending)
                 pending.clear()
                 session.commit()
     if pending:
-        _add_events_bulk(session, pending)
+        case_store.add_events_bulk(session, pending)
     session.commit()
     return stats
 
@@ -182,11 +183,11 @@ def _ingest_evtx(session, path: Path, source: str) -> dict[str, int]:
                 session.add(Process(**proc))
                 stats["processes"] += 1
         if len(pending) >= BATCH_SIZE:
-            _add_events_bulk(session, pending)
+            case_store.add_events_bulk(session, pending)
             pending.clear()
             session.commit()
     if pending:
-        _add_events_bulk(session, pending)
+        case_store.add_events_bulk(session, pending)
     session.commit()
     return stats
 
@@ -351,30 +352,6 @@ def _add_diagnostic(session, plugin: str, summary: str, data: dict[str, Any], se
     result = MemoryResult(plugin=plugin, pid=None, process_name=None, summary=summary, data=data, severity=severity)
     session.add(result)
     return result
-
-
-def _add_events_bulk(session, rows: Iterable[dict[str, Any]]) -> None:
-    events = [Event(**row) for row in rows]
-    if not events:
-        return
-    session.add_all(events)
-    session.flush()
-    session.execute(
-        text(
-            "INSERT INTO events_fts(rowid, summary, entity, source, category) "
-            "VALUES (:id, :summary, :entity, :source, :category)"
-        ),
-        [
-            {
-                "id": event.id,
-                "summary": event.summary or "",
-                "entity": event.entity or "",
-                "source": event.source or "",
-                "category": event.category or "",
-            }
-            for event in events
-        ],
-    )
 
 
 def _evtx_process_creation(event: dict[str, Any]) -> dict[str, Any] | None:

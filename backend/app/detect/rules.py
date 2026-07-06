@@ -198,6 +198,14 @@ SUSPICIOUS_PARENT_CHILD: list[tuple[str, str, str, str]] = [
     ("wmiprvse.exe", "cmd.exe", "T1047", "WMI provider spawning shell"),
 ]
 
+# (parent, child) -> (technique, description) for O(1) lookup in the per-process
+# detection loop. Pairs are exact lowercase names and unique, so this is an exact
+# substitute for a linear scan of SUSPICIOUS_PARENT_CHILD.
+SUSPICIOUS_PARENT_CHILD_MAP: dict[tuple[str, str], tuple[str, str]] = {
+    (parent, child): (technique, desc)
+    for parent, child, technique, desc in SUSPICIOUS_PARENT_CHILD
+}
+
 # System process names that should only run from system paths
 SYSTEM_PROCESS_PATHS: dict[str, str] = {
     "svchost.exe": r"\windows\system32",

@@ -4,7 +4,30 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
+
+# Hoisted out of parse_timestamp's hot path so they compile once, not per call.
+_NUMERIC_TS_RE = re.compile(r"\d{9,19}(\.\d+)?")
+_FRAC_TRIM_RE = re.compile(r"(.*\.\d{6})\d+(.*)")
+
+# Timestamp formats tried in order. Order is semantic (e.g. %m/%d vs %d/%m both
+# parse some strings, with different results) — do NOT reorder.
+_TIMESTAMP_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S.%f%z",
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%d %H:%M:%S.%f%z",
+    "%Y-%m-%d %H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M:%S %Z",
+    "%m/%d/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%b/%Y:%H:%M:%S %z",
+    "%d/%b/%Y:%H:%M:%S",
+)
 
 TIMESTAMP_KEYS = [
     "timestamp", "Timestamp", "TimeStamp", "time", "Time", "EventTime",
@@ -43,42 +66,33 @@ def parse_timestamp(value: Any) -> datetime | None:
         if not s or s in ("-", "N/A", "0"):
             return None
         # numeric string epoch
-        if re.fullmatch(r"\d{9,19}(\.\d+)?", s):
+        if _NUMERIC_TS_RE.fullmatch(s):
             return parse_timestamp(float(s))
-        # normalize timezone suffix
-        s = s.replace("Z", "+00:00")
-        # try common formats
-        formats = [
-            "%Y-%m-%dT%H:%M:%S.%f%z",
-            "%Y-%m-%dT%H:%M:%S%z",
-            "%Y-%m-%d %H:%M:%S.%f%z",
-            "%Y-%m-%d %H:%M:%S%z",
-            "%Y-%m-%dT%H:%M:%S.%f",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%d %H:%M:%S.%f",
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d %H:%M:%S %Z",
-            "%m/%d/%Y %H:%M:%S",
-            "%d/%m/%Y %H:%M:%S",
-            "%d/%b/%Y:%H:%M:%S %z",
-            "%d/%b/%Y:%H:%M:%S",
-        ]
-        # trim excess fractional digits (python supports max 6)
-        m = re.match(r"(.*\.\d{6})\d+(.*)", s)
-        if m:
-            s = m.group(1) + m.group(2)
-        for fmt in formats:
-            try:
-                dt = datetime.strptime(s, fmt)
-                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-            except ValueError:
-                continue
+        return _parse_timestamp_str(s)
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _parse_timestamp_str(s: str) -> datetime | None:
+    """Parse a non-empty, non-numeric timestamp string. Cached: pure function
+    returning immutable (tz-aware) datetimes, so results are safe to share."""
+    # normalize timezone suffix
+    s = s.replace("Z", "+00:00")
+    # trim excess fractional digits (python supports max 6)
+    m = _FRAC_TRIM_RE.match(s)
+    if m:
+        s = m.group(1) + m.group(2)
+    for fmt in _TIMESTAMP_FORMATS:
         try:
-            dt = datetime.fromisoformat(s)
+            dt = datetime.strptime(s, fmt)
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except ValueError:
-            return None
-    return None
+            continue
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def extract_timestamp(row: dict[str, Any]) -> datetime | None:
@@ -126,34 +140,39 @@ WIN_MESSAGE_CODES = {
 
 def decode_win_codes(row: dict[str, Any]) -> dict[str, Any]:
     """Replace %%18xx message-table placeholders with readable text."""
-    out: dict[str, Any] = {}
-    for k, v in row.items():
-        if isinstance(v, str) and v in WIN_MESSAGE_CODES:
-            out[k] = WIN_MESSAGE_CODES[v]
-        else:
-            out[k] = v
-    return out
+    # Fast path: most rows carry no placeholders, so skip rebuilding the dict.
+    # Callers always pass a freshly-built per-row dict, so returning it as-is is
+    # equivalent to the copy the rebuild would have produced.
+    if not any(isinstance(v, str) and v in WIN_MESSAGE_CODES for v in row.values()):
+        return row
+    return {
+        k: (WIN_MESSAGE_CODES[v] if isinstance(v, str) and v in WIN_MESSAGE_CODES else v)
+        for k, v in row.items()
+    }
 
 
 def truncate(value: str, limit: int = 500) -> str:
     return value if len(value) <= limit else value[: limit - 3] + "..."
 
 
+_SUMMARY_PREFERRED = (
+    "Message", "message",
+    # process/file/network context first: these say what actually happened
+    "Image", "CommandLine", "Cmdline", "ParentImage",
+    "TargetFilename", "TargetObject", "DestinationIp", "DestinationPort",
+    "QueryName",
+    "Name", "name", "FullPath", "OSPath", "Path",
+    "ImagePath", "Url", "TargetPath", "Exe",
+    "EventID", "Channel", "Provider", "User", "Username", "ServiceName",
+    "Laddr", "Raddr", "Status",
+    "KernelDebug", "TestSigning", "DisableIntegrityChecks", "FlightSigning",
+    "SubjectUserName", "request", "client_ip", "user_agent",
+)
+
+
 def summarize_row(row: dict[str, Any], max_fields: int = 6) -> str:
     """Build a compact human-readable summary from the most informative fields."""
-    preferred = [
-        "Message", "message",
-        # process/file/network context first: these say what actually happened
-        "Image", "CommandLine", "Cmdline", "ParentImage",
-        "TargetFilename", "TargetObject", "DestinationIp", "DestinationPort",
-        "QueryName",
-        "Name", "name", "FullPath", "OSPath", "Path",
-        "ImagePath", "Url", "TargetPath", "Exe",
-        "EventID", "Channel", "Provider", "User", "Username", "ServiceName",
-        "Laddr", "Raddr", "Status",
-        "KernelDebug", "TestSigning", "DisableIntegrityChecks", "FlightSigning",
-        "SubjectUserName", "request", "client_ip", "user_agent",
-    ]
+    preferred = _SUMMARY_PREFERRED
     parts: list[str] = []
     used: set[str] = set()
     for key in preferred:

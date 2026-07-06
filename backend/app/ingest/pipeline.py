@@ -8,12 +8,12 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from sqlalchemy import text
+from sqlalchemy import select
 
 from app.ingest.normalize import parse_timestamp
 from app.ingest.parsers import PARSABLE_EXTENSIONS, _basename, iter_zip_members, parse_file
 from app.store import cases as case_store
-from app.store.database import Event, Process
+from app.store.database import Process
 
 MEMORY_EXTENSIONS = {".raw", ".dmp", ".mem", ".vmem", ".bin", ".img", ".lime", ".dd"}
 DEFAULT_INGEST_BATCH_SIZE = 10000
@@ -121,28 +121,55 @@ def _evtx_process_creation(raw: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _add_events_bulk(session, rows: list[dict[str, Any]]) -> None:
-    events = [Event(**row) for row in rows]
-    if not events:
-        return
-    session.add_all(events)
-    session.flush()
-    session.execute(
-        text(
-            "INSERT INTO events_fts(rowid, summary, entity, source, category) "
-            "VALUES (:id, :summary, :entity, :source, :category)"
-        ),
-        [
-            {
-                "id": event.id,
-                "summary": event.summary or "",
-                "entity": event.entity or "",
-                "source": event.source or "",
-                "category": event.category or "",
-            }
-            for event in events
-        ],
-    )
+def _evtx_process_exit(raw: dict[str, Any]) -> int | None:
+    """PID of a process-exit event (Sysmon EID 5 / Security 4689), else None."""
+    eid = str(raw.get("EventID") or "")
+    channel = str(raw.get("Channel") or "")
+    provider = str(raw.get("Provider") or "")
+    if eid == "5" and ("sysmon" in channel.lower() or "sysmon" in provider.lower()):
+        return _to_int(raw.get("ProcessId"))
+    if eid == "4689" and (
+        channel == "Security" or provider == "Microsoft-Windows-Security-Auditing"
+    ):
+        # 4689 "A process has exited": ProcessId is the exiting process (hex).
+        return _to_int(raw.get("ProcessId"))
+    return None
+
+
+def _apply_evtx_exits(session, exits: dict[tuple[str, int], str | None]) -> int:
+    """Mark log-derived processes terminated from 4689/Sysmon-5 exit events.
+
+    A process-exit event only carries a (session, pid); PIDs are reused within a
+    long log, so the exit is attributed to the most recent creation for that pid
+    (the one with the greatest start_time). Best-effort provenance, not a
+    detection gate -- detections already run on every process regardless.
+    """
+    if not exits:
+        return 0
+    sids = {sid for sid, _pid in exits}
+    by_key: dict[tuple[str, int], list[Process]] = {}
+    for p in session.scalars(select(Process).where(Process.session_id.in_(sids))):
+        by_key.setdefault((p.session_id, p.pid), []).append(p)
+
+    marked = 0
+    for (sid, pid), exit_iso in exits.items():
+        candidates = by_key.get((sid, pid))
+        if not candidates:
+            continue
+        target = candidates[0]
+        for cand in candidates[1:]:
+            if cand.start_time and (target.start_time is None or cand.start_time > target.start_time):
+                target = cand
+        flags = set(target.flags or [])
+        if "terminated" not in flags:
+            flags.add("terminated")
+            target.flags = sorted(flags)
+            marked += 1
+        if exit_iso:
+            extra = dict(target.extra or {})
+            extra.setdefault("exit_time", exit_iso)
+            target.extra = extra
+    return marked
 
 
 def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) -> dict[str, int]:
@@ -155,6 +182,8 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
     # are only synthesized for genuinely unseen parents.
     seen_evtx_procs: set[tuple[str, int, str | None, str]] = set()
     known_pids: set[tuple[str, int]] = set()
+    # (session_id, pid) -> latest exit-event ISO timestamp, applied after parsing.
+    evtx_exits: dict[tuple[str, int], str | None] = {}
 
     def handle_evtx_process(event_kwargs: dict[str, Any], source: str) -> None:
         info = _evtx_process_creation(event_kwargs.get("raw") or {})
@@ -202,7 +231,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
         def flush_batch() -> None:
             if not pending_events:
                 return
-            _add_events_bulk(session, pending_events)
+            case_store.add_events_bulk(session, pending_events)
             pending_events.clear()
             session.commit()
             session.expunge_all()
@@ -223,6 +252,17 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
                 # Velociraptor JSON exports alike; _evtx_process_creation is a
                 # cheap no-op for anything else.
                 handle_evtx_process(event_kwargs, source)
+                raw = event_kwargs.get("raw") or {}
+                exit_pid = _evtx_process_exit(raw)
+                if exit_pid is not None:
+                    sid = f"evtx-{event_kwargs.get('host') or Path(source).stem}"
+                    start = event_kwargs.get("timestamp")
+                    iso = start.isoformat() if start else None
+                    key = (sid, exit_pid)
+                    prev = evtx_exits.get(key)
+                    # keep the latest exit timestamp seen for this pid
+                    if key not in evtx_exits or (iso and (prev is None or iso > prev)):
+                        evtx_exits[key] = iso
             if batch % batch_size == 0:
                 flush_batch()
         flush_batch()
@@ -246,6 +286,9 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
             stats["files"] = 1
         else:
             progress("skipped", 100.0, f"Unsupported file type: {suffix}", False, None)
+        # Apply process-exit events after all creations are persisted, so exits
+        # can match creations that appeared in any earlier batch.
+        _apply_evtx_exits(session, evtx_exits)
         session.commit()
     except Exception:
         session.rollback()

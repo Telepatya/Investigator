@@ -86,7 +86,17 @@ function EntityNodeCard({ data }: { data: any }) {
       <div className="text-sm font-semibold text-ink-50 truncate mt-0.5" title={data.value}>
         {data.label}
       </div>
-      <div className="text-[10px] text-ink-500 mt-0.5">{data.action_count} actions</div>
+      <div className="flex items-center gap-1.5 mt-0.5">
+        <span className="text-[10px] text-ink-500">{data.action_count} actions</span>
+        {data.dead && (
+          <span
+            className="text-[9px] px-1 rounded bg-white/10 text-ink-300 uppercase tracking-wider"
+            title={data.state ? `Service state: ${data.state}` : "Process has exited"}
+          >
+            {data.type === "service" ? data.state || "stopped" : "terminated"}
+          </span>
+        )}
+      </div>
       <Handle type="source" position={Position.Bottom} className="!bg-ink-500" />
     </div>
   );
@@ -98,6 +108,7 @@ export default function EntityMapPage() {
   const { caseId } = useParams();
   const [minSeverity, setMinSeverity] = useState<Severity>("info");
   const [activeTypes, setActiveTypes] = useState<Set<EntityType>>(new Set(ALL_TYPES));
+  const [showTerminated, setShowTerminated] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
 
   const { data, isLoading } = useQuery({
@@ -109,13 +120,20 @@ export default function EntityMapPage() {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
 
+  const deadCount = useMemo(
+    () => (data ? data.nodes.filter((n) => n.meta?.dead).length : 0),
+    [data],
+  );
+
   const filtered = useMemo(() => {
     if (!data) return null;
-    const keepNodes = data.nodes.filter((n) => activeTypes.has(n.type));
+    const keepNodes = data.nodes.filter(
+      (n) => activeTypes.has(n.type) && (showTerminated || !n.meta?.dead),
+    );
     const keep = new Set(keepNodes.map((n) => n.id));
     const keepEdges = data.edges.filter((e) => keep.has(e.source) && keep.has(e.target));
     return { nodes: keepNodes, edges: keepEdges };
-  }, [data, activeTypes]);
+  }, [data, activeTypes, showTerminated]);
 
   useEffect(() => {
     if (!filtered) return;
@@ -168,6 +186,17 @@ export default function EntityMapPage() {
               {TYPE_ICON[t]} {t} ({data.type_counts[t]})
             </button>
           ))}
+          {deadCount > 0 && (
+            <button
+              onClick={() => setShowTerminated((v) => !v)}
+              title="Show terminated processes and stopped services and their relationships"
+              className={`chip transition ${
+                showTerminated ? "bg-accent-cyan/15 text-accent-cyan" : "bg-white/5 text-ink-500"
+              }`}
+            >
+              {showTerminated ? "showing terminated" : "show terminated"} ({deadCount})
+            </button>
+          )}
           <select
             className="input w-auto py-1 ml-2"
             value={minSeverity}
@@ -231,6 +260,8 @@ function layoutGraph(nodes: EntityNode[], edges: { source: string; target: strin
           severity: n.severity,
           action_count: n.action_count,
           finding_count: n.findings.length,
+          dead: n.meta?.dead ?? false,
+          state: n.meta?.state,
         },
       });
     });

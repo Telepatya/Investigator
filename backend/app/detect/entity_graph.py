@@ -19,6 +19,11 @@ from app.store.database import Event, Finding, Process
 
 SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
+# Process flags that mean the process is no longer running.
+_DEAD_PROCESS_FLAGS = {"terminated", "exited"}
+# Service states (lowercased) that mean the service is not currently running.
+_DEAD_SERVICE_STATES = {"stopped", "inactive", "disabled", "stop pending", "stopping"}
+
 ENTITY_TYPES = (
     "user", "account", "host", "ip", "process", "service", "file", "url", "registry", "domain"
 )
@@ -43,6 +48,7 @@ EVENTID_VERB = {
     "4756": "added to universal group",
     "4697": "installed service",
     "7045": "installed service",
+    "7036": "changed service state",
     "4698": "created scheduled task",
     "4702": "updated scheduled task",
     "1102": "cleared event log",
@@ -188,7 +194,14 @@ def _extract_from_event(g: _Graph, ev: Event) -> None:
     target_user = _norm(raw.get("TargetUserName"))
     proc = _norm(raw.get("NewProcessName") or raw.get("Image") or raw.get("ProcessName"))
     parent = _norm(raw.get("ParentProcessName") or raw.get("ParentImage"))
-    service = _norm(raw.get("ServiceName") or raw.get("Service Name") or raw.get("ServiceFileName"))
+    # "service"/"binary"/"state" are the lowercase keys memory svcscan events use;
+    # the CamelCase ones come from EVTX 7045/4697/7036 service events.
+    service = _norm(
+        raw.get("ServiceName") or raw.get("Service Name")
+        or raw.get("ServiceFileName") or raw.get("service")
+    )
+    service_state = _norm(raw.get("state") or raw.get("State"))
+    service_binary = _norm(raw.get("binary") or raw.get("Binary") or raw.get("ImagePath"))
     ip = _norm(raw.get("IpAddress") or raw.get("SourceIp") or raw.get("Raddr") or raw.get("DestinationIp"))
     if ip and not _looks_like_ip(ip):
         ip = None
@@ -218,6 +231,20 @@ def _extract_from_event(g: _Graph, ev: Event) -> None:
 
     if service:
         svc = g.node("service", service)
+        if svc:
+            smeta = g.nodes[svc]["meta"]
+            if service_state:
+                smeta["state"] = service_state
+                if service_state.lower() in _DEAD_SERVICE_STATES:
+                    smeta["dead"] = True
+                elif "dead" not in smeta:
+                    smeta["dead"] = False
+            if service_binary:
+                # relationship to the on-disk image, so a stopped service still
+                # shows what it would run when viewed via the toggle.
+                fnode = g.node("file", service_binary)
+                g.bump(fnode, sev, ts)
+                g.edge(svc, fnode, "runs", sev, ts, summary)
         g.bump(svc, sev, ts)
         g.edge(actor_node or host_node, svc, verb or "installed service", sev, ts, summary)
 
@@ -239,6 +266,9 @@ def _extract_from_event(g: _Graph, ev: Event) -> None:
 
 def _extract_from_processes(g: _Graph, procs: list[Process]) -> None:
     by_pid: dict[int, Process] = {p.pid: p for p in procs}
+    # nid -> [alive instances, dead instances, union of flags] so a process-name
+    # node is marked dead only when every contributing process has exited.
+    liveness: dict[str, list[Any]] = {}
     for p in procs:
         name = _basename(p.name or f"pid-{p.pid}")
         pnode = g.node("process", name)
@@ -248,6 +278,13 @@ def _extract_from_processes(g: _Graph, procs: list[Process]) -> None:
                 g.nodes[pnode]["meta"]["pids"].append(p.pid)
             if p.cmdline and not g.nodes[pnode]["meta"].get("cmdline"):
                 g.nodes[pnode]["meta"]["cmdline"] = p.cmdline[:400]
+            pflags = set(p.flags or [])
+            agg = liveness.setdefault(pnode, [0, 0, set()])
+            agg[2].update(pflags)
+            if pflags & _DEAD_PROCESS_FLAGS:
+                agg[1] += 1
+            else:
+                agg[0] += 1
         g.bump(pnode, p.severity, p.start_time)
         parent = by_pid.get(p.ppid) if p.ppid else None
         if parent:
@@ -263,6 +300,15 @@ def _extract_from_processes(g: _Graph, procs: list[Process]) -> None:
             un = g.node("user", owner)
             g.bump(un, p.severity, p.start_time)
             g.edge(un, pnode, "ran", p.severity, p.start_time, f"{owner} ran {name}")
+
+    # Finalize per-node liveness: surface the union of process flags and mark the
+    # node dead only when it has no live instance. Consumed by the entity-map
+    # "show terminated" toggle and the terminated badge.
+    for nid, (alive, dead, flags) in liveness.items():
+        meta = g.nodes[nid]["meta"]
+        if flags:
+            meta["flags"] = sorted(flags)
+        meta["dead"] = alive == 0 and dead > 0
 
 
 def _attach_findings(g: _Graph, findings: list[Finding]) -> None:

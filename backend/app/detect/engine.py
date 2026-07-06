@@ -18,7 +18,7 @@ from app.detect.rules import (
     SCHEDULED_TASK_SCRIPT_HOSTS,
     SUSPICIOUS_CMDLINE_PATTERNS,
     SUSPICIOUS_EXECUTION_DIRS,
-    SUSPICIOUS_PARENT_CHILD,
+    SUSPICIOUS_PARENT_CHILD_MAP,
     SYSTEM_PROCESS_PATHS,
     TASK_UPDATER_MASQUERADES,
     WEB_ATTACK_PATTERNS,
@@ -1892,20 +1892,21 @@ def run_detections_sync(case_id: str) -> int:
                 }
                 # Known-bad pairs (skip when the parent PID was demonstrably reused)
                 if not pid_reused:
-                    for par, child, technique, desc in SUSPICIOUS_PARENT_CHILD:
-                        if pname == par and name == child:
-                            _add_finding(
-                                session, existing,
-                                title=f"Suspicious process chain: {parent.name} -> {proc.name}",
-                                description=f"{desc}. Child cmdline: {(cmdline or 'n/a')[:400]}",
-                                severity="high",
-                                techniques=[technique],
-                                evidence=parent_evidence,
-                                source="process-heuristics",
-                            )
-                            flags.append("bad-parent-child")
-                            if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
-                                proc.severity = "high"
+                    bad_pair = SUSPICIOUS_PARENT_CHILD_MAP.get((pname, name))
+                    if bad_pair is not None:
+                        technique, desc = bad_pair
+                        _add_finding(
+                            session, existing,
+                            title=f"Suspicious process chain: {parent.name} -> {proc.name}",
+                            description=f"{desc}. Child cmdline: {(cmdline or 'n/a')[:400]}",
+                            severity="high",
+                            techniques=[technique],
+                            evidence=parent_evidence,
+                            source="process-heuristics",
+                        )
+                        flags.append("bad-parent-child")
+                        if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
+                            proc.severity = "high"
                 # Broken expected parentage for core system processes
                 if name in EXPECTED_PARENTS and pname and pname not in EXPECTED_PARENTS[name]:
                     if pid_reused:
@@ -2597,9 +2598,13 @@ def run_detections_sync(case_id: str) -> int:
 
         # --- Severity taint propagation: events mentioning a flagged process/DLL/file
         # --- name inherit its severity, with provenance recorded on the event.
+        # NOTE: _propagate_flagged_entities iterates its events argument twice (it
+        # collects taint on the first pass and escalates on the second), so it must
+        # be given a materialized list -- a single-use streaming ScalarResult would
+        # be exhausted after the first pass and silently escalate nothing.
         _propagate_flagged_entities(
             session,
-            session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)),
+            list(session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE))),
             processes,
         )
 
