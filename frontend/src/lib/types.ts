@@ -133,7 +133,17 @@ export interface EntityNode {
   first_seen: string | null;
   last_seen: string | null;
   findings: { id: number; title: string; severity: Severity; techniques: string[] }[];
-  meta: Record<string, unknown>;
+  meta: EntityNodeMeta;
+}
+
+export interface EntityNodeMeta extends Record<string, unknown> {
+  // Present on process nodes: true when every contributing process has exited.
+  dead?: boolean;
+  // Union of process flags (e.g. "terminated", "hidden") or, for services,
+  // the service state ("Stopped", "Running", …).
+  flags?: string[];
+  state?: string;
+  pids?: number[];
 }
 
 export interface EntityEdge {
