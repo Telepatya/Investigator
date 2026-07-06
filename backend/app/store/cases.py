@@ -9,6 +9,7 @@ import shutil
 import stat
 import time
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -272,6 +273,36 @@ def add_event(session: Session, **kwargs) -> Event:
     session.flush()
     sync_fts(session, event.id)
     return event
+
+
+def add_events_bulk(session: Session, rows: Iterable[dict]) -> None:
+    """Insert many events plus their FTS rows in two statements.
+
+    Shared by the artifact-ingest and memory-forensics batch paths so the
+    contentless-external events_fts table stays in sync with a single
+    executemany rather than a get+insert per row.
+    """
+    events = [Event(**row) for row in rows]
+    if not events:
+        return
+    session.add_all(events)
+    session.flush()
+    session.execute(
+        text(
+            "INSERT INTO events_fts(rowid, summary, entity, source, category) "
+            "VALUES (:id, :summary, :entity, :source, :category)"
+        ),
+        [
+            {
+                "id": event.id,
+                "summary": event.summary or "",
+                "entity": event.entity or "",
+                "source": event.source or "",
+                "category": event.category or "",
+            }
+            for event in events
+        ],
+    )
 
 
 def search_events(session: Session, query: str, limit: int = 50) -> list[Event]:

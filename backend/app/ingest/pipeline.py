@@ -8,12 +8,10 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from sqlalchemy import text
-
 from app.ingest.normalize import parse_timestamp
 from app.ingest.parsers import PARSABLE_EXTENSIONS, _basename, iter_zip_members, parse_file
 from app.store import cases as case_store
-from app.store.database import Event, Process
+from app.store.database import Process
 
 MEMORY_EXTENSIONS = {".raw", ".dmp", ".mem", ".vmem", ".bin", ".img", ".lime", ".dd"}
 DEFAULT_INGEST_BATCH_SIZE = 10000
@@ -121,30 +119,6 @@ def _evtx_process_creation(raw: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _add_events_bulk(session, rows: list[dict[str, Any]]) -> None:
-    events = [Event(**row) for row in rows]
-    if not events:
-        return
-    session.add_all(events)
-    session.flush()
-    session.execute(
-        text(
-            "INSERT INTO events_fts(rowid, summary, entity, source, category) "
-            "VALUES (:id, :summary, :entity, :source, :category)"
-        ),
-        [
-            {
-                "id": event.id,
-                "summary": event.summary or "",
-                "entity": event.entity or "",
-                "source": event.source or "",
-                "category": event.category or "",
-            }
-            for event in events
-        ],
-    )
-
-
 def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) -> dict[str, int]:
     """Synchronous ingestion of one uploaded file. Returns counts."""
     session = case_store.get_session(case_id)
@@ -202,7 +176,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
         def flush_batch() -> None:
             if not pending_events:
                 return
-            _add_events_bulk(session, pending_events)
+            case_store.add_events_bulk(session, pending_events)
             pending_events.clear()
             session.commit()
             session.expunge_all()

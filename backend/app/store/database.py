@@ -150,6 +150,12 @@ def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
         # without it, case-stat queries 500 with "database is locked" mid-ingest.
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
+        # Bigger page cache and in-memory temp store speed up the large batch
+        # inserts and index maintenance during ingest; mmap reduces read syscalls
+        # for the stat/timeline queries. Durability is unchanged (still WAL+NORMAL).
+        cursor.execute("PRAGMA cache_size=-65536")   # ~64 MiB page cache
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute("PRAGMA mmap_size=268435456")  # 256 MiB
     finally:
         cursor.close()
 
