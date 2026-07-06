@@ -1382,6 +1382,20 @@ def _correlate_file_execution_provenance(
         gap_txt = "unknown time after" if gap == _DOWNLOAD_CORRELATION_WINDOW_S else (
             f"{gap/60:.0f} minutes after" if gap < 5400 else f"{gap/3600:.1f} hours after"
         )
+        # Surface the provenance as first-class entity-map edges: the downloaded
+        # file (and, when known, the URL it came from) linked to the process that
+        # ran it. Process/file use basenames so the file node and the executed
+        # process node coincide with the ones built from the process table.
+        chain_edges: list[dict[str, str]] = [{
+            "src_type": "file", "src": artifact["base"],
+            "verb": f"{artifact['kind']}, later executed",
+            "dst_type": "process", "dst": execution["base"],
+        }]
+        if artifact["origin"]:
+            chain_edges.insert(0, {
+                "src_type": "url", "src": artifact["origin"],
+                "verb": "served", "dst_type": "file", "dst": artifact["base"],
+            })
         _add_finding(
             session,
             existing,
@@ -1406,6 +1420,7 @@ def _correlate_file_execution_provenance(
                 "match_confidence": confidence,
                 "gap_seconds": None if gap == _DOWNLOAD_CORRELATION_WINDOW_S else round(gap, 1),
                 "origin_url": artifact["origin"],
+                "chain_edges": chain_edges,
             },
             source="correlation",
         )
