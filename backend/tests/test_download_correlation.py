@@ -147,6 +147,55 @@ class DownloadCorrelationTests(unittest.TestCase):
         self.assertIn(("file::rclone.exe", "process::rclone.exe"), edges)
         self.assertTrue(any(s_.startswith("url::") and d == "file::rclone.exe" for s_, d in edges))
 
+    def test_download_correlates_with_velociraptor_startup_argv_event(self) -> None:
+        # The live Velociraptor Application log records startup as EventID 1000
+        # "Velociraptor startup ARGV", not as Sysmon 1 / Security 4688. That is
+        # still execution evidence for download provenance.
+        case = cases.create_case("velo-argv")
+        s = cases.get_session(case["id"])
+        t0 = datetime(2026, 7, 4, 17, 22, 28, tzinfo=timezone.utc)
+        name = "velociraptor-v0.77.1-windows-amd64.exe"
+        dlpath = f"\\\\.\\C:\\Users\\roeif\\Downloads\\{name}"
+        runpath = f"C:\\Users\\roeif\\Desktop\\velociraptor\\{name}"
+        try:
+            cases.add_event(
+                s, timestamp=t0, host="Atlas",
+                source="Windows.Analysis.EvidenceOfDownload.json",
+                category="artifact", entity=None, severity="info",
+                summary=f"DownloadedFilePath={dlpath}",
+                raw={
+                    "DownloadedFilePath": dlpath,
+                    "_ZoneIdentifierContent": (
+                        "[ZoneTransfer]\r\nZoneId=3\r\n"
+                        "ReferrerUrl=https://docs.velociraptor.app/\r\n"
+                        f"HostUrl=https://release-assets.githubusercontent.com/{name}\r\n"
+                    ),
+                },
+            )
+            cases.add_event(
+                s, timestamp=t0 + timedelta(seconds=46), host="Atlas",
+                source="Windows.EventLogs.Evtx.json", category="eventlog",
+                entity="EventID 1000 (Application)", severity="info",
+                summary=f'Velociraptor startup ARGV: ["{runpath}"]',
+                raw={
+                    "EventID": 1000,
+                    "Channel": "Application",
+                    "Provider": "Velociraptor",
+                    "Message": f'Velociraptor startup ARGV: ["{runpath}"]',
+                    "Data": [f'Velociraptor startup ARGV: ["{runpath}"]\n'],
+                },
+            )
+            s.commit()
+        finally:
+            s.close()
+
+        run_detections_sync(case["id"])
+        graph = entity_graph.build_entity_graph(case["id"])
+
+        edges = {(e["source"], e["target"]) for e in graph["edges"]}
+        self.assertIn((f"file::{name}", f"process::{name}"), edges)
+        self.assertTrue(any(s_.startswith("url::") and d == f"file::{name}" for s_, d in edges))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -60,6 +60,14 @@ const ALL_TYPES: EntityType[] = [
   "domain",
 ];
 
+const SEVERITY_RANK: Record<Severity, number> = {
+  info: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  critical: 4,
+};
+
 function EntityNodeCard({ data }: { data: any }) {
   const sev = data.severity as Severity;
   const active = sev !== "info";
@@ -134,14 +142,13 @@ export default function EntityMapPage() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const focusActive = focusId !== null;
 
-  // While focused, reveal everything connected regardless of severity by loading
-  // the full graph (the server otherwise pre-filters by min_severity).
-  const effMinSeverity: Severity = focusActive ? "info" : minSeverity;
+  // Load the broad graph once and apply severity locally so the dropdown feels
+  // instant instead of waiting on a slow graph rebuild for each threshold.
   const maxNodes = focusActive ? 600 : 250;
 
   const { data, isLoading } = useQuery({
-    queryKey: ["entities", caseId, effMinSeverity, maxNodes],
-    queryFn: () => api.getEntities(caseId!, { min_severity: effMinSeverity, max_nodes: maxNodes }),
+    queryKey: ["entities", caseId, maxNodes],
+    queryFn: () => api.getEntities(caseId!, { min_severity: "info", max_nodes: maxNodes }),
     enabled: !!caseId,
     placeholderData: (prev) => prev,
   });
@@ -196,13 +203,17 @@ export default function EntityMapPage() {
       const keepEdges = data.edges.filter((e) => keep.has(e.source) && keep.has(e.target));
       return { nodes: keepNodes, edges: keepEdges };
     }
+    const minRank = SEVERITY_RANK[minSeverity];
     const keepNodes = data.nodes.filter(
-      (n) => activeTypes.has(n.type) && (showTerminated || !n.meta?.dead),
+      (n) =>
+        SEVERITY_RANK[n.severity] >= minRank &&
+        activeTypes.has(n.type) &&
+        (showTerminated || !n.meta?.dead),
     );
     const keep = new Set(keepNodes.map((n) => n.id));
     const keepEdges = data.edges.filter((e) => keep.has(e.source) && keep.has(e.target));
     return { nodes: keepNodes, edges: keepEdges };
-  }, [data, activeTypes, showTerminated, focusView]);
+  }, [data, activeTypes, showTerminated, focusView, minSeverity]);
 
   useEffect(() => {
     if (!filtered) return;

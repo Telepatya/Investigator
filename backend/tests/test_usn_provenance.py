@@ -121,6 +121,75 @@ class UsnProvenanceTests(unittest.TestCase):
         self.assertTrue(any(s_ == "file::payload.exe" and d == "process::payload.exe"
                             for s_, v, d in edges), edges)
 
+    def test_download_multi_rename_chain_then_executed(self) -> None:
+        case = cases.create_case("multirename")
+        s = cases.get_session(case["id"])
+        dl = "C:\\Users\\v\\Downloads\\stage1.exe"
+        mid = "C:\\Users\\v\\AppData\\Local\\Temp\\stage2.exe"
+        final = "C:\\Users\\v\\AppData\\Local\\Temp\\payload.exe"
+        try:
+            self._download(s, dl, self.t0)
+            self._usn(s, dl, ["RENAME_OLD_NAME"], "900:1", self.t0 + timedelta(minutes=2))
+            self._usn(s, mid, ["RENAME_NEW_NAME"], "900:1", self.t0 + timedelta(minutes=2))
+            self._usn(s, mid, ["RENAME_OLD_NAME"], "900:1", self.t0 + timedelta(minutes=3))
+            self._usn(s, final, ["RENAME_NEW_NAME"], "900:1", self.t0 + timedelta(minutes=3))
+            s.add(Process(pid=72, ppid=None, name="payload.exe", path=final,
+                          cmdline="payload.exe", session_id="live", flags=[], severity="low",
+                          start_time=self.t0 + timedelta(minutes=8)))
+            s.commit()
+        finally:
+            s.close()
+
+        run_detections_sync(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            fins = [
+                f for f in s.scalars(select(Finding))
+                if f.title.startswith("File artifact later executed")
+                and f.evidence.get("artifact_path") == dl
+            ]
+            self.assertTrue(fins, "no download lifecycle finding")
+            fin = fins[0]
+            self.assertEqual(fin.evidence["match_confidence"], "usn-rename-chain")
+            self.assertEqual(fin.evidence["renamed_from"], dl)
+            self.assertEqual(fin.evidence["renamed_to"], final)
+            self.assertEqual(len(fin.evidence["rename_chain"]), 2)
+        finally:
+            s.close()
+
+        edges = _edges(entity_graph.build_entity_graph(case["id"]))
+        self.assertIn(("file::stage1.exe", "renamed to", "file::stage2.exe"), edges)
+        self.assertIn(("file::stage2.exe", "renamed to", "file::payload.exe"), edges)
+        self.assertTrue(any(s_ == "file::payload.exe" and d == "process::payload.exe"
+                            for s_, v, d in edges), edges)
+
+    def test_download_without_execution_stays_context_only(self) -> None:
+        case = cases.create_case("noexec")
+        s = cases.get_session(case["id"])
+        dl = "C:\\Users\\v\\Downloads\\never_run.exe"
+        renamed = "C:\\Users\\v\\Downloads\\never_run_renamed.exe"
+        try:
+            self._download(s, dl, self.t0)
+            self._usn(s, dl, ["RENAME_OLD_NAME"], "901:1", self.t0 + timedelta(minutes=2))
+            self._usn(s, renamed, ["RENAME_NEW_NAME"], "901:1", self.t0 + timedelta(minutes=2))
+            s.commit()
+        finally:
+            s.close()
+
+        run_detections_sync(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            fins = [
+                f for f in s.scalars(select(Finding))
+                if f.title.startswith("File artifact later executed")
+            ]
+            self.assertEqual(fins, [])
+        finally:
+            s.close()
+
+        graph = entity_graph.build_entity_graph(case["id"])
+        self.assertFalse(any(n["type"] == "file" and "never_run" in n["value"] for n in graph["nodes"]))
+
     def test_download_executed_then_deleted(self) -> None:
         case = cases.create_case("delete")
         s = cases.get_session(case["id"])

@@ -692,6 +692,58 @@ def _basename(path: str) -> str:
     return p.rsplit("\\", 1)[-1].strip().lower()
 
 
+def _startup_argv_execution(raw: dict[str, Any]) -> tuple[str, str] | None:
+    """Treat Velociraptor/.NET startup ARGV application logs as execution evidence."""
+    bits: list[str] = []
+    data = raw.get("Data")
+    if isinstance(data, list):
+        bits.extend(str(v) for v in data)
+    elif data:
+        bits.append(str(data))
+    for key in ("Message", "RenderedDescription"):
+        if raw.get(key):
+            bits.append(str(raw.get(key)))
+
+    text = "\n".join(bits)
+    if "startup argv" not in text.lower():
+        return None
+    m = re.search(r"ARGV:\s*(\[[\s\S]*?\])", text)
+    if not m:
+        return None
+    try:
+        argv = json.loads(m.group(1))
+    except Exception:
+        first = re.search(r'^\[\s*"([^"]+)"', m.group(1))
+        if not first:
+            return None
+        image = first.group(1).strip()
+        return (image, image) if image else None
+    if not isinstance(argv, list) or not argv:
+        return None
+    image = str(argv[0]).strip()
+    if not image:
+        return None
+    return image, " ".join(str(arg) for arg in argv)
+
+
+def _event_execution(raw: dict[str, Any], eid: str) -> tuple[str, str | None] | None:
+    if eid in {"1", "4688"}:
+        if not _eid_channel_ok(raw, eid):
+            return None
+        image = _field(raw, "Image", "NewProcessName")
+        return (image, _field(raw, "CommandLine", "Cmdline")) if image else None
+
+    if eid == "1000":
+        return _startup_argv_execution(raw)
+
+    channel = str(raw.get("Channel") or "")
+    if eid == "17" and "Program-Compatibility-Assistant" in channel:
+        image = _field(raw, "ExePath")
+        return (image, None) if image else None
+
+    return None
+
+
 _GUID_NAME_RE = re.compile(r"^\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?$")
 _HEX_NAME_RE = re.compile(r"^[0-9a-f]{12,}$")
 _VOWELS = set("aeiou")
@@ -1201,7 +1253,8 @@ def _corr_tokens(text: str) -> set[str]:
     }
 
 
-_ZONE_URL_RE = re.compile(r"(ReferrerUrl|HostUrl)=(\S+)", re.IGNORECASE)
+_ZONE_HOST_URL_RE = re.compile(r"HostUrl=(\S+)", re.IGNORECASE)
+_ZONE_REFERRER_URL_RE = re.compile(r"ReferrerUrl=(\S+)", re.IGNORECASE)
 _DOWNLOAD_PAYLOAD_RE = re.compile(
     r"\.(?:exe|msi|dll|sys|ps1|bat|cmd|vbs|js|scr|com|zip|7z|rar|gz|iso|cab)$",
     re.IGNORECASE,
@@ -1228,7 +1281,7 @@ _DOWNLOAD_PATH_FIELDS = (
 )
 # URL columns various download artifacts use for the origin.
 _DOWNLOAD_URL_FIELDS = (
-    "URL", "Url", "Referrer", "ReferrerUrl", "HostUrl", "DownloadUrl", "SourceUrl", "Uri",
+    "HostUrl", "DownloadUrl", "SourceUrl", "URL", "Url", "Uri", "ReferrerUrl", "Referrer",
 )
 
 
@@ -1239,8 +1292,8 @@ def _download_origin(raw: dict[str, Any]) -> str | None:
     if url:
         return url[:300]
     zone = str(raw.get("_ZoneIdentifierContent") or raw.get("ZoneIdentifierContent") or "")
-    m = _ZONE_URL_RE.search(zone)
-    return m.group(2)[:300] if m else None
+    m = _ZONE_HOST_URL_RE.search(zone) or _ZONE_REFERRER_URL_RE.search(zone)
+    return m.group(1)[:300] if m else None
 
 
 def _download_evidence(event: Event, raw: dict[str, Any]) -> tuple[str, str | None]:
@@ -1266,6 +1319,8 @@ def _download_evidence(event: Event, raw: dict[str, Any]) -> tuple[str, str | No
 def _event_needed_for_provenance(event: Event, raw: dict[str, Any]) -> bool:
     eid = str(raw.get("EventID") or "")
     if eid and _eid_channel_ok(raw, eid) and eid in {"11", "12", "13", "4697", "7045"}:
+        return True
+    if _event_execution(raw, eid):
         return True
     if _download_evidence(event, raw)[0]:
         return True
@@ -1410,33 +1465,121 @@ def _collect_usn_deletes(events: list[Event]) -> list[dict[str, Any]]:
     return deletes
 
 
-def _deleted_after(execution: dict[str, Any], frn: str, deletes: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """A delete of the executed file that postdates the execution, matched by
-    file reference number when available, otherwise by resolved path."""
-    exec_key = _artifact_path_key(execution["path"])
-    exec_ts = _aware(execution["timestamp"]) if execution["timestamp"] else None
-    for d in deletes:
-        if d["timestamp"] is None or exec_ts is None or _aware(d["timestamp"]) <= exec_ts:
-            continue
-        same_file = (frn and d["frn"] and d["frn"] == frn) or (
-            exec_key and _artifact_path_key(d["path"]) == exec_key
-        )
-        if same_file:
-            return d
-    return None
+def _candidate_event_in_window(candidate: dict[str, Any], ts: datetime | None) -> bool:
+    start = candidate["event"].timestamp
+    if not start or not ts:
+        return True
+    gap = (_aware(ts) - _aware(start)).total_seconds()
+    return 0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S
 
 
-def _correlate_file_execution_provenance(
-    session,
-    existing: set[tuple[str, str]],
-    events: list[Event],
-    processes: list[Process],
-) -> None:
-    artifacts = _collect_file_artifacts(events)
-    if not artifacts:
-        return
+def _segment_active_at(segment: dict[str, Any], ts: datetime | None) -> bool:
+    if not ts:
+        return True
+    ats = _aware(ts)
+    if segment["start"] and ats < _aware(segment["start"]):
+        return False
+    if segment["end"] and ats > _aware(segment["end"]):
+        return False
+    return True
+
+
+def _candidate_matches_rename(candidate: dict[str, Any], rn: dict[str, Any]) -> bool:
+    if candidate.get("frn") and rn.get("frn") and candidate["frn"] == rn["frn"]:
+        return True
+    current = candidate["segments"][-1]
+    old_key = _artifact_path_key(rn["old_path"])
+    current_key = _artifact_path_key(current["path"])
+    if old_key and current_key and old_key == current_key:
+        return True
+    base = rn["old_base"]
+    return (
+        not candidate.get("frn")
+        and base == current["base"]
+        and base not in _COMMON_DOWNLOAD_NAMES
+        and base not in _PAIRING_GENERIC_HOSTS
+    )
+
+
+def _candidate_matches_delete(candidate: dict[str, Any], delete: dict[str, Any]) -> bool:
+    if candidate.get("frn") and delete.get("frn") and candidate["frn"] == delete["frn"]:
+        return True
+    delete_key = _artifact_path_key(delete["path"])
+    for segment in candidate["segments"]:
+        segment_key = _artifact_path_key(segment["path"])
+        if (
+            delete_key
+            and segment_key
+            and delete_key == segment_key
+            and _segment_active_at(segment, delete["timestamp"])
+        ):
+            return True
+    current = candidate["segments"][-1]
+    return (
+        not candidate.get("frn")
+        and delete["base"] == current["base"]
+        and delete["base"] not in _COMMON_DOWNLOAD_NAMES
+        and delete["base"] not in _PAIRING_GENERIC_HOSTS
+    )
+
+
+def _artifact_lifecycles(
+    artifacts: list[dict[str, Any]],
+    renames: list[dict[str, Any]],
+    deletes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Advance each artifact through USN rename/delete state until execution."""
+    candidates: list[dict[str, Any]] = []
+    for artifact in artifacts:
+        candidates.append({
+            **artifact,
+            "frn": None,
+            "renames": [],
+            "deletes": [],
+            "segments": [{
+                "path": artifact["path"],
+                "base": artifact["base"],
+                "start": artifact["event"].timestamp,
+                "end": None,
+            }],
+        })
+
+    for rn in sorted(
+        renames,
+        key=lambda r: (r["timestamp"].isoformat() if r["timestamp"] else "", r["event"].id or 0),
+    ):
+        for candidate in candidates:
+            if not _candidate_event_in_window(candidate, rn["timestamp"]):
+                continue
+            if not _candidate_matches_rename(candidate, rn):
+                continue
+            candidate["frn"] = candidate.get("frn") or rn.get("frn") or None
+            candidate["renames"].append(rn)
+            candidate["segments"][-1]["end"] = rn["timestamp"]
+            candidate["segments"].append({
+                "path": rn["new_path"],
+                "base": rn["new_base"],
+                "start": rn["timestamp"],
+                "end": None,
+            })
+
+    for delete in sorted(
+        deletes,
+        key=lambda d: (d["timestamp"].isoformat() if d["timestamp"] else "", d["event"].id or 0),
+    ):
+        for candidate in candidates:
+            if not _candidate_event_in_window(candidate, delete["timestamp"]):
+                continue
+            if _candidate_matches_delete(candidate, delete):
+                candidate["frn"] = candidate.get("frn") or delete.get("frn") or None
+                candidate["deletes"].append(delete)
+    return candidates
+
+
+def _execution_candidates(events: list[Event], processes: list[Process]) -> dict[str, list[dict[str, Any]]]:
     executions_by_base: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen_exec: set[tuple[str, int | None, str]] = set()
+
     for proc in processes:
         exec_path = proc.path or proc.name or ""
         if not exec_path or _basename(exec_path) in _PAIRING_GENERIC_HOSTS:
@@ -1457,14 +1600,13 @@ def _correlate_file_execution_provenance(
             "event": None,
         }
         executions_by_base[entry["base"]].append(entry)
+
     for event in events:
         raw = event.raw or {}
-        eid = str(raw.get("EventID") or "")
-        if eid and not _eid_channel_ok(raw, eid):
+        execution_info = _event_execution(raw, str(raw.get("EventID") or ""))
+        if not execution_info:
             continue
-        if eid not in {"1", "4688"}:
-            continue
-        image = _field(raw, "Image", "NewProcessName")
+        image, cmdline = execution_info
         if not image or _basename(image) in _PAIRING_GENERIC_HOSTS:
             continue
         key = ("event", event.id, _artifact_path_key(image) or _basename(image))
@@ -1478,76 +1620,96 @@ def _correlate_file_execution_provenance(
             "severity": event.severity,
             "pid": _field(raw, "ProcessId", "NewProcessId") or None,
             "process": _basename(image),
-            "cmdline": _field(raw, "CommandLine", "Cmdline"),
+            "cmdline": cmdline,
             "session_id": None,
             "event": event,
         }
         executions_by_base[entry["base"]].append(entry)
 
-    # USN journal lets us follow a downloaded file across a rename before
-    # execution, and notice it being deleted afterwards.
+    return executions_by_base
+
+
+def _match_candidate_execution(
+    candidate: dict[str, Any],
+    executions_by_base: dict[str, list[dict[str, Any]]],
+) -> tuple[float, str, dict[str, Any], int] | None:
+    artifact_ts = candidate["event"].timestamp
+    best: tuple[float, str, dict[str, Any], int] | None = None
+    for segment_index, segment in enumerate(candidate["segments"]):
+        for execution in executions_by_base.get(segment["base"], []):
+            confidence = _artifact_match_confidence(segment["path"], execution["path"])
+            if not confidence:
+                continue
+            if not _segment_active_at(segment, execution["timestamp"]):
+                continue
+            if artifact_ts and execution["timestamp"]:
+                gap = (_aware(execution["timestamp"]) - _aware(artifact_ts)).total_seconds()
+                if not (0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S):
+                    continue
+            else:
+                gap = _DOWNLOAD_CORRELATION_WINDOW_S
+            rank = 0 if confidence == "exact-path" else 1
+            score = gap + (rank * _DOWNLOAD_CORRELATION_WINDOW_S)
+            if best is None or score < best[0]:
+                best = (gap, confidence, execution, segment_index)
+    return best
+
+
+def _candidate_delete_after(candidate: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any] | None:
+    if not execution["timestamp"]:
+        return None
+    exec_ts = _aware(execution["timestamp"])
+    after = [
+        d for d in candidate["deletes"]
+        if d["timestamp"] and _aware(d["timestamp"]) > exec_ts
+    ]
+    after.sort(key=lambda d: (_aware(d["timestamp"]), d["event"].id or 0))
+    return after[0] if after else None
+
+
+def _correlate_file_execution_provenance(
+    session,
+    existing: set[tuple[str, str]],
+    events: list[Event],
+    processes: list[Process],
+) -> None:
+    artifacts = _collect_file_artifacts(events)
+    if not artifacts:
+        return
+    executions_by_base = _execution_candidates(events, processes)
     renames = _collect_usn_renames(events)
     deletes = _collect_usn_deletes(events)
-    renames_by_old_key: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    renames_by_old_base: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for rn in renames:
-        old_key = _artifact_path_key(rn["old_path"])
-        if old_key:
-            renames_by_old_key[old_key].append(rn)
-        renames_by_old_base[rn["old_base"]].append(rn)
+    candidates = _artifact_lifecycles(artifacts, renames, deletes)
 
-    for artifact in artifacts:
+    for artifact in candidates:
         event = artifact["event"]
-        artifact_ts = event.timestamp
-
-        def match_execution(match_path: str, base: str) -> tuple[float, str, dict[str, Any]] | None:
-            best_local: tuple[float, str, dict[str, Any]] | None = None
-            for execution in executions_by_base.get(base, []):
-                confidence = _artifact_match_confidence(match_path, execution["path"])
-                if not confidence:
-                    continue
-                if artifact_ts and execution["timestamp"]:
-                    gap = (_aware(execution["timestamp"]) - _aware(artifact_ts)).total_seconds()
-                    if not (0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S):
-                        continue
-                else:
-                    gap = _DOWNLOAD_CORRELATION_WINDOW_S
-                rank = 0 if confidence == "exact-path" else 1
-                score = gap + (rank * _DOWNLOAD_CORRELATION_WINDOW_S)
-                if best_local is None or score < best_local[0]:
-                    best_local = (gap, confidence, execution)
-            return best_local
-
-        best = match_execution(artifact["path"], artifact["base"])
-        renamed: dict[str, Any] | None = None
-        # If the download name is never executed directly, follow a rename of the
-        # same file (matched by path, else basename) to the name it ran under.
-        if best is None and renames:
-            candidates = renames_by_old_key.get(_artifact_path_key(artifact["path"]), [])
-            if not candidates:
-                candidates = renames_by_old_base.get(artifact["base"], [])
-            for rn in candidates:
-                cand = match_execution(rn["new_path"], rn["new_base"])
-                if cand and (best is None or cand[0] < best[0]):
-                    best, renamed = cand, rn
+        best = _match_candidate_execution(artifact, executions_by_base)
         if not best:
             continue
-        gap, confidence, execution = best
-        frn = renamed["frn"] if renamed else ""
-        del_rec = _deleted_after(execution, frn, deletes) if deletes else None
+        gap, confidence, execution, segment_index = best
+        rename_chain = artifact["renames"][:segment_index]
+        del_rec = _candidate_delete_after(artifact, execution)
 
         exec_rank = SEVERITY_RANK.get(execution["severity"], 0)
         artifact_rank = SEVERITY_RANK.get(event.severity, 0)
         # A rename-before-execution or a delete-after-execution is itself strong
         # evidence, so (like an exact-path match) it bypasses the low-severity gate.
-        strong = confidence == "exact-path" or renamed is not None or del_rec is not None
+        strong = confidence == "exact-path" or bool(rename_chain) or del_rec is not None
+        # A browser/download provenance row with a URL plus the same non-generic
+        # executable basename is also enough context to keep for analyst review.
+        if (
+            artifact["kind"] == "download"
+            and artifact["origin"]
+            and confidence in {"distinctive-basename", "basename"}
+        ):
+            strong = True
         if not strong and max(exec_rank, artifact_rank) < SEVERITY_RANK["medium"]:
             continue
         severity = "high" if max(exec_rank, artifact_rank) >= SEVERITY_RANK["high"] else "medium"
         gap_txt = "unknown time after" if gap == _DOWNLOAD_CORRELATION_WINDOW_S else (
             f"{gap/60:.0f} minutes after" if gap < 5400 else f"{gap/3600:.1f} hours after"
         )
-        match_confidence = "usn-rename-chain" if renamed else confidence
+        match_confidence = "usn-rename-chain" if rename_chain else confidence
 
         # Entity-map edges: URL -> downloaded file -> (renamed file) -> process,
         # and a "then deleted" edge when the file was removed post-execution.
@@ -1559,13 +1721,16 @@ def _correlate_file_execution_provenance(
                 "src_type": "url", "src": artifact["origin"],
                 "verb": "served", "dst_type": "file", "dst": artifact["base"],
             })
-        if renamed and renamed["new_base"] != artifact["base"]:
+        prev_base = artifact["base"]
+        for rn in rename_chain:
             chain_edges.append({
-                "src_type": "file", "src": artifact["base"],
-                "verb": "renamed to", "dst_type": "file", "dst": renamed["new_base"],
+                "src_type": "file", "src": prev_base,
+                "verb": "renamed to", "dst_type": "file", "dst": rn["new_base"],
             })
+            prev_base = rn["new_base"]
+        if rename_chain:
             chain_edges.append({
-                "src_type": "file", "src": renamed["new_base"],
+                "src_type": "file", "src": prev_base,
                 "verb": "later executed", "dst_type": "process", "dst": exec_base,
             })
         else:
@@ -1585,11 +1750,14 @@ def _correlate_file_execution_provenance(
             f"{execution['path'][:300]} ({gap_txt} the artifact timestamp). Match confidence: "
             f"{match_confidence}."
         )
-        if renamed:
+        if rename_chain:
+            rename_summary = "; ".join(
+                f"{rn['old_path'][:120]} -> {rn['new_path'][:120]}"
+                for rn in rename_chain[:4]
+            )
             description += (
-                f" The NTFS $UsnJrnl:$J journal shows the file was renamed from "
-                f"{renamed['old_path'][:200]} to {renamed['new_path'][:200]} (same file reference) "
-                "before execution -- a name change that a directory listing alone would miss."
+                f" The NTFS $UsnJrnl:$J journal tracks the same candidate through "
+                f"{len(rename_chain)} rename(s) before execution: {rename_summary}."
             )
         if del_rec:
             ddesc = "shortly"
@@ -1609,10 +1777,10 @@ def _correlate_file_execution_provenance(
             session,
             existing,
             title=f"File artifact later executed: {artifact['base']}"
-            + (" (renamed)" if renamed else "") + (" then deleted" if del_rec else ""),
+            + (" (renamed)" if rename_chain else "") + (" then deleted" if del_rec else ""),
             description=description,
             severity=severity,
-            techniques=["T1204", "T1105"] + (["T1036.003"] if renamed else []) + (["T1070.004"] if del_rec else []),
+            techniques=["T1204", "T1105"] + (["T1036.003"] if rename_chain else []) + (["T1070.004"] if del_rec else []),
             evidence={
                 "entity": execution["path"],
                 "artifact_path": artifact["path"][:700],
@@ -1625,9 +1793,18 @@ def _correlate_file_execution_provenance(
                 "match_confidence": match_confidence,
                 "gap_seconds": None if gap == _DOWNLOAD_CORRELATION_WINDOW_S else round(gap, 1),
                 "origin_url": artifact["origin"],
-                "renamed_from": renamed["old_path"][:700] if renamed else None,
-                "renamed_to": renamed["new_path"][:700] if renamed else None,
-                "file_reference": frn or None,
+                "renamed_from": rename_chain[0]["old_path"][:700] if rename_chain else None,
+                "renamed_to": rename_chain[-1]["new_path"][:700] if rename_chain else None,
+                "rename_chain": [
+                    {
+                        "old_path": rn["old_path"][:700],
+                        "new_path": rn["new_path"][:700],
+                        "file_reference": rn["frn"] or None,
+                        "event_id": rn["event"].id,
+                    }
+                    for rn in rename_chain
+                ],
+                "file_reference": artifact.get("frn") or None,
                 "deleted_after_execution": bool(del_rec),
                 "delete_event_id": del_rec["event"].id if del_rec else None,
                 "chain_edges": chain_edges,
@@ -1639,13 +1816,13 @@ def _correlate_file_execution_provenance(
             event,
             severity,
             f"Correlated: {artifact['kind']} artifact later executed as {execution['base']}"
-            + (" (via USN rename)" if renamed else "")
+            + (" (via USN rename)" if rename_chain else "")
             + ("; file deleted afterwards" if del_rec else ""),
         )
-        if renamed:
+        for rn in rename_chain:
             _escalate_event(
-                session, renamed["event"], severity,
-                f"Correlated: USN rename of downloaded file to {renamed['new_base']} before execution",
+                session, rn["event"], severity,
+                f"Correlated: USN rename of downloaded file to {rn['new_base']} before execution",
             )
         if del_rec:
             _escalate_event(
