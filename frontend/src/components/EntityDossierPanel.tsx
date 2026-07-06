@@ -11,6 +11,7 @@ import {
   Download,
   Cpu,
   Database,
+  Crosshair,
 } from "lucide-react";
 import { api, memoryModuleDownloadUrl, memoryProcessDownloadUrl, wsUrl } from "../lib/api";
 import { SeverityBadge, Spinner, CodeBlock } from "./common";
@@ -21,10 +22,14 @@ export function EntityDossierPanel({
   caseId,
   entityId,
   onClose,
+  onFocus,
+  focused = false,
 }: {
   caseId: string;
   entityId: string;
   onClose: () => void;
+  onFocus?: (entityId: string) => void;
+  focused?: boolean;
 }) {
   const [tab, setTab] = useState<"trace" | "relations" | "memory" | "ai">("trace");
   const { data, isLoading } = useQuery({
@@ -54,9 +59,24 @@ export function EntityDossierPanel({
               {data?.entity.value ?? "…"}
             </div>
           </div>
-          <button className="text-ink-400 hover:text-ink-100" onClick={onClose}>
-            <X size={18} />
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {onFocus && (
+              <button
+                className={`btn text-xs ${
+                  focused
+                    ? "bg-accent-cyan/15 text-accent-cyan"
+                    : "text-ink-300 hover:bg-white/5"
+                }`}
+                onClick={() => onFocus(entityId)}
+                title="Show only this entity and everything connected to it on the map"
+              >
+                <Crosshair size={13} /> {focused ? "Focused" : "Focus on map"}
+              </button>
+            )}
+            <button className="text-ink-400 hover:text-ink-100" onClick={onClose}>
+              <X size={18} />
+            </button>
+          </div>
         </div>
         {data && (
           <div className="flex items-center gap-2 mt-3 flex-wrap">
