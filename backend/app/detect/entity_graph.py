@@ -194,14 +194,17 @@ def _extract_from_event(g: _Graph, ev: Event) -> None:
     target_user = _norm(raw.get("TargetUserName"))
     proc = _norm(raw.get("NewProcessName") or raw.get("Image") or raw.get("ProcessName"))
     parent = _norm(raw.get("ParentProcessName") or raw.get("ParentImage"))
-    # "service"/"binary"/"state" are the lowercase keys memory svcscan events use;
-    # the CamelCase ones come from EVTX 7045/4697/7036 service events.
-    service = _norm(
-        raw.get("ServiceName") or raw.get("Service Name")
-        or raw.get("ServiceFileName") or raw.get("service")
-    )
-    service_state = _norm(raw.get("state") or raw.get("State"))
-    service_binary = _norm(raw.get("binary") or raw.get("Binary") or raw.get("ImagePath"))
+    # EVTX 7045/4697/7036 service events (CamelCase keys) create a service node
+    # just as before. Memory svcscan rows (lowercase "service" key) list *every*
+    # service on the host -- surfacing all of them floods the map, so only bring
+    # in svcscan services that were flagged suspicious (non-info severity), and
+    # only those carry state / dead / binary detail.
+    service = _norm(raw.get("ServiceName") or raw.get("Service Name") or raw.get("ServiceFileName"))
+    svcscan_service = _norm(raw.get("service")) if raw.get("plugin") == "svcscan" else None
+    if not service and svcscan_service and sev != "info":
+        service = svcscan_service
+    service_state = _norm(raw.get("state") or raw.get("State")) if svcscan_service else None
+    service_binary = _norm(raw.get("binary") or raw.get("Binary")) if svcscan_service else None
     ip = _norm(raw.get("IpAddress") or raw.get("SourceIp") or raw.get("Raddr") or raw.get("DestinationIp"))
     if ip and not _looks_like_ip(ip):
         ip = None
@@ -235,13 +238,10 @@ def _extract_from_event(g: _Graph, ev: Event) -> None:
             smeta = g.nodes[svc]["meta"]
             if service_state:
                 smeta["state"] = service_state
-                if service_state.lower() in _DEAD_SERVICE_STATES:
-                    smeta["dead"] = True
-                elif "dead" not in smeta:
-                    smeta["dead"] = False
+                smeta["dead"] = service_state.lower() in _DEAD_SERVICE_STATES
             if service_binary:
-                # relationship to the on-disk image, so a stopped service still
-                # shows what it would run when viewed via the toggle.
+                # a suspicious service's on-disk image, so a stopped service still
+                # shows what it would run when revealed via the terminated toggle.
                 fnode = g.node("file", service_binary)
                 g.bump(fnode, sev, ts)
                 g.edge(svc, fnode, "runs", sev, ts, summary)

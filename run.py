@@ -36,6 +36,15 @@ BACKEND_UNLOCKED_REQUIREMENTS = BACKEND / "requirements-memory.in"
 BACKEND_LOCK_STATE = VENV / ".investigator-requirements-lock.sha256"
 FRONTEND_LOCK = FRONTEND / "package-lock.json"
 FRONTEND_LOCK_STATE = FRONTEND / "node_modules" / ".investigator-package-lock.sha256"
+FRONTEND_DIST = FRONTEND / "dist"
+FRONTEND_BUILD_STATE = FRONTEND_DIST / ".investigator-src.sha256"
+# Files whose contents determine the built frontend; a change to any triggers a
+# rebuild. node_modules and dist are excluded (deps handled separately, dist is
+# the output).
+FRONTEND_BUILD_CONFIG_FILES = (
+    "index.html", "package.json", "package-lock.json",
+    "vite.config.ts", "tsconfig.json", "tsconfig.app.json", "tsconfig.node.json",
+)
 
 
 def venv_python() -> Path:
@@ -119,6 +128,24 @@ def ensure_venv(allow_unlocked_deps: bool = False) -> Path:
     return py
 
 
+def frontend_source_digest() -> str:
+    """Hash of everything that determines the built frontend, so we only rebuild
+    when the source actually changed."""
+    h = hashlib.sha256()
+    inputs: list[Path] = []
+    src = FRONTEND / "src"
+    if src.exists():
+        inputs.extend(p for p in src.rglob("*") if p.is_file())
+    for name in FRONTEND_BUILD_CONFIG_FILES:
+        p = FRONTEND / name
+        if p.is_file():
+            inputs.append(p)
+    for p in sorted(inputs):
+        h.update(p.relative_to(FRONTEND).as_posix().encode("utf-8"))
+        h.update(file_sha256(p).encode("utf-8"))
+    return h.hexdigest()
+
+
 def ensure_frontend(build: bool) -> None:
     npm = npm_cmd()
     if not FRONTEND_LOCK.exists():
@@ -129,8 +156,16 @@ def ensure_frontend(build: bool) -> None:
         run([npm, "ci"], cwd=FRONTEND)
         write_state(FRONTEND_LOCK_STATE, digest)
     if build:
-        log("Building frontend...")
-        run([npm, "run", "build"], cwd=FRONTEND)
+        # Rebuild only when the frontend source changed (or dist is missing), so
+        # a change to any src/config file is picked up automatically without
+        # rebuilding on every launch.
+        src_digest = frontend_source_digest()
+        if (FRONTEND_DIST / "index.html").exists() and state_matches(FRONTEND_BUILD_STATE, src_digest):
+            log("Frontend already up to date; skipping build.")
+        else:
+            log("Building frontend (source changed)...")
+            run([npm, "run", "build"], cwd=FRONTEND)
+            write_state(FRONTEND_BUILD_STATE, src_digest)
 
 
 def open_browser_later(url: str, delay: float = 2.0) -> None:
