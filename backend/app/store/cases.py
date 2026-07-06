@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.config import case_db_path, get_cases_dir
@@ -21,8 +21,6 @@ from app.store.database import (
     CaseMeta,
     ChatHistory,
     Event,
-    Finding,
-    Process,
     Report,
     dispose_db,
     init_db,
@@ -255,9 +253,15 @@ def get_case_stats(case_id: str) -> dict:
         return {"event_count": 0, "finding_count": 0, "process_count": 0}
     session = get_session(case_id)
     try:
-        event_count = session.scalar(select(func.count()).select_from(Event)) or 0
-        finding_count = session.scalar(select(func.count()).select_from(Finding)) or 0
-        process_count = session.scalar(select(func.count()).select_from(Process)) or 0
+        # One round trip instead of three: list_cases polls this per case every
+        # few seconds, so collapsing the counts matters at N cases.
+        event_count, finding_count, process_count = session.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM events), "
+                "(SELECT COUNT(*) FROM findings), "
+                "(SELECT COUNT(*) FROM processes)"
+            )
+        ).one()
         return {
             "event_count": event_count,
             "finding_count": finding_count,
@@ -309,16 +313,28 @@ def search_events(session: Session, query: str, limit: int = 50) -> list[Event]:
     rows = session.execute(
         text(
             """
-            SELECT e.* FROM events e
-            JOIN events_fts fts ON e.id = fts.rowid
+            SELECT fts.rowid AS id FROM events_fts fts
             WHERE events_fts MATCH :q
             ORDER BY rank
             LIMIT :limit
             """
         ),
         {"q": query, "limit": limit},
-    ).mappings().all()
-    return [session.get(Event, r["id"]) for r in rows if r["id"]]
+    ).all()
+    ids = [r[0] for r in rows if r[0]]
+    if not ids:
+        return []
+    # One SELECT ... IN instead of a get() per hit; reorder to the FTS rank order.
+    by_id = {e.id: e for e in session.scalars(select(Event).where(Event.id.in_(ids)))}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def count_search_events(session: Session, query: str) -> int:
+    """Total number of events matching an FTS query (ignores paging limit)."""
+    return session.scalar(
+        text("SELECT COUNT(*) FROM events_fts WHERE events_fts MATCH :q"),
+        {"q": query},
+    ) or 0
 
 
 def get_latest_report(session: Session) -> Report | None:

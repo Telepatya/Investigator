@@ -196,18 +196,25 @@ async def get_events(
         if q:
             try:
                 from app.llm.orchestrator import _fts_query
-                events = case_store.search_events(session, _fts_query(q), limit=limit)
+                fts_query = _fts_query(q)
+                events = case_store.search_events(session, fts_query, limit=limit)
+                total = case_store.count_search_events(session, fts_query)
             except Exception:
                 events = []
+                total = 0
         else:
             stmt = select(Event)
+            count_stmt = select(func.count()).select_from(Event)
             if category:
                 stmt = stmt.where(Event.category == category)
+                count_stmt = count_stmt.where(Event.category == category)
             if severity:
                 stmt = stmt.where(Event.severity == severity)
+                count_stmt = count_stmt.where(Event.severity == severity)
             stmt = stmt.order_by(Event.timestamp.desc().nullslast()).limit(limit).offset(offset)
             events = list(session.scalars(stmt))
-        total = session.scalar(select(func.count()).select_from(Event)) or 0
+            # Count reflects the active filters so the UI's "showing X of N" is correct.
+            total = session.scalar(count_stmt) or 0
         return {
             "total": total,
             "events": [
