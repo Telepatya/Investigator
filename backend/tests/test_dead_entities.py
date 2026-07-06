@@ -175,24 +175,48 @@ class DeadEntityTests(unittest.TestCase):
         files = [n for n in graph["nodes"] if n["type"] == "file"]
         self.assertTrue(any("evil.exe" in n["value"] for n in files))
 
-    def test_running_service_not_dead(self) -> None:
+    def test_suspicious_running_service_not_dead(self) -> None:
+        # A flagged (non-info) service that is currently running: node appears,
+        # state recorded, but not marked dead.
         case = cases.create_case("svc2")
         s = cases.get_session(case["id"])
         try:
             cases.add_event(
                 s, timestamp=None, host=None, source="memory:svcscan",
-                category="persistence", entity="GoodSvc", severity="info",
-                summary="Service: GoodSvc [Running] -> c:\\windows\\system32\\svc.exe",
-                raw={"service": "GoodSvc", "binary": "c:\\windows\\system32\\svc.exe",
+                category="persistence", entity="BadSvc", severity="medium",
+                summary="Service: BadSvc [Running] -> c:\\temp\\bad.exe",
+                raw={"service": "BadSvc", "binary": "c:\\temp\\bad.exe",
                      "state": "Running", "plugin": "svcscan"},
             )
             s.commit()
         finally:
             s.close()
         graph = entity_graph.build_entity_graph(case["id"])
-        svc = [n for n in graph["nodes"] if n["type"] == "service" and n["value"] == "GoodSvc"][0]
+        svc = [n for n in graph["nodes"] if n["type"] == "service" and n["value"] == "BadSvc"][0]
         self.assertEqual(svc["meta"].get("state"), "Running")
         self.assertFalse(svc["meta"].get("dead"))
+
+    def test_benign_svcscan_services_do_not_flood_graph(self) -> None:
+        # Regression guard: info-severity svcscan rows (every benign Windows
+        # service) must NOT create service/file nodes, or they flood the map and
+        # evict the interesting nodes under the max_nodes cap.
+        case = cases.create_case("svc3")
+        s = cases.get_session(case["id"])
+        try:
+            for i in range(200):
+                cases.add_event(
+                    s, timestamp=None, host=None, source="memory:svcscan",
+                    category="persistence", entity=f"Svc{i}", severity="info",
+                    summary=f"Service: Svc{i} [Running] -> c:\\windows\\system32\\s{i}.exe",
+                    raw={"service": f"Svc{i}", "binary": f"c:\\windows\\system32\\s{i}.exe",
+                         "state": "Running", "plugin": "svcscan"},
+                )
+            s.commit()
+        finally:
+            s.close()
+        graph = entity_graph.build_entity_graph(case["id"])
+        svc_nodes = [n for n in graph["nodes"] if n["type"] == "service"]
+        self.assertEqual(svc_nodes, [], "benign svcscan services should not create nodes")
 
 
 if __name__ == "__main__":
