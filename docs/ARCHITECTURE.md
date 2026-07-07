@@ -30,29 +30,29 @@ Investigator is a local-first web application with two halves:
 
 ```mermaid
 flowchart LR
-    subgraph Evidence
-        VR["Velociraptor collections<br/>(ZIP / JSON / JSONL / CSV / EVTX)"]
-        MEM["Memory dumps<br/>(.raw .dmp .mem .vmem .lime ...)"]
+    VR["Velociraptor collections"]
+    MEMDUMP["Memory dumps"]
+
+    subgraph BE["FastAPI backend"]
+        ING["Ingest pipeline"]
+        MEMP["Memory pipeline: MemProcFS + YARA"]
+        DET["Detection engine"]
+        DB[("Per-case SQLite + FTS5")]
+        LLM["LLM orchestrator"]
+        API["REST + WebSocket API"]
     end
 
-    subgraph Backend["FastAPI backend (backend/app)"]
-        ING["Ingest pipeline<br/>app/ingest"]
-        MEMP["Memory pipeline<br/>app/memory<br/>(MemProcFS + YARA + heuristics)"]
-        DET["Deterministic detection engine<br/>app/detect"]
-        DB[("Per-case SQLite<br/>+ FTS5")]
-        LLM["LLM orchestrator<br/>app/llm"]
-        API["REST + WebSocket API<br/>app/api"]
-    end
-
-    subgraph Providers["LLM providers"]
-        OLL["Ollama (local)"]
+    subgraph PROV["LLM providers"]
+        OLL["Ollama - local"]
         EXT["OpenAI / Anthropic / Gemini"]
     end
 
-    UI["React SPA<br/>frontend/src"]
+    UI["React SPA"]
 
-    VR --> ING --> DB
-    MEM --> MEMP --> DB
+    VR --> ING
+    MEMDUMP --> MEMP
+    ING --> DB
+    MEMP --> DB
     ING --> DET
     MEMP --> DET
     DET --> DB
@@ -63,6 +63,8 @@ flowchart LR
     API <--> LLM
     UI <--> API
 ```
+
+*Evidence sources on the left (Velociraptor collections: ZIP / JSON / JSONL / CSV / EVTX; memory dumps: `.raw` `.dmp` `.mem` `.vmem` `.lime` ...) flow through the backend modules (`app/ingest`, `app/memory`, `app/detect`, `app/llm`, `app/api`) into the per-case database, which the React SPA reads through the API.*
 
 Two design decisions shape everything else:
 
@@ -103,31 +105,31 @@ The full path from an uploaded file to an AI-written report:
 ```mermaid
 sequenceDiagram
     participant U as UI
-    participant A as API (cases_router)
+    participant A as API
     participant I as Ingest pipeline
     participant M as Memory pipeline
     participant D as Detection engine
     participant DB as Case SQLite
     participant O as LLM orchestrator
 
-    U->>A: POST /api/cases/{id}/upload (file or chunks)
+    U->>A: POST upload (file or chunks)
     A->>I: run_ingestion() as background task
     alt Velociraptor / log evidence
-        I->>DB: normalized Events + Processes (batched bulk inserts)
-        I->>D: run_detections_sync()
+        I->>DB: normalized Events + Processes
+        I->>D: run detections
         D->>DB: Findings + severity escalations
     else memory dump
-        I->>M: analyze_memory_dump_sync()
+        I->>M: analyze memory dump
         M->>DB: MemoryResults, processes, forensic events
         M->>D: detections over recovered artifacts
     end
-    A-->>U: live progress via /ingestion-ws WebSocket
+    A-->>U: live progress via ingestion WebSocket
 
-    U->>A: POST /api/cases/{id}/analyze
+    U->>A: POST analyze
     A->>O: analyze_case() as background task
-    O->>DB: reads events / findings / memory, may query via tools
+    O->>DB: reads events, findings, memory (tool queries)
     O->>DB: persists Report + per-finding AI verdicts
-    A-->>U: phase/percent progress via /analyze-ws WebSocket
+    A-->>U: phase and percent via analysis WebSocket
 ```
 
 1. **Upload.** Files arrive whole (`/upload`) or in resumable chunks (`/upload-chunk`) and are stored under the case's `uploads/` directory.
