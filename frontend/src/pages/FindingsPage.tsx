@@ -28,16 +28,29 @@ export default function FindingsPage() {
     queryKey: ["findings", caseId],
     queryFn: () => api.getFindings(caseId!),
   });
+  const invalidateCaseViews = () => {
+    for (const key of [
+      "findings",
+      "entities",
+      "entity-dossier",
+      "attack-matrix",
+      "timeline",
+      "events",
+      "categories",
+    ]) {
+      qc.invalidateQueries({ queryKey: [key, caseId] });
+    }
+  };
 
   const benignMut = useMutation({
     mutationFn: ({ id, benign }: { id: number; benign: boolean }) =>
       api.setFindingBenign(caseId!, id, benign),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["findings", caseId] }),
+    onSuccess: invalidateCaseViews,
   });
   const ruleMut = useMutation({
     mutationFn: ({ ruleId, disabled }: { ruleId: string; disabled: boolean }) =>
       api.setRuleDisabled(caseId!, ruleId, disabled),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["findings", caseId] }),
+    onSuccess: invalidateCaseViews,
   });
   const setBenign: BenignFn = (id, benign) => benignMut.mutate({ id, benign });
   const setRule: RuleFn = (ruleId, disabled) => ruleMut.mutate({ ruleId, disabled });

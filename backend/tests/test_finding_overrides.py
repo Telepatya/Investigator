@@ -42,10 +42,10 @@ sys.modules.setdefault("pydantic", types.SimpleNamespace(
 ))
 
 from sqlalchemy import select
-from app.detect import engine, overrides
+from app.detect import engine, entity_graph, overrides
 from app.store import cases
 from app.store import database
-from app.store.database import Finding, Process
+from app.store.database import Event, Finding, Process
 
 
 class _Base(unittest.TestCase):
@@ -174,6 +174,13 @@ class OverrideTests(_Base):
             {sev for t, sev in self._findings() if t.startswith("LOLBin activity")},
             {"info"},
         )
+        graph = entity_graph.build_entity_graph(self.cid)
+        lolbin_nodes = {
+            n["label"]: n["severity"]
+            for n in graph["nodes"]
+            if n["type"] == "process" and n["label"] in {"mshta.exe", "cscript.exe"}
+        }
+        self.assertEqual(lolbin_nodes, {"mshta.exe": "info", "cscript.exe": "info"})
         # Survives a full rebuild (findings wiped + regenerated).
         engine.run_detections_sync(self.cid)
         self.assertEqual(
@@ -208,10 +215,77 @@ class OverrideTests(_Base):
         self.assertEqual(by_title.get("LOLBin activity: mshta.exe"), "info")
         # The other finding is untouched.
         self.assertEqual(by_title.get("LOLBin activity: cscript.exe"), "medium")
+        graph = entity_graph.build_entity_graph(self.cid)
+        by_process = {
+            n["label"]: n["severity"]
+            for n in graph["nodes"]
+            if n["type"] == "process" and n["label"] in {"mshta.exe", "cscript.exe"}
+        }
+        self.assertEqual(by_process.get("mshta.exe"), "info")
+        self.assertEqual(by_process.get("cscript.exe"), "medium")
         # Benign mark persists across a rebuild (keyed by stable identity).
         engine.run_detections_sync(self.cid)
         by_title = {t: sev for t, sev in self._findings()}
         self.assertEqual(by_title.get("LOLBin activity: mshta.exe"), "info")
+
+    def test_mark_benign_downgrades_backing_event_in_entity_graph(self) -> None:
+        s = self._session()
+        try:
+            ev = Event(
+                timestamp=None,
+                host="H",
+                source="Windows.EventLogs.Evtx.json",
+                category="process",
+                entity="svchost.exe",
+                severity="high",
+                severity_reason="Detection: cross-process access",
+                summary=r"ProcessAccess: C:\Windows\System32\svchost.exe -> lsass.exe",
+                raw={"EventID": 10, "ProcessName": r"C:\Windows\System32\svchost.exe"},
+            )
+            s.add(ev)
+            s.flush()
+            s.add(Finding(
+                title="Suspicious process access",
+                description="Process accessed LSASS",
+                severity="high",
+                mitre_techniques=["T1003.001"],
+                evidence={"event_id": ev.id, "entity": "svchost.exe"},
+                source="event:Windows.EventLogs.Evtx.json",
+            ))
+            s.add(Event(
+                timestamp=None,
+                host="H",
+                source="Windows.EventLogs.Evtx.json",
+                category="process",
+                entity="svchost.exe",
+                severity="high",
+                severity_reason=(
+                    "Flagged-entity match: this event references 'svchost.exe' - "
+                    "a high-severity event involved svchost.exe"
+                ),
+                summary=r"Process activity from C:\Windows\System32\svchost.exe",
+                raw={"EventID": 1, "ProcessName": r"C:\Windows\System32\svchost.exe"},
+            ))
+            s.commit()
+        finally:
+            s.close()
+
+        graph = entity_graph.build_entity_graph(self.cid)
+        node = next(n for n in graph["nodes"] if n["id"] == "process::C:\\Windows\\System32\\svchost.exe")
+        self.assertEqual(node["severity"], "high")
+
+        s = self._session()
+        try:
+            f = s.scalars(select(Finding).where(Finding.title == "Suspicious process access")).one()
+            overrides.set_finding_benign(s, overrides.finding_key(f.title, f.evidence), True)
+            overrides.apply_overrides(s)
+            s.commit()
+        finally:
+            s.close()
+
+        graph = entity_graph.build_entity_graph(self.cid)
+        node = next(n for n in graph["nodes"] if n["id"] == "process::C:\\Windows\\System32\\svchost.exe")
+        self.assertEqual(node["severity"], "info")
 
     def test_rule_id_families(self) -> None:
         self.assertEqual(overrides.rule_id_for("LOLBin activity: msiexec.exe", ""), "lolbin-activity")
