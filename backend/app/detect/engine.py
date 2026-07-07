@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Text, cast, or_, select
 
 from app.detect.rules import (
     EXPECTED_PARENTS,
@@ -33,6 +35,8 @@ from app.detect.overrides import (
 )
 from app.store import cases as case_store
 from app.store.database import Event, Finding, MemoryResult, Process
+
+logger = logging.getLogger(__name__)
 
 SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 _RANK_TO_SEVERITY = {v: k for k, v in SEVERITY_RANK.items()}
@@ -596,6 +600,8 @@ def _check_cmdline(session, existing, text: str, evidence: dict[str, Any], sourc
     """Returns highest severity matched, adds findings."""
     if not text:
         return None
+    if not _CMDLINE_PREFILTER_RE.search(text):
+        return None
     lower = text.lower()
     top: str | None = None
     for regex, technique, description, severity in SUSPICIOUS_CMDLINE_PATTERNS:
@@ -623,6 +629,8 @@ def _scan_cmdline_severity(text: str) -> str | None:
     detection (e.g. scheduled-task analysis) so we don't double-emit findings.
     """
     if not text:
+        return None
+    if not _CMDLINE_PREFILTER_RE.search(text):
         return None
     lower = text.lower()
     top: str | None = None
@@ -1064,6 +1072,37 @@ _EXE_TOKEN_RE = re.compile(r"[\w][\w\-.]{0,80}\.exe\b")
 _BASE64_BLOB_RE = re.compile(r"[a-z0-9+/]{80,}={0,2}")
 _SERVICE_INTERPRETER_RE = re.compile(r"\b(?:powershell|pwsh|cmd\.exe|rundll32)\b|comspec")
 
+_CMDLINE_PREFILTER_RE = re.compile(
+    "|".join(
+        re.escape(term)
+        for term in (
+            "-enc", "-encodedcommand", "-nop", "-noprofile", "executionpolicy", "bypass",
+            "downloadstring", "downloadfile", "iex", "invoke-expression", "invoke-webrequest",
+            "frombase64string", "mimikatz", "sekurlsa", "lsass", "procdump", "comsvcs",
+            "minidump", "nanodump", "out-minidump", "createdump", ".dmp", "vssadmin",
+            "delete shadows", "wbadmin", "delete catalog", "bcdedit", "wevtutil",
+            "clear-eventlog", "net user", "net1 user", "localgroup", "administrators",
+            "reg add", "currentversion\\run", "attrib", "+h", "icacls", "/grant", "/deny",
+            "/setowner", "/reset", "/inheritance", "/remove", "javascript:", "scrobj.dll",
+            "-urlcache", "certutil", "-decode", "schtasks", "/create", "mshta", "http://",
+            "https://", "regsvr32", "/i:http", "activexobject", "wscript.shell",
+            "shell.application", "hidden", "wmic", "process call create", "/node:", "psexec",
+            "ntdsutil", "ntds.dit", "reg save", "hklm\\sam", "hklm\\system", "dcsync",
+            "kerberos::golden", "golden ticket", "golden-ticket", "golden_ticket",
+            "kerberoast", "rubeus", "bloodhound", "sharphound", "cobalt strike",
+            "cobalt-strike", "cobalt_strike", "beacon.dll", "meterpreter", "empire",
+            "covenant", "gruntstager", "grunthttp", "nishang", "powersploit", "lazagne",
+            "chisel", "ngrok", "plink", "set-mppreference", "add-mppreference",
+            "-disable", "-exclusion", "windefend", "sense", "wscsvc",
+            "securityhealthservice", "mpssvc", "wuauserv", "net stop", "auditpol",
+            "/clear", "/success:disable", "/failure:disable", "fsutil", "usn deletejournal",
+            "netsh", "advfirewall", "state off", "sdelete", "cipher", "/w", "eventfilter",
+            "commandlineeventconsumer", "bitsadmin", "/transfer",
+        )
+    ),
+    re.IGNORECASE,
+)
+
 
 def _mem_result_technique(plugin: str, summary: str) -> list[str]:
     text = f"{plugin} {summary}".lower()
@@ -1328,8 +1367,6 @@ def _event_needed_for_provenance(event: Event, raw: dict[str, Any]) -> bool:
     eid = str(raw.get("EventID") or "")
     if eid and _eid_channel_ok(raw, eid) and eid in {"11", "12", "13", "4697", "7045"}:
         return True
-    if _event_execution(raw, eid):
-        return True
     if _download_evidence(event, raw)[0]:
         return True
     if _is_usn_journal_event(event, raw):
@@ -1342,6 +1379,8 @@ def _event_needed_for_provenance(event: Event, raw: dict[str, Any]) -> bool:
             tokens & {"FILE_CREATE", "RENAME_NEW_NAME", "RENAME_OLD_NAME", "FILE_DELETE"}
             and _is_usn_executable_path(_usn_path(event, raw))
         )
+    if _event_execution(raw, eid):
+        return True
     return False
 
 
@@ -1538,9 +1577,10 @@ def _artifact_lifecycles(
 ) -> list[dict[str, Any]]:
     """Advance each artifact through USN rename/delete state until execution."""
     candidates: list[dict[str, Any]] = []
-    for artifact in artifacts:
+    for idx, artifact in enumerate(artifacts):
         candidates.append({
             **artifact,
+            "_lifecycle_index": idx,
             "frn": None,
             "renames": [],
             "deletes": [],
@@ -1552,15 +1592,77 @@ def _artifact_lifecycles(
             }],
         })
 
+    by_frn: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_current_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_current_base: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_segment_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    def add_index(index: dict[str, list[dict[str, Any]]], key: str, candidate: dict[str, Any]) -> None:
+        if key:
+            index[key].append(candidate)
+
+    def remove_index(index: dict[str, list[dict[str, Any]]], key: str, candidate: dict[str, Any]) -> None:
+        if not key:
+            return
+        bucket = index.get(key)
+        if not bucket:
+            return
+        try:
+            bucket.remove(candidate)
+        except ValueError:
+            return
+        if not bucket:
+            index.pop(key, None)
+
+    def current_path_key(candidate: dict[str, Any]) -> str:
+        return _artifact_path_key(candidate["segments"][-1]["path"])
+
+    def current_base(candidate: dict[str, Any]) -> str:
+        return candidate["segments"][-1]["base"]
+
+    def index_candidate(candidate: dict[str, Any]) -> None:
+        add_index(by_frn, candidate.get("frn") or "", candidate)
+        add_index(by_current_path, current_path_key(candidate), candidate)
+        add_index(by_current_base, current_base(candidate), candidate)
+        add_index(by_segment_path, current_path_key(candidate), candidate)
+
+    def unindex_current_candidate(candidate: dict[str, Any]) -> None:
+        remove_index(by_frn, candidate.get("frn") or "", candidate)
+        remove_index(by_current_path, current_path_key(candidate), candidate)
+        remove_index(by_current_base, current_base(candidate), candidate)
+
+    def matching_candidates(*buckets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[int] = set()
+        matches: list[dict[str, Any]] = []
+        for bucket in buckets:
+            for candidate in bucket:
+                cid = candidate["_lifecycle_index"]
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                matches.append(candidate)
+        matches.sort(key=lambda c: c["_lifecycle_index"])
+        return matches
+
+    for candidate in candidates:
+        index_candidate(candidate)
+
     for rn in sorted(
         renames,
         key=lambda r: (r["timestamp"].isoformat() if r["timestamp"] else "", r["event"].id or 0),
     ):
-        for candidate in candidates:
+        old_key = _artifact_path_key(rn["old_path"])
+        candidate_pool = matching_candidates(
+            by_frn.get(rn.get("frn") or "", []),
+            by_current_path.get(old_key, []),
+            by_current_base.get(rn["old_base"], []),
+        )
+        for candidate in candidate_pool:
             if not _candidate_event_in_window(candidate, rn["timestamp"]):
                 continue
             if not _candidate_matches_rename(candidate, rn):
                 continue
+            unindex_current_candidate(candidate)
             candidate["frn"] = candidate.get("frn") or rn.get("frn") or None
             candidate["renames"].append(rn)
             candidate["segments"][-1]["end"] = rn["timestamp"]
@@ -1570,16 +1672,26 @@ def _artifact_lifecycles(
                 "start": rn["timestamp"],
                 "end": None,
             })
+            index_candidate(candidate)
 
     for delete in sorted(
         deletes,
         key=lambda d: (d["timestamp"].isoformat() if d["timestamp"] else "", d["event"].id or 0),
     ):
-        for candidate in candidates:
+        delete_key = _artifact_path_key(delete["path"])
+        candidate_pool = matching_candidates(
+            by_frn.get(delete.get("frn") or "", []),
+            by_segment_path.get(delete_key, []),
+            by_current_base.get(delete["base"], []),
+        )
+        for candidate in candidate_pool:
             if not _candidate_event_in_window(candidate, delete["timestamp"]):
                 continue
             if _candidate_matches_delete(candidate, delete):
+                old_frn = candidate.get("frn") or ""
                 candidate["frn"] = candidate.get("frn") or delete.get("frn") or None
+                if candidate.get("frn") and not old_frn:
+                    add_index(by_frn, candidate["frn"], candidate)
                 candidate["deletes"].append(delete)
     return candidates
 
@@ -2087,7 +2199,56 @@ _FILE_TOKEN_RE = re.compile(
 )
 
 
-def _propagate_flagged_entities(session, events: list[Event], processes: list[Process]) -> int:
+def _taint_matches_in_value(value: Any, pattern: re.Pattern[str], max_rank: int,
+                            tainted: dict[str, tuple[int, str]]) -> set[str]:
+    matches: set[str] = set()
+
+    def visit(v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, str):
+            matches.update(m.lower() for m in pattern.findall(v))
+        elif isinstance(v, dict):
+            for k, child in v.items():
+                if visit(k) or visit(child):
+                    return True
+        elif isinstance(v, (list, tuple)):
+            for child in v:
+                if visit(child):
+                    return True
+        else:
+            return False
+        return bool(matches) and max(tainted[m][0] for m in matches) >= max_rank
+
+    visit(value)
+    return matches
+
+
+def _taint_candidate_events(session, names: list[str]):
+    raw_text = cast(Event.raw, Text)
+    seen: set[int] = set()
+    chunk_size = 20
+    for i in range(0, len(names), chunk_size):
+        conditions = []
+        for name in names[i:i + chunk_size]:
+            like = f"%{name}%"
+            conditions.extend([
+                Event.summary.like(like),
+                Event.entity.like(like),
+                raw_text.like(like),
+            ])
+        for event in session.scalars(
+            select(Event)
+            .where(or_(*conditions))
+            .execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)
+        ):
+            if event.id in seen:
+                continue
+            seen.add(event.id)
+            yield event
+
+
+def _propagate_flagged_entities(session, events: list[Event] | None, processes: list[Process]) -> int:
     """Severity taint propagation across the case timeline.
 
     Collects every process/DLL/file name that anything already flagged low or
@@ -2139,7 +2300,15 @@ def _propagate_flagged_entities(session, events: list[Event], processes: list[Pr
                 f"referencing {_basename(tok)}{pid_part}: {summary}",
             )
 
-    for e in events:
+    source_events = events
+    if source_events is None:
+        source_events = list(session.scalars(
+            select(Event)
+            .where(Event.severity.in_(["low", "medium", "high", "critical"]))
+            .execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)
+        ))
+
+    for e in source_events:
         if SEVERITY_RANK.get(e.severity, 0) < SEVERITY_RANK["low"]:
             continue
         if (e.severity_reason or "").startswith(_PROPAGATION_MARKER):
@@ -2155,16 +2324,22 @@ def _propagate_flagged_entities(session, events: list[Event], processes: list[Pr
         return 0
 
     names = sorted(tainted, key=len, reverse=True)
+    max_taint_rank = max(rank for rank, _origin in tainted.values())
     pattern = re.compile(
         r"(?<![\w-])(?:" + "|".join(re.escape(n) for n in names) + r")(?![\w-])",
         re.IGNORECASE,
     )
     changed = 0
-    for e in events:
-        hay = " ".join(
-            filter(None, [e.summary, e.entity, json.dumps(e.raw or {}, default=str)])
+    target_events = events if events is not None else _taint_candidate_events(session, names)
+    for e in target_events:
+        matches = _taint_matches_in_value(
+            [e.summary, e.entity],
+            pattern,
+            max_taint_rank,
+            tainted,
         )
-        matches = {m.lower() for m in pattern.findall(hay)}
+        if not matches or max(tainted[m][0] for m in matches) < max_taint_rank:
+            matches.update(_taint_matches_in_value(e.raw or {}, pattern, max_taint_rank, tainted))
         if not matches:
             continue
         best = max(matches, key=lambda n: tainted[n][0])
@@ -2338,6 +2513,21 @@ def run_detections_sync(case_id: str) -> int:
     """Run all detection heuristics for a case. Returns number of findings added."""
     session = case_store.get_session(case_id)
     try:
+        total_started = time.perf_counter()
+        phase_started = total_started
+
+        def mark_phase(phase: str, **counts: Any) -> None:
+            nonlocal phase_started
+            now = time.perf_counter()
+            suffix = ""
+            if counts:
+                suffix = " " + " ".join(f"{k}={v}" for k, v in counts.items())
+            logger.info(
+                "detections phase complete case_id=%s phase=%s seconds=%.3f%s",
+                case_id, phase, now - phase_started, suffix,
+            )
+            phase_started = now
+
         existing: set[tuple[str, str]] = set()
         for f in session.scalars(select(Finding)):
             existing.add((f.title, str(f.evidence.get("entity") or f.evidence.get("pid") or f.evidence.get("summary", ""))[:200]))
@@ -2567,12 +2757,14 @@ def run_detections_sync(case_id: str) -> int:
                 proc.severity = severity
 
         session.commit()
+        mark_phase("process heuristics", processes=len(processes), findings=len(existing) - before)
 
         # --- MemoryResult bridge ---
         # Memory analysis can produce high-confidence indicators even when no
         # event-log fields exist to match, so promote those rows into Findings.
         _promote_memory_results(session, existing)
         session.commit()
+        mark_phase("memory promotion", findings=len(existing) - before)
 
         # --- Event heuristics ---
         event_stream = session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE))
@@ -2596,15 +2788,33 @@ def run_detections_sync(case_id: str) -> int:
 
         for event in event_stream:
             raw = event.raw or {}
+            is_usn_event = _is_usn_journal_event(event, raw)
+            if is_usn_event:
+                tokens = _usn_reason_tokens(raw)
+                path = _usn_path(event, raw)
+                if (
+                    tokens & {"FILE_CREATE", "RENAME_NEW_NAME", "RENAME_OLD_NAME", "FILE_DELETE"}
+                    and _is_usn_executable_path(path)
+                ):
+                    provenance_events.append(event)
+                if tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}:
+                    usn_events.append(event)
+                if _is_usn_executable_path(path) and (
+                    "FILE_CREATE" in tokens or tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}
+                ):
+                    evidence = {
+                        "event_id": event.id, "entity": event.entity,
+                        "source": event.source, "summary": event.summary[:300],
+                    }
+                    _check_usn_journal_event(session, existing, event, raw, evidence)
+                continue
+
             if _event_needed_for_provenance(event, raw):
                 provenance_events.append(event)
-            is_usn_event = _is_usn_journal_event(event, raw)
             # Memory-pipeline events carry our own descriptive summaries (e.g. "Hidden
             # process detected: lsass.exe ..."); scanning those re-triggers patterns on
             # text that merely describes a finding. Only scan real embedded command lines.
-            if is_usn_event:
-                summary_text = ""
-            elif (event.source or "").startswith("memory:") or event.category == "memory":
+            if (event.source or "").startswith("memory:") or event.category == "memory":
                 summary_text = " ".join(
                     str(v) for v in [raw.get("CommandLine"), raw.get("Cmdline")] if v
                 )
@@ -2614,17 +2824,6 @@ def run_detections_sync(case_id: str) -> int:
                 "event_id": event.id, "entity": event.entity,
                 "source": event.source, "summary": event.summary[:300],
             }
-
-            if is_usn_event:
-                tokens = _usn_reason_tokens(raw)
-                path = _usn_path(event, raw)
-                if tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}:
-                    usn_events.append(event)
-                if _is_usn_executable_path(path) and (
-                    "FILE_CREATE" in tokens or tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}
-                ):
-                    _check_usn_journal_event(session, existing, event, raw, evidence)
-                continue
 
             cross_process_severity = _check_cross_process_event(session, existing, event, raw, evidence)
             if cross_process_severity:
@@ -2902,7 +3101,14 @@ def run_detections_sync(case_id: str) -> int:
                 if raddr and _addr_scope(raddr) != "local":
                     beacon_tracker[raddr].append(event)
 
+        mark_phase(
+            "event scan",
+            provenance_events=len(provenance_events),
+            usn_events=len(usn_events),
+            task_records=len(task_records),
+        )
         _analyze_usn_rename_chains(session, existing, usn_events)
+        mark_phase("usn rename analysis", usn_events=len(usn_events))
 
         # Beacon candidates: >= 5 connections to same endpoint with regular-ish spacing
         # over a meaningful window (a burst within one second is not a beacon).
@@ -3187,22 +3393,20 @@ def run_detections_sync(case_id: str) -> int:
                     source="logon-heuristics",
                 )
 
+        mark_phase("aggregate heuristics", findings=len(existing) - before)
+
         # --- Service provenance: trace installed services back to the dropping /
         # --- installing process and the download the binary came from.
         _correlate_service_provenance(session, existing, provenance_events, processes)
+        mark_phase("service provenance", provenance_events=len(provenance_events))
         _correlate_file_execution_provenance(session, existing, provenance_events, processes)
+        mark_phase("file provenance", provenance_events=len(provenance_events))
 
         # --- Severity taint propagation: events mentioning a flagged process/DLL/file
         # --- name inherit its severity, with provenance recorded on the event.
-        # NOTE: _propagate_flagged_entities iterates its events argument twice (it
-        # collects taint on the first pass and escalates on the second), so it must
-        # be given a materialized list -- a single-use streaming ScalarResult would
-        # be exhausted after the first pass and silently escalate nothing.
-        _propagate_flagged_entities(
-            session,
-            list(session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE))),
-            processes,
-        )
+        session.flush()
+        _propagate_flagged_entities(session, None, processes)
+        mark_phase("propagation")
 
         # --- Log-clear-after-activity: a 1102/wevtutil-cl that postdates high/critical
         # --- activity likely caps an active intrusion window (timestamps required).
@@ -3248,12 +3452,18 @@ def run_detections_sync(case_id: str) -> int:
         # Conservative-by-default: raise a finding's severity only when a second,
         # independent rule corroborates it on the same/related entity.
         _corroborate_findings(session, processes, disabled_rules, benign_keys)
+        mark_phase("corroboration")
         # User overrides last: disabled-rule and benign findings are forced to info
         # regardless of anything above (and survive this rebuild via case_meta).
         apply_overrides(session)
+        mark_phase("overrides")
         session.commit()
 
         after = len(existing)
+        logger.info(
+            "detections complete case_id=%s seconds=%.3f findings_added=%s findings_total=%s",
+            case_id, time.perf_counter() - total_started, after - before, after,
+        )
         return after - before
     finally:
         session.close()
