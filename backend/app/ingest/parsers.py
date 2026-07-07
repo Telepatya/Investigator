@@ -1,4 +1,5 @@
-"""Parsers for Velociraptor output files: JSONL, JSON, CSV, EVTX, ZIP collections."""
+"""Parsers for endpoint evidence: Velociraptor JSONL/JSON/CSV/EVTX/ZIP collections
+and Microsoft Defender Advanced Hunting (Device* table) JSON/CSV exports."""
 
 from __future__ import annotations
 
@@ -69,6 +70,8 @@ def normalize_row(row: dict[str, Any], source: str) -> dict[str, Any]:
         return _normalize_vr_evtx_row(row, source)
     if _is_usn_journal_row(row, source):
         return _normalize_usn_journal_row(row, source)
+    if _is_defender_row(row, source):
+        return _normalize_defender_row(row, source)
     return {
         "timestamp": extract_timestamp(row),
         "host": extract_host(row),
@@ -212,6 +215,292 @@ def _normalize_usn_journal_row(row: dict[str, Any], source: str) -> dict[str, An
         "summary": f"$J USN {action.replace('_', ' ')}: {path} ({reason})",
         "raw": raw,
     }
+
+
+# ---------------------------------------------------------------------------
+# Microsoft Defender / M365 Advanced Hunting (Device* tables)
+# ---------------------------------------------------------------------------
+# Exported Advanced Hunting rows are flat dicts with a stable column vocabulary
+# (DeviceName, ActionType, InitiatingProcess*). They map onto the same unified
+# Event/Process schema as Sysmon/EVTX, so once normalized the existing detection,
+# correlation, process-tree and timeline machinery works over them unchanged.
+# All recognition is gated behind _is_defender_row so non-Defender rows are
+# parsed exactly as before.
+
+_DEFENDER_INITIATING_KEYS = (
+    "InitiatingProcessFileName", "InitiatingProcessCommandLine",
+    "InitiatingProcessId", "InitiatingProcessAccountName",
+    "InitiatingProcessFolderPath",
+)
+
+_DEFENDER_TABLE_NAMES = (
+    "deviceprocessevents", "devicenetworkevents", "devicefileevents",
+    "deviceregistryevents", "devicelogonevents", "deviceimageloadevents",
+    "devicenetworkinfo", "deviceevents", "deviceinfo",
+)
+
+
+def _dstr(raw: dict[str, Any], *names: str) -> str:
+    """First non-empty value among names (case/underscore-insensitive), stripped."""
+    val = _row_get(raw, *names)
+    return str(val).strip() if val not in (None, "") else ""
+
+
+def _defender_source_table(source: str) -> str:
+    """Defender table name inferred from the source/filename, else ''."""
+    low = (source or "").lower()
+    for name in _DEFENDER_TABLE_NAMES:
+        if name in low:
+            return name
+    return "advancedhunting" if "advancedhunting" in low else ""
+
+
+def _is_defender_row(row: dict[str, Any], source: str) -> bool:
+    """Recognize a Microsoft Defender Advanced Hunting export row."""
+    if _defender_source_table(source):
+        return True
+    if _row_get(row, "DeviceId", "DeviceName") in (None, ""):
+        return False
+    if _row_get(row, "ActionType") not in (None, ""):
+        return True
+    return any(_row_get(row, key) not in (None, "") for key in _DEFENDER_INITIATING_KEYS)
+
+
+def _defender_table(row: dict[str, Any], source: str) -> str:
+    """Resolve the Advanced Hunting table: explicit column, then source name,
+    then a column-signature fallback so a table is always chosen."""
+    explicit = _dstr(row, "Type", "_TableName", "TableName").lower()
+    for name in _DEFENDER_TABLE_NAMES:
+        if explicit and name in explicit:
+            return name
+    table = _defender_source_table(source)
+    if table and table != "advancedhunting":
+        return table
+    action = _dstr(row, "ActionType").lower()
+    if "logon" in action or "logoff" in action or _dstr(row, "LogonType"):
+        return "devicelogonevents"
+    if "registry" in action or _dstr(row, "RegistryKey", "RegistryValueName"):
+        return "deviceregistryevents"
+    if _dstr(row, "RemoteIP", "RemotePort") or action in ("connectionsuccess", "connectionfailed", "inboundconnectionaccepted"):
+        return "devicenetworkevents"
+    if _dstr(row, "FileOriginUrl", "PreviousFileName", "PreviousFolderPath") or action.startswith("file"):
+        return "devicefileevents"
+    if action == "imageloaded":
+        return "deviceimageloadevents"
+    if (_dstr(row, "ProcessCommandLine") and _dstr(row, "ProcessId")) or action == "processcreated":
+        return "deviceprocessevents"
+    return table or "advancedhunting"
+
+
+def _defender_proc(raw: dict[str, Any]) -> str:
+    """Initiating (parent) process basename for a Defender row."""
+    return _basename(_dstr(raw, "InitiatingProcessFolderPath")) or _dstr(raw, "InitiatingProcessFileName")
+
+
+def _defender_file_tokens(action: str) -> list[str]:
+    """USN-style reason tokens for a DeviceFileEvents ActionType, so the engine's
+    existing file-lifecycle collectors track Defender file changes like a USN journal."""
+    return {
+        "filecreated": ["FILE_CREATE"],
+        "filerenamed": ["RENAME_NEW_NAME"],
+        "filedeleted": ["FILE_DELETE"],
+    }.get(action.lower(), [])
+
+
+def _map_defender_process(event: dict[str, Any], raw: dict[str, Any]) -> None:
+    image = _dstr(raw, "FolderPath") or _dstr(raw, "FileName")
+    base = _basename(image) or _dstr(raw, "FileName")
+    event["category"] = "process"
+    event["entity"] = base or event.get("entity")
+    cmd = _dstr(raw, "ProcessCommandLine")
+    parent = _defender_proc(raw)
+    summary = f"Process created: {image or base or '<unknown>'}"
+    if cmd:
+        summary += f" — {truncate(cmd, 300)}"
+    if parent:
+        summary += f" (parent: {parent})"
+    event["summary"] = summary
+
+
+def _map_defender_network(event: dict[str, Any], raw: dict[str, Any]) -> None:
+    event["category"] = "network"
+    proc = _defender_proc(raw)
+    event["entity"] = proc or event.get("entity")
+    # Copy into the raw keys the detection engine consumes for network events
+    # (identical shape to the Sysmon EID-3 mapping, so C2/beacon rules fire).
+    for key, src in (("Raddr", "RemoteIP"), ("Rport", "RemotePort"),
+                     ("Laddr", "LocalIP"), ("Lport", "LocalPort"), ("Proto", "Protocol")):
+        val = _dstr(raw, src)
+        if val:
+            raw[key] = val
+    url = _dstr(raw, "RemoteUrl")
+    if url and not raw.get("Url"):
+        raw["Url"] = url
+    remote = _dstr(raw, "RemoteIP") or url
+    summary = f"{proc or 'unknown'} → {remote or '<unknown>'}"
+    if _dstr(raw, "RemotePort"):
+        summary += f":{_dstr(raw, 'RemotePort')}"
+    if _dstr(raw, "Protocol"):
+        summary += f" ({_dstr(raw, 'Protocol')})"
+    if url and url != remote:
+        summary += f", url {truncate(url, 200)}"
+    event["summary"] = summary
+
+
+def _map_defender_file(event: dict[str, Any], raw: dict[str, Any]) -> None:
+    action = _dstr(raw, "ActionType")
+    path = _dstr(raw, "FolderPath") or _dstr(raw, "FileName")
+    name = _dstr(raw, "FileName") or _basename(path)
+    event["category"] = "filesystem"
+    event["entity"] = name or event.get("entity")
+    proc = _defender_proc(raw)
+
+    # Download provenance: FileOriginUrl/ReferrerUrl feed the existing
+    # _download_evidence/_download_origin logic (Url/ReferrerUrl/FullPath are
+    # already the keys it reads), so URL→file→process chains reconstruct.
+    origin = _dstr(raw, "FileOriginUrl")
+    referrer = _dstr(raw, "FileOriginReferrerUrl")
+    if origin and not raw.get("Url"):
+        raw["Url"] = origin
+    if referrer and not raw.get("ReferrerUrl"):
+        raw["ReferrerUrl"] = referrer
+    if path and not raw.get("FullPath"):
+        raw["FullPath"] = path
+
+    # File-lifecycle: mirror the synthetic USN keys _normalize_usn_journal_row
+    # emits, so the engine's create/rename/delete collectors track this file.
+    tokens = _defender_file_tokens(action)
+    if tokens:
+        raw["usn_journal"] = True
+        raw["UsnReasonTokens"] = tokens
+        raw["UsnPath"] = path
+        raw["UsnFileName"] = name
+        # File content hash is a stable identity across create/rename/delete.
+        raw["UsnFileReference"] = _dstr(raw, "SHA256", "SHA1", "MD5")
+        prev = _dstr(raw, "PreviousFolderPath") or _dstr(raw, "PreviousFileName")
+        if prev:
+            raw["PreviousFileFullPath"] = prev
+
+    verb = {
+        "filecreated": "created", "filerenamed": "renamed",
+        "filedeleted": "deleted", "filemodified": "modified",
+    }.get(action.lower(), "touched")
+    if action.lower() == "filerenamed" and raw.get("PreviousFileFullPath"):
+        summary = f"{proc or 'process'} renamed {raw['PreviousFileFullPath']} → {path or name}"
+    else:
+        summary = f"{proc or 'process'} {verb} {path or name or '<unknown>'}"
+    if origin:
+        summary += f" (from {truncate(origin, 200)})"
+    event["summary"] = summary
+
+
+def _map_defender_deviceevents(event: dict[str, Any], raw: dict[str, Any]) -> None:
+    action = _dstr(raw, "ActionType")
+    proc = _defender_proc(raw)
+    url = _dstr(raw, "RemoteUrl")
+    if ("browserlaunched" in action.lower()) or (url and "url" in action.lower()):
+        event["category"] = "browser"
+        event["entity"] = url or proc or event.get("entity")
+        if url and not raw.get("Url"):
+            raw["Url"] = url
+        event["summary"] = f"Site visited: {truncate(url, 200) or '<unknown>'}" + (
+            f" (by {proc})" if proc else "")
+        return
+    event["category"] = "eventlog"
+    event["entity"] = proc or event.get("entity")
+    if url and not raw.get("Url"):
+        raw["Url"] = url
+    detail = _dstr(raw, "FileName") or url or _dstr(raw, "RemoteIP")
+    event["summary"] = (f"{action}" if action else "Device event") + (
+        f": {truncate(detail, 200)}" if detail else "") + (f" (by {proc})" if proc else "")
+
+
+def _map_defender_registry(event: dict[str, Any], raw: dict[str, Any]) -> None:
+    event["category"] = "persistence"
+    key = _dstr(raw, "RegistryKey")
+    val = _dstr(raw, "RegistryValueName")
+    if key and not raw.get("KeyPath"):
+        # The engine matches PERSISTENCE_REGISTRY_PATHS against raw KeyPath.
+        raw["KeyPath"] = key
+    event["entity"] = val or key or event.get("entity")
+    proc = _defender_proc(raw)
+    action = _dstr(raw, "ActionType")
+    data = _dstr(raw, "RegistryValueData")
+    summary = f"{action or 'Registry change'}: {key}" + (f"\\{val}" if val else "")
+    if data:
+        summary += f" = {truncate(data, 200)}"
+    if proc:
+        summary += f" (by {proc})"
+    event["summary"] = summary
+
+
+def _map_defender_logon(event: dict[str, Any], raw: dict[str, Any]) -> None:
+    event["category"] = "account"
+    user = _dstr(raw, "AccountName") or _dstr(raw, "AccountUpn")
+    event["entity"] = user or event.get("entity")
+    ltype = _dstr(raw, "LogonType")
+    remote = _dstr(raw, "RemoteIP") or _dstr(raw, "RemoteDeviceName")
+    action = _dstr(raw, "ActionType") or "Logon"
+    domain = _dstr(raw, "AccountDomain")
+    summary = f"{action}: {domain + chr(92) if domain else ''}{user or '<unknown>'}"
+    if ltype:
+        summary += f" (type {ltype})"
+    if remote:
+        summary += f" from {remote}"
+    event["summary"] = summary
+
+
+def _map_defender_imageload(event: dict[str, Any], raw: dict[str, Any]) -> None:
+    event["category"] = "process"
+    proc = _defender_proc(raw)
+    img = _dstr(raw, "FolderPath") or _dstr(raw, "FileName")
+    event["entity"] = proc or event.get("entity")
+    event["summary"] = f"Image loaded: {img or '<unknown>'}" + (f" by {proc}" if proc else "")
+
+
+def _map_defender_generic(event: dict[str, Any], raw: dict[str, Any]) -> None:
+    table = str(raw.get("_defender_table") or "")
+    event["category"] = categorize(table) if table else "artifact"
+    event["entity"] = _defender_proc(raw) or event.get("entity")
+    action = _dstr(raw, "ActionType")
+    event["summary"] = (f"{action}: " if action else "") + summarize_row(raw)
+
+
+_DEFENDER_TABLE_MAPPERS = {
+    "deviceprocessevents": _map_defender_process,
+    "devicenetworkevents": _map_defender_network,
+    "devicefileevents": _map_defender_file,
+    "deviceevents": _map_defender_deviceevents,
+    "deviceregistryevents": _map_defender_registry,
+    "devicelogonevents": _map_defender_logon,
+    "deviceimageloadevents": _map_defender_imageload,
+}
+
+
+def _normalize_defender_row(row: dict[str, Any], source: str) -> dict[str, Any]:
+    table = _defender_table(row, source)
+    raw = _json_safe(row)
+    if not isinstance(raw, dict):
+        raw = dict(row)
+    raw["_defender_table"] = table
+    host = _dstr(raw, "DeviceName", "DeviceId")
+    event: dict[str, Any] = {
+        "timestamp": extract_timestamp(row),
+        "host": host or extract_host(row),
+        "source": source,
+        "category": "artifact",
+        "entity": None,
+        "severity": "info",
+        "summary": "",
+        "raw": raw,
+    }
+    _DEFENDER_TABLE_MAPPERS.get(table, _map_defender_generic)(event, raw)
+    if not event.get("entity"):
+        init = _dstr(raw, "InitiatingProcessFileName")
+        event["entity"] = _basename(init) or host or f"Defender {table}"
+    if not event.get("summary"):
+        event["summary"] = summarize_row(raw)
+    return event
 
 
 def _is_plain_json(obj: Any) -> bool:

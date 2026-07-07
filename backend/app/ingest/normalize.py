@@ -37,7 +37,8 @@ TIMESTAMP_KEYS = [
     "atime", "ctime", "btime", "LastWriteTime", "FirstRunTime",
 ]
 
-HOST_KEYS = ["Hostname", "hostname", "Computer", "computer", "Fqdn", "host", "Host", "ClientId"]
+HOST_KEYS = ["Hostname", "hostname", "Computer", "computer", "Fqdn", "host", "Host",
+             "DeviceName", "DeviceId", "ClientId"]
 
 
 def parse_timestamp(value: Any) -> datetime | None:

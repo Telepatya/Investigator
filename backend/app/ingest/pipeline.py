@@ -80,7 +80,25 @@ def _to_int(value: Any) -> int | None:
 
 
 def _evtx_process_creation(raw: dict[str, Any]) -> dict[str, Any] | None:
-    """Pull process fields out of a Sysmon EID-1 / Security 4688 event's raw data."""
+    """Pull process fields out of a Sysmon EID-1 / Security 4688 / Defender
+    DeviceProcessEvents event's raw data."""
+    if raw.get("_defender_table") == "deviceprocessevents":
+        image = str(raw.get("FolderPath") or raw.get("FileName") or "").strip()
+        pid = _to_int(raw.get("ProcessId"))
+        if pid is None or not image:
+            return None
+        return {
+            "pid": pid,
+            "ppid": _to_int(raw.get("InitiatingProcessId")),
+            "name": _basename(image) or f"pid-{pid}",
+            "path": image,
+            "cmdline": raw.get("ProcessCommandLine"),
+            "user": raw.get("AccountName") or raw.get("InitiatingProcessAccountName"),
+            "parent_image": raw.get("InitiatingProcessFolderPath")
+            or raw.get("InitiatingProcessFileName"),
+            "parent_cmdline": raw.get("InitiatingProcessCommandLine"),
+            "origin": "defender-process",
+        }
     eid = str(raw.get("EventID") or "")
     channel = str(raw.get("Channel") or "")
     provider = str(raw.get("Provider") or "")
@@ -189,7 +207,8 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
         info = _evtx_process_creation(event_kwargs.get("raw") or {})
         if not info:
             return
-        sid = f"evtx-{event_kwargs.get('host') or Path(source).stem}"
+        host = event_kwargs.get("host")
+        sid = f"evtx-{host or Path(source).stem}"
         start = event_kwargs.get("timestamp")
         key = (sid, info["pid"], start.isoformat() if start else None, info["name"].lower())
         if key in seen_evtx_procs:
@@ -204,7 +223,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
             cmdline=info["cmdline"],
             start_time=start,
             session_id=sid,
-            extra={"source": info["origin"], "user": info["user"]},
+            extra={"source": info["origin"], "user": info["user"], "host": host},
         ))
         stats["processes"] += 1
         # Synthesize a stub for the parent when its own creation event predates the
@@ -219,7 +238,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
                 cmdline=info["parent_cmdline"],
                 start_time=None,
                 session_id=sid,
-                extra={"synthesized_from": "parent-fields"},
+                extra={"synthesized_from": "parent-fields", "host": host},
             ))
             stats["processes"] += 1
 

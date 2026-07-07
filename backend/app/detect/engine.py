@@ -1449,6 +1449,7 @@ def _collect_file_artifacts(events: list[Event]) -> list[dict[str, Any]]:
             "base": base,
             "kind": kind,
             "origin": origin,
+            "host": event.host,
         })
     return artifacts
 
@@ -1510,6 +1511,30 @@ def _collect_usn_deletes(events: list[Event]) -> list[dict[str, Any]]:
             "frn": _usn_file_reference(raw), "timestamp": event.timestamp, "event": event,
         })
     return deletes
+
+
+def _collect_defender_renames(events: list[Event]) -> list[dict[str, Any]]:
+    """Defender DeviceFileEvents FileRenamed rows carry old+new paths in a single
+    row (unlike the two-row USN journal), so pair them directly. Returns the same
+    dict shape as _collect_usn_renames; gated on Defender file rows only, so the
+    USN rename path is untouched."""
+    renames: list[dict[str, Any]] = []
+    for event in events:
+        raw = event.raw or {}
+        if raw.get("_defender_table") != "devicefileevents":
+            continue
+        if "RENAME_NEW_NAME" not in _usn_reason_tokens(raw):
+            continue
+        old_path = str(raw.get("PreviousFileFullPath") or "").strip()
+        new_path = _usn_path(event, raw)
+        if not old_path or not new_path:
+            continue
+        renames.append({
+            "old_path": old_path, "old_base": _basename(old_path),
+            "new_path": new_path, "new_base": _basename(new_path),
+            "frn": _usn_file_reference(raw), "timestamp": event.timestamp, "event": event,
+        })
+    return renames
 
 
 def _candidate_event_in_window(candidate: dict[str, Any], ts: datetime | None) -> bool:
@@ -1717,6 +1742,7 @@ def _execution_candidates(events: list[Event], processes: list[Process]) -> dict
             "process": proc.name,
             "cmdline": proc.cmdline,
             "session_id": proc.session_id,
+            "host": (proc.extra or {}).get("host"),
             "event": None,
         }
         executions_by_base[entry["base"]].append(entry)
@@ -1742,6 +1768,7 @@ def _execution_candidates(events: list[Event], processes: list[Process]) -> dict
             "process": _basename(image),
             "cmdline": cmdline,
             "session_id": None,
+            "host": event.host,
             "event": event,
         }
         executions_by_base[entry["base"]].append(entry)
@@ -1754,10 +1781,17 @@ def _match_candidate_execution(
     executions_by_base: dict[str, list[dict[str, Any]]],
 ) -> tuple[float, str, dict[str, Any], int] | None:
     artifact_ts = candidate["event"].timestamp
+    artifact_host = candidate.get("host")
     best: tuple[float, str, dict[str, Any], int] | None = None
     best_score: float | None = None
     for segment_index, segment in enumerate(candidate["segments"]):
         for execution in executions_by_base.get(segment["base"], []):
+            # Multi-host sources (e.g. Defender) must not link a download on one
+            # device to a same-named execution on another. Only enforced when both
+            # hosts are known, so single-host collections are unaffected.
+            exec_host = execution.get("host")
+            if artifact_host and exec_host and artifact_host != exec_host:
+                continue
             confidence = _artifact_match_confidence(segment["path"], execution["path"])
             if not confidence:
                 continue
@@ -1804,7 +1838,7 @@ def _correlate_file_execution_provenance(
     if not artifacts:
         return
     executions_by_base = _execution_candidates(events, processes)
-    renames = _collect_usn_renames(events)
+    renames = _collect_usn_renames(events) + _collect_defender_renames(events)
     deletes = _collect_usn_deletes(events)
     candidates = _artifact_lifecycles(artifacts, renames, deletes)
 
