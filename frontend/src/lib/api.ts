@@ -6,6 +6,7 @@ import type {
   EventRow,
   EvidenceFile,
   Finding,
+  FindingsResponse,
   LLMConfig,
   MemoryResult,
   MemoryDump,
@@ -67,7 +68,17 @@ export const api = {
   },
   getCategories: (id: string) =>
     req<{ categories: { name: string; count: number }[] }>(`/cases/${id}/categories`),
-  getFindings: (id: string) => req<{ findings: Finding[] }>(`/cases/${id}/findings`),
+  getFindings: (id: string) => req<FindingsResponse>(`/cases/${id}/findings`),
+  setFindingBenign: (id: string, findingId: number, benign: boolean) =>
+    req<{ ok: boolean }>(`/cases/${id}/findings/${findingId}/benign`, {
+      method: "POST",
+      body: JSON.stringify({ benign }),
+    }),
+  setRuleDisabled: (id: string, ruleId: string, disabled: boolean) =>
+    req<{ ok: boolean; disabled_rules: string[] }>(`/cases/${id}/rules/disable`, {
+      method: "POST",
+      body: JSON.stringify({ rule_id: ruleId, disabled }),
+    }),
   getAttackMatrix: (id: string) =>
     req<{ techniques: AttackTechnique[] }>(`/cases/${id}/attack-matrix`),
   getProcessSessions: (id: string) =>

@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
 
 from app.config import case_uploads_path
+from app.detect import overrides
 from app.detect.entity_graph import build_entity_graph, entity_dossier
 from app.detect.process_tree import build_tree, list_sessions, process_dossier
 from app.ingest import evidence as evidence_store
@@ -316,17 +317,58 @@ async def get_findings(case_id: str) -> dict:
         findings = list(session.scalars(select(Finding)))
         order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
         findings.sort(key=lambda f: order.get(f.severity, 0), reverse=True)
-        return {
-            "findings": [
-                {
-                    "id": f.id, "title": f.title, "description": f.description,
-                    "severity": f.severity, "mitre_techniques": f.mitre_techniques,
-                    "evidence": f.evidence, "source": f.source, "ai_verdict": f.ai_verdict,
-                    "created_at": f.created_at.isoformat(),
-                }
-                for f in findings
-            ],
-        }
+        disabled = overrides.get_disabled_rules(session)
+        benign = overrides.get_benign_keys(session)
+        out = []
+        for f in findings:
+            rid = overrides.rule_id_for(f.title, f.source)
+            reason = overrides.is_suppressed(f.title, f.source, f.evidence, disabled, benign)
+            out.append({
+                "id": f.id, "title": f.title, "description": f.description,
+                "severity": f.severity, "mitre_techniques": f.mitre_techniques,
+                "evidence": f.evidence, "source": f.source, "ai_verdict": f.ai_verdict,
+                "created_at": f.created_at.isoformat(),
+                "rule_id": rid,
+                "suppressed": reason is not None,
+                "suppressed_reason": reason,
+                "benign": overrides.finding_key(f.title, f.evidence) in benign,
+                "rule_disabled": rid in disabled,
+            })
+        return {"findings": out, "disabled_rules": sorted(disabled)}
+    finally:
+        session.close()
+
+
+@router.post("/{case_id}/findings/{finding_id}/benign")
+async def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
+    """Mark a single finding benign (severity -> info) or restore it."""
+    benign = bool(body.get("benign", True))
+    session = case_store.get_session(case_id)
+    try:
+        f = session.get(Finding, finding_id)
+        if not f:
+            raise HTTPException(404, "Finding not found")
+        overrides.set_finding_benign(session, overrides.finding_key(f.title, f.evidence), benign)
+        overrides.apply_overrides(session)
+        session.commit()
+        return {"ok": True, "finding_id": finding_id, "benign": benign}
+    finally:
+        session.close()
+
+
+@router.post("/{case_id}/rules/disable")
+async def set_rule_disabled(case_id: str, body: dict) -> dict:
+    """Disable a detection rule (all its findings -> info) or re-enable it."""
+    rule_id = str(body.get("rule_id") or "").strip()
+    if not rule_id:
+        raise HTTPException(400, "rule_id required")
+    disabled = bool(body.get("disabled", True))
+    session = case_store.get_session(case_id)
+    try:
+        rules = overrides.set_rule_disabled(session, rule_id, disabled)
+        overrides.apply_overrides(session)
+        session.commit()
+        return {"ok": True, "rule_id": rule_id, "disabled": disabled, "disabled_rules": sorted(rules)}
     finally:
         session.close()
 

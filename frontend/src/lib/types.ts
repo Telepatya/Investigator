@@ -72,6 +72,16 @@ export interface Finding {
   source: string;
   ai_verdict: string | null;
   created_at: string;
+  rule_id: string;
+  suppressed: boolean;
+  suppressed_reason: string | null;
+  benign: boolean;
+  rule_disabled: boolean;
+}
+
+export interface FindingsResponse {
+  findings: Finding[];
+  disabled_rules: string[];
 }
 
 export interface AttackTechnique {

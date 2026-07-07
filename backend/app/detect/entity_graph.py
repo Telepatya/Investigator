@@ -106,17 +106,29 @@ class _Graph:
                 "first_seen": None,
                 "last_seen": None,
                 "findings": [],
+                "_event_severity": "info",
+                "_process_severity": "info",
+                "_finding_severity": "info",
                 "meta": {},
             }
         return nid
 
-    def bump(self, nid: str | None, severity: str, ts: datetime | None) -> None:
+    def mark_severity(self, nid: str | None, severity: str, source: str) -> None:
+        if not nid or nid not in self.nodes:
+            return
+        n = self.nodes[nid]
+        bucket = f"_{source}_severity"
+        if bucket in n and SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(n[bucket], 0):
+            n[bucket] = severity
+        if SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(n["severity"], 0):
+            n["severity"] = severity
+
+    def bump(self, nid: str | None, severity: str, ts: datetime | None, source: str = "event") -> None:
         if not nid or nid not in self.nodes:
             return
         n = self.nodes[nid]
         n["action_count"] += 1
-        if SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(n["severity"], 0):
-            n["severity"] = severity
+        self.mark_severity(nid, severity, source)
         if ts:
             iso = ts.isoformat()
             if not n["first_seen"] or iso < n["first_seen"]:
@@ -159,9 +171,18 @@ class _Graph:
             e["samples"].append(summary[:200])
 
 
-def _extract_from_event(g: _Graph, ev: Event) -> None:
+def _extract_from_event(
+    g: _Graph,
+    ev: Event,
+    suppressed_event_ids: set[int] | None = None,
+    suppressed_propagation_entities: set[str] | None = None,
+) -> None:
     raw = ev.raw or {}
     sev = ev.severity
+    if suppressed_event_ids and ev.id in suppressed_event_ids:
+        sev = "info"
+    elif _is_suppressed_propagation(ev, suppressed_propagation_entities):
+        sev = "info"
     ts = ev.timestamp
     cat = ev.category
     summary = ev.summary or ""
@@ -285,12 +306,12 @@ def _extract_from_processes(g: _Graph, procs: list[Process]) -> None:
                 agg[1] += 1
             else:
                 agg[0] += 1
-        g.bump(pnode, p.severity, p.start_time)
+        g.bump(pnode, p.severity, p.start_time, source="process")
         parent = by_pid.get(p.ppid) if p.ppid else None
         if parent:
             parent_name = _basename(parent.name or f"pid-{parent.ppid}")
             pn = g.node("process", parent_name)
-            g.edge(pn, pnode, "spawned", p.severity, p.start_time,
+            g.edge(pn, pnode, "spawned", "info", p.start_time,
                    f"{parent_name} -> {name} (pid {p.pid})")
         # owner user from extra if present
         owner = None
@@ -298,8 +319,8 @@ def _extract_from_processes(g: _Graph, procs: list[Process]) -> None:
             owner = _norm(p.extra.get("user") or p.extra.get("Username") or p.extra.get("owner"))
         if owner:
             un = g.node("user", owner)
-            g.bump(un, p.severity, p.start_time)
-            g.edge(un, pnode, "ran", p.severity, p.start_time, f"{owner} ran {name}")
+            g.bump(un, p.severity, p.start_time, source="process")
+            g.edge(un, pnode, "ran", "info", p.start_time, f"{owner} ran {name}")
 
     # Finalize per-node liveness: surface the union of process flags and mark the
     # node dead only when it has no live instance. Consumed by the entity-map
@@ -337,8 +358,7 @@ def _attach_findings(g: _Graph, findings: list[Finding]) -> None:
                 "id": f.id, "title": f.title, "severity": f.severity,
                 "techniques": f.mitre_techniques,
             })
-            if SEVERITY_RANK.get(f.severity, 0) > SEVERITY_RANK.get(n["severity"], 0):
-                n["severity"] = f.severity
+            g.mark_severity(nid, f.severity, source="finding")
 
 
 def _attach_chain_edges(g: _Graph, findings: list[Finding]) -> None:
@@ -356,10 +376,71 @@ def _attach_chain_edges(g: _Graph, findings: list[Finding]) -> None:
             dst = g.node(dst_type, str(edge.get("dst") or ""))
             if not src or not dst:
                 continue
-            g.bump(src, f.severity, None)
-            g.bump(dst, f.severity, None)
+            g.bump(src, f.severity, None, source="finding")
+            g.bump(dst, f.severity, None, source="finding")
             g.edge(src, dst, str(edge.get("verb") or "correlated with"),
                    f.severity, None, f.title)
+
+
+def _suppression_tokens(evidence: dict) -> set[str]:
+    tokens: set[str] = set()
+    for key in ("entity", "client_ip", "parent", "process", "path", "name", "service", "source_image"):
+        val = evidence.get(key)
+        if isinstance(val, str) and val.strip():
+            tokens.add(val.strip().lower())
+            tokens.add(_basename(val).lower())
+    return tokens
+
+
+def _suppressed_graph_signals(findings: list[Finding]) -> tuple[set[int], set[str]]:
+    suppressed: set[int] = set()
+    active: set[int] = set()
+    suppressed_entities: set[str] = set()
+    active_entities: set[str] = set()
+    for f in findings:
+        ev = f.evidence or {}
+        event_id = ev.get("event_id")
+        if ev.get("suppressed_from") and f.severity == "info":
+            if isinstance(event_id, int):
+                suppressed.add(event_id)
+            suppressed_entities.update(_suppression_tokens(ev))
+        elif SEVERITY_RANK.get(f.severity, 0) > 0:
+            if isinstance(event_id, int):
+                active.add(event_id)
+            active_entities.update(_suppression_tokens(ev))
+    return suppressed - active, suppressed_entities - active_entities
+
+
+def _is_suppressed_propagation(ev: Event, suppressed_entities: set[str] | None) -> bool:
+    if not suppressed_entities:
+        return False
+    reason = (ev.severity_reason or "").lower()
+    if not reason.startswith("flagged-entity match:"):
+        return False
+    return any(token and token in reason for token in suppressed_entities)
+
+
+def _max_severity(*severities: str) -> str:
+    return max(severities or ("info",), key=lambda sev: SEVERITY_RANK.get(sev, 0))
+
+
+def _finalize_node_severities(g: _Graph) -> None:
+    for n in g.nodes.values():
+        event_sev = n.get("_event_severity", "info")
+        process_sev = n.get("_process_severity", "info")
+        finding_sev = n.get("_finding_severity", "info")
+        if n["findings"]:
+            # Process.severity is detector-maintained and can outlive a user's
+            # finding override. For entities with attached findings, make the
+            # effective findings authoritative while preserving independent
+            # event severity from logs or memory artifacts.
+            n["severity"] = _max_severity(event_sev, finding_sev)
+        else:
+            n["severity"] = _max_severity(event_sev, process_sev, finding_sev)
+
+
+def _public_graph_node(node: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in node.items() if not k.startswith("_")}
 
 
 def build_entity_graph(
@@ -372,18 +453,20 @@ def build_entity_graph(
     try:
         g = _Graph()
         procs = list(session.scalars(select(Process)))
+        findings = list(session.scalars(select(Finding)))
+        suppressed_event_ids, suppressed_entities = _suppressed_graph_signals(findings)
         _extract_from_processes(g, procs)
 
         for ev in session.scalars(select(Event)):
-            _extract_from_event(g, ev)
+            _extract_from_event(g, ev, suppressed_event_ids, suppressed_entities)
 
-        findings = list(session.scalars(select(Finding)))
         _attach_chain_edges(g, findings)
         _attach_findings(g, findings)
+        _finalize_node_severities(g)
 
         min_rank = SEVERITY_RANK.get(min_severity, 0)
         nodes = [
-            n for n in g.nodes.values()
+            _public_graph_node(n) for n in g.nodes.values()
             if SEVERITY_RANK.get(n["severity"], 0) >= min_rank
             and (not entity_types or n["type"] in entity_types)
         ]
@@ -419,13 +502,15 @@ def entity_dossier(case_id: str, entity_id: str, action_limit: int = 500) -> dic
     try:
         g = _Graph()
         procs = list(session.scalars(select(Process)))
+        findings = list(session.scalars(select(Finding)))
+        suppressed_event_ids, suppressed_entities = _suppressed_graph_signals(findings)
         _extract_from_processes(g, procs)
         all_events = list(session.scalars(select(Event)))
         for ev in all_events:
-            _extract_from_event(g, ev)
-        findings = list(session.scalars(select(Finding)))
+            _extract_from_event(g, ev, suppressed_event_ids, suppressed_entities)
         _attach_chain_edges(g, findings)
         _attach_findings(g, findings)
+        _finalize_node_severities(g)
 
         node = g.nodes.get(entity_id)
         if not node:
