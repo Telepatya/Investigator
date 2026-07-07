@@ -2206,6 +2206,38 @@ def _finding_entity_tokens(f: Finding) -> set[str]:
     return tokens
 
 
+_CORROBORATION_NOTE = " Corroboration:"
+
+
+def _corroboration_base(f: Finding) -> str:
+    """The engine-assigned severity of a finding, ignoring any prior corroboration.
+
+    Stored the first time a finding is escalated so repeated (non-rebuild)
+    detection runs recompute from the same base instead of compounding the bump.
+    """
+    return (f.evidence or {}).get("corroboration_base", f.severity)
+
+
+def _strip_corroboration_note(f: Finding) -> None:
+    desc = f.description or ""
+    idx = desc.find(_CORROBORATION_NOTE)
+    if idx != -1:
+        f.description = desc[:idx].rstrip()
+
+
+def _reset_corroboration(f: Finding, base: str) -> None:
+    """Return a finding to its engine base severity, clearing corroboration marks."""
+    ev = dict(f.evidence or {})
+    had = "corroboration_base" in ev
+    ev.pop("corroboration_base", None)
+    ev.pop("corroborated_by", None)
+    if had:
+        f.evidence = ev
+    if f.severity != base:
+        f.severity = base
+    _strip_corroboration_note(f)
+
+
 def _corroborate_findings(session, processes, disabled: set[str], benign: set[str]) -> int:
     """Grade single findings conservatively, escalate corroborated ones.
 
@@ -2216,13 +2248,23 @@ def _corroborate_findings(session, processes, disabled: set[str], benign: set[st
     what turns e.g. a low process finding plus a low finding on the service it
     dropped into a single medium-confidence lead. Suppressed findings (benign or
     disabled-rule) neither escalate nor lend corroboration.
+
+    Idempotent across repeated runs: each finding is recomputed from its stored
+    engine base severity, so re-running detections on a case (e.g. after a second
+    upload, without wiping findings) never compounds the escalation.
     """
-    findings = [
-        f for f in session.scalars(select(Finding))
-        if not is_suppressed(f.title, f.source, f.evidence, disabled, benign)
-        and SEVERITY_RANK.get(f.severity, 0) >= SEVERITY_RANK["low"]
-    ]
-    if len(findings) < 2:
+    active: list[tuple[Finding, str]] = []
+    for f in session.scalars(select(Finding)):
+        if is_suppressed(f.title, f.source, f.evidence, disabled, benign):
+            continue  # left entirely to apply_overrides
+        base = _corroboration_base(f)
+        if SEVERITY_RANK.get(base, 0) < SEVERITY_RANK["low"]:
+            continue
+        active.append((f, base))
+
+    if len(active) < 2:
+        for f, base in active:
+            _reset_corroboration(f, base)  # a lone finding falls back to its base
         return 0
 
     # Union-find over entity tokens; directly-related process names are pre-linked
@@ -2255,44 +2297,39 @@ def _corroborate_findings(session, processes, disabled: set[str], benign: set[st
 
     # group id -> list of (finding, rule_id)
     groups: dict[str, list[tuple[Finding, str]]] = defaultdict(list)
-    finding_tokens: list[tuple[Finding, str, set[str]]] = []
-    for f in findings:
+    finding_tokens: list[tuple[Finding, str, str, set[str]]] = []
+    for f, base in active:
         rid = rule_id_for(f.title, f.source)
         toks = _finding_entity_tokens(f)
-        finding_tokens.append((f, rid, toks))
+        finding_tokens.append((f, base, rid, toks))
         for g in {find(t) for t in toks}:
             groups[g].append((f, rid))
 
     changed = 0
-    for f, rid, toks in finding_tokens:
-        cur = SEVERITY_RANK.get(f.severity, 0)
-        if cur >= _CORROBORATION_CAP:
-            continue
+    for f, base, rid, toks in finding_tokens:
         partners: list[str] = []
         for g in {find(t) for t in toks}:
             for other, other_rid in groups.get(g, ()):
-                if other.id != f.id and other_rid != rid:
+                if other.id != f.id and other_rid != rid and other.title not in partners:
                     partners.append(other.title)
-        if not partners:
+
+        base_rank = SEVERITY_RANK.get(base, 0)
+        if not partners or base_rank >= _CORROBORATION_CAP:
+            _reset_corroboration(f, base)
             continue
-        new_rank = min(cur + 1, _CORROBORATION_CAP)
-        if new_rank <= cur:
-            continue
-        seen: list[str] = []
-        for t in partners:
-            if t not in seen:
-                seen.append(t)
-        f.severity = _RANK_TO_SEVERITY[new_rank]
+
+        new_sev = _RANK_TO_SEVERITY[min(base_rank + 1, _CORROBORATION_CAP)]
         ev = dict(f.evidence or {})
-        ev["corroborated_by"] = seen[:5]
+        ev["corroboration_base"] = base
+        ev["corroborated_by"] = partners[:5]
         f.evidence = ev
-        note = (
-            " Corroboration: the same entity is independently flagged by "
-            f"{len(seen)} other rule(s) ({', '.join(seen[:3])}); raised one "
+        f.severity = new_sev
+        _strip_corroboration_note(f)
+        f.description = (f.description or "") + (
+            _CORROBORATION_NOTE + " the same entity is independently flagged by "
+            f"{len(partners)} other rule(s) ({', '.join(partners[:3])}); raised one "
             "severity rank because corroborated signals are stronger than any alone."
         )
-        if "Corroboration:" not in (f.description or ""):
-            f.description = (f.description or "") + note
         changed += 1
     return changed
 

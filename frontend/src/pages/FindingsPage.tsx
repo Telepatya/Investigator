@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
@@ -239,7 +239,7 @@ function IconBtn({
   active: boolean;
   onClick: () => void;
   title: string;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   return (
     <button
