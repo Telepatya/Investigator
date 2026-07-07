@@ -41,8 +41,16 @@ LOLBINS: dict[str, tuple[str, str]] = {
     "ftp.exe": ("T1105", "Ingress tool transfer"),
 }
 
-# Discovery binaries that are also everyday admin tools; a bare match is low signal
-LOW_SIGNAL_LOLBINS: set[str] = {"whoami.exe", "quser.exe", "reg.exe"}
+# LOLBins that are also everyday admin/software tooling: a bare invocation (even with
+# arguments) is weak signal on its own, so it is reported at "low" rather than "medium".
+# The genuinely-abused command lines for these (certutil -urlcache, reg add ...\run,
+# schtasks /create, wmic process call create, bitsadmin /transfer, ...) are still caught
+# with full severity by SUSPICIOUS_CMDLINE_PATTERNS.
+LOW_SIGNAL_LOLBINS: set[str] = {
+    "whoami.exe", "quser.exe", "reg.exe",
+    "msiexec.exe", "curl.exe", "ftp.exe", "netsh.exe", "schtasks.exe", "wmic.exe",
+    "dsquery.exe", "nltest.exe",
+}
 
 def _exe(name: str) -> str:
     """Regex prefix for an executable invocation followed by its arguments.
@@ -91,7 +99,9 @@ SUSPICIOUS_CMDLINE_PATTERNS: list[tuple[re.Pattern[str], str, str, str]] = [
     (re.compile(_exe("reg") + r"add\s+[\"']?(?:hklm|hkcu|hkey_local_machine|hkey_current_user)\\software\\microsoft\\windows\\currentversion\\run"),
      "T1547.001", "Run key persistence", "high"),
     (re.compile(r"\battrib\b.{0,40}\+h\b"), "T1564.001", "File hiding", "medium"),
-    (re.compile(r"\bicacls\b"), "T1222", "Permission modification", "low"),
+    # Bare "icacls" (read/list ACLs) is benign; only an actual ACL change is signal.
+    (re.compile(r"\bicacls\b.{0,200}(?:/grant|/deny|/setowner|/reset|/inheritance:[re]|/remove)"),
+     "T1222", "Permission modification", "low"),
     (re.compile(r"\brundll32(?:\.exe)?[\s\"']+javascript:"), "T1218.011", "Rundll32 JavaScript execution", "critical"),
     (re.compile(r"\bscrobj\.dll\b"), "T1218.010", "Squiblydoo scriptlet execution", "critical"),
     (re.compile(r"-urlcache\b"), "T1105", "Certutil URL cache download", "critical"),
@@ -114,10 +124,19 @@ SUSPICIOUS_CMDLINE_PATTERNS: list[tuple[re.Pattern[str], str, str, str]] = [
     (re.compile(_exe("reg") + r"save\s+[\"']?hklm\\sam\b"), "T1003.002", "SAM hive dump", "critical"),
     (re.compile(_exe("reg") + r"save\s+[\"']?hklm\\system\b"), "T1003.002", "SYSTEM hive dump", "critical"),
     (re.compile(r"\bdcsync\b"), "T1003.006", "DCSync replication attack", "critical"),
-    (re.compile(r"golden[\s_-]?ticket"), "T1558.001", "Golden ticket attack", "critical"),
+    # mimikatz's own golden-ticket verb: unambiguous, fires on its own.
+    (re.compile(r"kerberos::golden\b"), "T1558.001", "Golden ticket (mimikatz kerberos::golden)", "critical"),
+    # The bare phrase "golden ticket" collides with everyday text (raffles, promos,
+    # Willy Wonka, a URL like /golden-ticket-promo). Require a Kerberos-attack context
+    # token to co-occur so only real forged-TGT tradecraft fires.
+    (re.compile(r"(?=.*golden[\s_-]?ticket)(?=.*(?:krbtgt|mimikatz|rubeus|kerberos::|\.kirbi|/aes256|/rc4|/ptt|sid:s-1-5-21))"),
+     "T1558.001", "Golden ticket attack", "critical"),
     (re.compile(r"\bkerberoast"), "T1558.003", "Kerberoasting", "critical"),
     (re.compile(r"\brubeus\b"), "T1558", "Rubeus Kerberos abuse", "critical"),
-    (re.compile(r"\bbloodhound\b"), "T1087", "BloodHound AD reconnaissance", "high"),
+    # "bloodhound" alone is a dog breed / common word; match the tool's invocation
+    # forms or its collection flag instead of any bare mention.
+    (re.compile(r"\binvoke-bloodhound\b|\bbloodhound\.(?:exe|ps1|py)\b|\bbloodhound-python\b|\bbloodhound\b.{0,60}-collectionmethod"),
+     "T1087", "BloodHound AD reconnaissance", "high"),
     (re.compile(r"\bsharphound\b"), "T1087", "SharpHound AD reconnaissance", "high"),
     (re.compile(r"cobalt[\s_-]?strike"), "T1071", "Cobalt Strike C2", "critical"),
     (re.compile(r"\bbeacon\.dll\b"), "T1071", "Cobalt Strike beacon", "critical"),
@@ -278,8 +297,11 @@ PERSISTENCE_REGISTRY_PATHS = [
     (r"activesetup\installed components", "T1547.014", "Active Setup persistence"),
 ]
 
-# Web access-log attack indicators, matched (case-insensitive) against the request line
-WEB_ATTACK_PATTERNS: list[tuple[str, str, str, str]] = [
+# Web access-log attack indicators, matched (case-insensitive) against the request line.
+# An entry's pattern is either a plain substring (fast `in` test) or a compiled regex
+# (used where a bare substring is too broad -- e.g. a benign "/powershell-docs/" path or
+# the "eval(" inside "retrieval(").
+WEB_ATTACK_PATTERNS: list[tuple[str | re.Pattern[str], str, str, str]] = [
     ("..%2f", "T1083", "Path traversal (encoded ../)", "high"),
     ("..%5c", "T1083", "Path traversal (encoded ..\\)", "high"),
     ("%2e%2e", "T1083", "Path traversal (encoded dots)", "high"),
@@ -301,7 +323,11 @@ WEB_ATTACK_PATTERNS: list[tuple[str, str, str, str]] = [
     ("/bin/bash", "T1059.004", "Command injection (shell)", "critical"),
     (";cmd", "T1059", "Command injection", "high"),
     ("cmd.exe", "T1059.003", "Command injection (cmd.exe)", "high"),
-    ("powershell", "T1059.001", "Command injection (PowerShell)", "high"),
+    # Bare "powershell" matches benign paths (/powershell-docs/, ?lang=powershell);
+    # require a shell-injection delimiter (raw or percent-encoded ; & | ` $( ) right
+    # before it so only command-injection-shaped requests fire.
+    (re.compile(r"(?:[;&|`]|%3b|%26|%7c|\$\()\s*'?\"?powershell"),
+     "T1059.001", "Command injection (PowerShell)", "high"),
     ("wget ", "T1105", "Remote payload download (wget)", "high"),
     ("curl ", "T1105", "Remote payload download (curl)", "high"),
     ("cmd.jsp", "T1505.003", "JSP web shell access", "critical"),
@@ -310,18 +336,31 @@ WEB_ATTACK_PATTERNS: list[tuple[str, str, str, str]] = [
     ("shell.php", "T1505.003", "PHP web shell access", "critical"),
     ("c99.php", "T1505.003", "c99 PHP web shell", "critical"),
     ("r57.php", "T1505.003", "r57 PHP web shell", "critical"),
-    ("eval(", "T1505.003", "Web shell eval() payload", "medium"),
+    # \b anchors "eval" to a token boundary so "retrieval(" / "medieval(" don't match.
+    (re.compile(r"\beval\s*\("), "T1505.003", "Web shell eval() payload", "medium"),
     ("base64_decode", "T1140", "Encoded payload (base64_decode)", "high"),
     ("/manager/html", "T1190", "Tomcat Manager access (deploy vector)", "low"),
     ("/manager/deploy", "T1505.003", "Tomcat Manager app deployment", "high"),
     ("/manager/upload", "T1505.003", "Tomcat Manager app upload", "high"),
     (".war", "T1505.003", "WAR archive deployment (webshell vector)", "high"),
+]
+
+# Scanner/attack-tool signatures that live in the *User-Agent* header, not the request
+# line. Matching these against the URL produced both false positives (a benign
+# "/nmap-tutorial" path) and false negatives (a scanner sending a normal-looking URL
+# with a tell-tale UA). Matched case-insensitively against the user_agent field.
+WEB_USER_AGENT_PATTERNS: list[tuple[str, str, str, str]] = [
     ("sqlmap", "T1595", "sqlmap scanner user-agent", "medium"),
-    ("nikto", "T1595", "Nikto scanner", "medium"),
-    ("nessus", "T1595", "Nessus scanner", "medium"),
-    ("nmap", "T1595", "Nmap probe", "low"),
-    ("masscan", "T1595", "Masscan probe", "low"),
-    ("acunetix", "T1595", "Acunetix scanner", "medium"),
+    ("nikto", "T1595", "Nikto scanner user-agent", "medium"),
+    ("nessus", "T1595", "Nessus scanner user-agent", "medium"),
+    ("acunetix", "T1595", "Acunetix scanner user-agent", "medium"),
+    ("nuclei", "T1595", "Nuclei scanner user-agent", "medium"),
+    ("dirbuster", "T1595", "DirBuster content-discovery user-agent", "medium"),
+    ("gobuster", "T1595", "Gobuster content-discovery user-agent", "medium"),
+    ("wpscan", "T1595", "WPScan user-agent", "medium"),
+    ("masscan", "T1595", "Masscan probe user-agent", "low"),
+    ("nmap", "T1595", "Nmap probe user-agent", "low"),
+    ("zgrab", "T1595", "zgrab banner-grab user-agent", "low"),
 ]
 
 MITRE_TECHNIQUE_NAMES: dict[str, str] = {

@@ -22,6 +22,7 @@ from app.detect.rules import (
     SYSTEM_PROCESS_PATHS,
     TASK_UPDATER_MASQUERADES,
     WEB_ATTACK_PATTERNS,
+    WEB_USER_AGENT_PATTERNS,
 )
 from app.store import cases as case_store
 from app.store.database import Event, Finding, MemoryResult, Process
@@ -1635,6 +1636,7 @@ def _match_candidate_execution(
 ) -> tuple[float, str, dict[str, Any], int] | None:
     artifact_ts = candidate["event"].timestamp
     best: tuple[float, str, dict[str, Any], int] | None = None
+    best_score: float | None = None
     for segment_index, segment in enumerate(candidate["segments"]):
         for execution in executions_by_base.get(segment["base"], []):
             confidence = _artifact_match_confidence(segment["path"], execution["path"])
@@ -1649,9 +1651,15 @@ def _match_candidate_execution(
             else:
                 gap = _DOWNLOAD_CORRELATION_WINDOW_S
             rank = 0 if confidence == "exact-path" else 1
+            # Prefer exact-path matches (rank 0) over basename matches, and the
+            # smallest time gap within a rank. Compare against the stored best's
+            # *score*, not its bare gap -- mixing the two lets a large window
+            # constant pin selection to whichever candidate happened to be seen
+            # first (an exact-path hit could never displace an earlier basename).
             score = gap + (rank * _DOWNLOAD_CORRELATION_WINDOW_S)
-            if best is None or score < best[0]:
+            if best_score is None or score < best_score:
                 best = (gap, confidence, execution, segment_index)
+                best_score = score
     return best
 
 
@@ -2582,43 +2590,46 @@ def run_detections_sync(case_id: str) -> int:
                     techniques.append("T1570")
                 elif svc_l and (
                     _looks_machine_generated(svc_l)
-                    or (
-                        len(svc_l) == 4 and svc_l.isalnum()
-                        and (any(c.isdigit() for c in svc_l) or not any(c in _VOWELS for c in svc_l))
-                    )
+                    # PsExec-style random short names contain a digit ("a1b2"); a bare
+                    # vowel-less short name is not enough on its own (it flagged legit
+                    # services like "dhcp"), so require a digit for the 4-char branch.
+                    or (len(svc_l) == 4 and svc_l.isalnum() and any(c.isdigit() for c in svc_l))
                 ):
                     reasons.append(
                         f"service name '{svc_name}' looks machine-generated "
                         "(random/PsExec-style short name)"
                     )
-                severity = "high" if reasons else "medium"
-                description = f"Event 7045 (service installation): {event.summary[:300]}"
+                # Service installs are routine (software, drivers, updates), so a plain
+                # install is not a finding on its own. Only surface one when the install
+                # has a concretely suspicious property; the service is still recorded as
+                # a persistence artifact below for the execution-pairing pass.
                 if reasons:
-                    description += (
-                        " Escalated medium->high because: " + "; ".join(reasons) + ". "
+                    description = (
+                        f"Event 7045 (service installation): {event.summary[:300]}"
+                        " Flagged because: " + "; ".join(reasons) + ". "
                         "Service installs are routine for software deployment; these "
                         "properties are what make this one consistent with malicious "
                         "service persistence."
                     )
-                _add_finding(
-                    session, existing,
-                    title="New service installed",
-                    description=description,
-                    severity=severity,
-                    techniques=techniques,
-                    evidence={
-                        **evidence,
-                        "entity": svc_name or evidence.get("entity"),
-                        "service_name": svc_name, "image_path": image[:500],
-                        "escalation_reasons": reasons,
-                    },
-                    source=f"event:{event.source}",
-                )
-                _escalate_event(
-                    session, event, severity,
-                    "Detection: new service installed (Event 7045)"
-                    + (f" — {'; '.join(reasons)}" if reasons else ""),
-                )
+                    _add_finding(
+                        session, existing,
+                        title="New service installed",
+                        description=description,
+                        severity="high",
+                        techniques=techniques,
+                        evidence={
+                            **evidence,
+                            "entity": svc_name or evidence.get("entity"),
+                            "service_name": svc_name, "image_path": image[:500],
+                            "escalation_reasons": reasons,
+                        },
+                        source=f"event:{event.source}",
+                    )
+                    _escalate_event(
+                        session, event, "high",
+                        "Detection: suspicious service installed (Event 7045) — "
+                        + "; ".join(reasons),
+                    )
                 image_base = _basename(_first_exe_token(image))
                 if image_base:
                     persistence_artifacts.append(
@@ -3076,7 +3087,9 @@ def _check_weblog(session, existing, event, raw, web_ip_tracker) -> None:
     request = str(raw.get("request") or "")
     status = str(raw.get("status") or "")
     user = raw.get("user")
+    user_agent = str(raw.get("user_agent") or "")
     req_lower = request.lower()
+    ua_lower = user_agent.lower()
 
     stat = web_ip_tracker[ip]
     stat["total"] += 1
@@ -3091,25 +3104,37 @@ def _check_weblog(session, existing, event, raw, web_ip_tracker) -> None:
 
     evidence = {
         "entity": ip, "request": request[:400], "status": status,
-        "user": user, "event_id": event.id,
+        "user": user, "user_agent": user_agent[:300] or None, "event_id": event.id,
     }
     matched_top: str | None = None
+
+    def record(technique: str, desc: str, severity: str) -> None:
+        nonlocal matched_top
+        _add_finding(
+            session, existing,
+            title=f"Web attack: {desc}",
+            description=f"{desc} from {ip}: \"{request[:300]}\" (HTTP {status})",
+            severity=severity,
+            techniques=[technique],
+            evidence=evidence,
+            source="weblog-heuristics",
+        )
+        if matched_top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[matched_top]:
+            matched_top = severity
+
     for pattern, technique, desc, severity in WEB_ATTACK_PATTERNS:
-        if pattern in req_lower:
+        hit = pattern.search(req_lower) if isinstance(pattern, re.Pattern) else pattern in req_lower
+        if hit:
             # /manager/html on its own is very noisy; only flag when authenticated
             if pattern == "/manager/html" and not user:
                 continue
-            _add_finding(
-                session, existing,
-                title=f"Web attack: {desc}",
-                description=f"{desc} from {ip}: \"{request[:300]}\" (HTTP {status})",
-                severity=severity,
-                techniques=[technique],
-                evidence=evidence,
-                source="weblog-heuristics",
-            )
-            if matched_top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[matched_top]:
-                matched_top = severity
+            record(technique, desc, severity)
+
+    # Scanner/attack-tool signatures identify themselves in the User-Agent header.
+    for pattern, technique, desc, severity in WEB_USER_AGENT_PATTERNS:
+        if ua_lower and pattern in ua_lower:
+            record(technique, desc, severity)
+
     if matched_top:
         _escalate_event(
             session, event, matched_top,
