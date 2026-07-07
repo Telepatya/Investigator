@@ -24,6 +24,13 @@ from app.detect.rules import (
     WEB_ATTACK_PATTERNS,
     WEB_USER_AGENT_PATTERNS,
 )
+from app.detect.overrides import (
+    apply_overrides,
+    get_benign_keys,
+    get_disabled_rules,
+    is_suppressed,
+    rule_id_for,
+)
 from app.store import cases as case_store
 from app.store.database import Event, Finding, MemoryResult, Process
 
@@ -2173,6 +2180,123 @@ def _propagate_flagged_entities(session, events: list[Event], processes: list[Pr
     return changed
 
 
+_CORROBORATION_CAP = SEVERITY_RANK["high"]
+
+
+def _finding_entity_tokens(f: Finding) -> set[str]:
+    """Entity tokens a finding concerns: distinctive basenames + a pid key.
+
+    Generic host binaries (svchost/cmd/powershell/...) and very short names are
+    excluded so corroboration links on a *specific* implant/file/service, not on
+    a name that appears everywhere.
+    """
+    ev = f.evidence or {}
+    tokens: set[str] = set()
+    for key in ("entity", "image_path", "path", "normalized_path",
+                "execution_path", "artifact_path", "service_name"):
+        val = ev.get(key)
+        if not val:
+            continue
+        base = _basename(str(val))
+        if base and len(base) >= 4 and base not in _PAIRING_GENERIC_HOSTS:
+            tokens.add("name:" + base)
+    pid = ev.get("pid")
+    if pid is not None:
+        tokens.add(f"pid:{ev.get('session_id')}:{pid}")
+    return tokens
+
+
+def _corroborate_findings(session, processes, disabled: set[str], benign: set[str]) -> int:
+    """Grade single findings conservatively, escalate corroborated ones.
+
+    When two findings from *different* rules concern the same entity -- or two
+    entities in a direct parent/child relationship -- the combination is stronger
+    evidence than either alone, so each involved finding is raised one rank
+    (capped at 'high'; corroboration never mints a critical on its own). This is
+    what turns e.g. a low process finding plus a low finding on the service it
+    dropped into a single medium-confidence lead. Suppressed findings (benign or
+    disabled-rule) neither escalate nor lend corroboration.
+    """
+    findings = [
+        f for f in session.scalars(select(Finding))
+        if not is_suppressed(f.title, f.source, f.evidence, disabled, benign)
+        and SEVERITY_RANK.get(f.severity, 0) >= SEVERITY_RANK["low"]
+    ]
+    if len(findings) < 2:
+        return 0
+
+    # Union-find over entity tokens; directly-related process names are pre-linked
+    # so a parent and its child (or a dropper and the file it wrote) share a group.
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        parent[find(a)] = find(b)
+
+    proc_by_pid = {(p.session_id, p.pid): p for p in processes}
+    for p in processes:
+        if not p.ppid:
+            continue
+        par = proc_by_pid.get((p.session_id, p.ppid))
+        if not par:
+            continue
+        cb, pb = _basename(p.name or ""), _basename(par.name or "")
+        if (cb and pb and len(cb) >= 4 and len(pb) >= 4
+                and cb not in _PAIRING_GENERIC_HOSTS and pb not in _PAIRING_GENERIC_HOSTS):
+            union("name:" + cb, "name:" + pb)
+
+    # group id -> list of (finding, rule_id)
+    groups: dict[str, list[tuple[Finding, str]]] = defaultdict(list)
+    finding_tokens: list[tuple[Finding, str, set[str]]] = []
+    for f in findings:
+        rid = rule_id_for(f.title, f.source)
+        toks = _finding_entity_tokens(f)
+        finding_tokens.append((f, rid, toks))
+        for g in {find(t) for t in toks}:
+            groups[g].append((f, rid))
+
+    changed = 0
+    for f, rid, toks in finding_tokens:
+        cur = SEVERITY_RANK.get(f.severity, 0)
+        if cur >= _CORROBORATION_CAP:
+            continue
+        partners: list[str] = []
+        for g in {find(t) for t in toks}:
+            for other, other_rid in groups.get(g, ()):
+                if other.id != f.id and other_rid != rid:
+                    partners.append(other.title)
+        if not partners:
+            continue
+        new_rank = min(cur + 1, _CORROBORATION_CAP)
+        if new_rank <= cur:
+            continue
+        seen: list[str] = []
+        for t in partners:
+            if t not in seen:
+                seen.append(t)
+        f.severity = _RANK_TO_SEVERITY[new_rank]
+        ev = dict(f.evidence or {})
+        ev["corroborated_by"] = seen[:5]
+        f.evidence = ev
+        note = (
+            " Corroboration: the same entity is independently flagged by "
+            f"{len(seen)} other rule(s) ({', '.join(seen[:3])}); raised one "
+            "severity rank because corroborated signals are stronger than any alone."
+        )
+        if "Corroboration:" not in (f.description or ""):
+            f.description = (f.description or "") + note
+        changed += 1
+    return changed
+
+
 def run_detections_sync(case_id: str) -> int:
     """Run all detection heuristics for a case. Returns number of findings added."""
     session = case_store.get_session(case_id)
@@ -2181,6 +2305,10 @@ def run_detections_sync(case_id: str) -> int:
         for f in session.scalars(select(Finding)):
             existing.add((f.title, str(f.evidence.get("entity") or f.evidence.get("pid") or f.evidence.get("summary", ""))[:200]))
         before = len(existing)
+
+        # User overrides (persisted in case_meta, survive this rebuild).
+        disabled_rules = get_disabled_rules(session)
+        benign_keys = get_benign_keys(session)
 
         processes = list(session.scalars(select(Process)))
         proc_by_pid: dict[tuple[str, int], Process] = {}
@@ -2259,20 +2387,22 @@ def run_detections_sync(case_id: str) -> int:
                     if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
                         proc.severity = "high"
 
-            # Execution from suspicious directories
+            # Execution from suspicious directories. Weak single signal on its own
+            # (installers, updaters and portable apps run from these too), so it is
+            # graded "low" and relies on corroboration to rise.
             if path and any(d in path for d in SUSPICIOUS_EXECUTION_DIRS):
                 _add_finding(
                     session, existing,
                     title=f"Execution from suspicious directory: {proc.name}",
                     description=f"Process executing from user-writable/staging path: {proc.path}",
-                    severity="medium",
+                    severity="low",
                     techniques=["T1204"],
                     evidence=evidence,
                     source="process-heuristics",
                 )
                 flags.append("suspicious-path")
-                if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["medium"]:
-                    proc.severity = "medium"
+                if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["low"]:
+                    proc.severity = "low"
 
             path_base = _basename(path)
             root_name = re.sub(r"\.exe$", "", path_base)
@@ -2604,6 +2734,10 @@ def run_detections_sync(case_id: str) -> int:
                 # has a concretely suspicious property; the service is still recorded as
                 # a persistence artifact below for the execution-pairing pass.
                 if reasons:
+                    # Conservative base severity: a single suspicious property is
+                    # "low", two or more (or corroboration with the dropping process,
+                    # applied later) push it up. Routine installs produce nothing.
+                    svc_severity = "medium" if len(reasons) >= 2 else "low"
                     description = (
                         f"Event 7045 (service installation): {event.summary[:300]}"
                         " Flagged because: " + "; ".join(reasons) + ". "
@@ -2615,7 +2749,7 @@ def run_detections_sync(case_id: str) -> int:
                         session, existing,
                         title="New service installed",
                         description=description,
-                        severity="high",
+                        severity=svc_severity,
                         techniques=techniques,
                         evidence={
                             **evidence,
@@ -2626,7 +2760,7 @@ def run_detections_sync(case_id: str) -> int:
                         source=f"event:{event.source}",
                     )
                     _escalate_event(
-                        session, event, "high",
+                        session, event, svc_severity,
                         "Detection: suspicious service installed (Event 7045) — "
                         + "; ".join(reasons),
                     )
@@ -3073,6 +3207,13 @@ def run_detections_sync(case_id: str) -> int:
                             "out an operation) rather than routine log maintenance."
                         )
 
+        session.flush()
+        # Conservative-by-default: raise a finding's severity only when a second,
+        # independent rule corroborates it on the same/related entity.
+        _corroborate_findings(session, processes, disabled_rules, benign_keys)
+        # User overrides last: disabled-rule and benign findings are forced to info
+        # regardless of anything above (and survive this rebuild via case_meta).
+        apply_overrides(session)
         session.commit()
 
         after = len(existing)

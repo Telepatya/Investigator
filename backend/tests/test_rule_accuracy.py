@@ -139,17 +139,19 @@ class ServiceInstallTests(_CaseTestBase):
         titles = [t for t, _ in self._run(seed)]
         self.assertNotIn("New service installed", titles)
 
-    def test_service_from_temp_path_is_flagged_high(self) -> None:
+    def test_single_suspicious_property_is_low(self) -> None:
+        # One suspicious property (staging path) is a weak signal on its own -> low.
         def seed(s):
             self._svc_event(s, "Updater", r"C:\Users\v\AppData\Local\Temp\a.exe")
         found = [(t, sev) for t, sev in self._run(seed) if t == "New service installed"]
-        self.assertEqual(found, [("New service installed", "high")])
+        self.assertEqual(found, [("New service installed", "low")])
 
-    def test_service_launching_interpreter_is_flagged(self) -> None:
+    def test_two_suspicious_properties_are_medium(self) -> None:
+        # Staging path *and* a machine-generated name -> two reasons -> medium.
         def seed(s):
-            self._svc_event(s, "Helper", r"cmd.exe /c powershell -nop -w hidden -enc ZgBv")
-        found = [t for t, _ in self._run(seed) if t == "New service installed"]
-        self.assertEqual(found, ["New service installed"])
+            self._svc_event(s, "a1b2", r"C:\Users\v\AppData\Local\Temp\a1b2.exe")
+        found = [(t, sev) for t, sev in self._run(seed) if t == "New service installed"]
+        self.assertEqual(found, [("New service installed", "medium")])
 
     def test_random_short_name_with_digit_is_flagged(self) -> None:
         def seed(s):
