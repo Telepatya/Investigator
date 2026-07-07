@@ -42,6 +42,7 @@ sys.modules.setdefault("pydantic", types.SimpleNamespace(
 
 from sqlalchemy import select
 from app.detect import entity_graph
+from app.detect import engine
 from app.detect.engine import run_detections_sync
 from app.store import cases
 from app.store import database
@@ -85,6 +86,112 @@ class UsnProvenanceTests(unittest.TestCase):
             raw={"usn_journal": True, "UsnReasonTokens": tokens, "UsnPath": path,
                  "UsnFileReference": frn},
         )
+
+    def _fake_event(self, event_id: int, ts: datetime):
+        return types.SimpleNamespace(id=event_id, timestamp=ts)
+
+    def _artifact(self, path: str, event_id: int, ts: datetime) -> dict:
+        return {
+            "event": self._fake_event(event_id, ts),
+            "path": path,
+            "base": engine._basename(path),
+            "kind": "download",
+            "origin": None,
+        }
+
+    def _delete(self, path: str, event_id: int, ts: datetime, frn: str = "") -> dict:
+        return {
+            "path": path,
+            "base": engine._basename(path),
+            "frn": frn,
+            "timestamp": ts,
+            "event": self._fake_event(event_id, ts),
+        }
+
+    def _rename(self, old_path: str, new_path: str, event_id: int, ts: datetime, frn: str = "") -> dict:
+        return {
+            "old_path": old_path,
+            "old_base": engine._basename(old_path),
+            "new_path": new_path,
+            "new_base": engine._basename(new_path),
+            "frn": frn,
+            "timestamp": ts,
+            "event": self._fake_event(event_id, ts),
+        }
+
+    def test_lifecycle_indexes_skip_irrelevant_delete_volume(self) -> None:
+        artifacts = [
+            self._artifact(f"C:\\Users\\v\\Downloads\\app{i}.exe", i, self.t0)
+            for i in range(100)
+        ]
+        deletes = [
+            self._delete(f"C:\\Users\\v\\Temp\\noise{i}.exe", 1000 + i, self.t0 + timedelta(minutes=20))
+            for i in range(1000)
+        ]
+        deletes.append(
+            self._delete(
+                "C:\\Users\\v\\Downloads\\app42.exe",
+                3000,
+                self.t0 + timedelta(minutes=30),
+            )
+        )
+
+        with patch.object(engine, "_candidate_matches_delete", wraps=engine._candidate_matches_delete) as wrapped:
+            candidates = engine._artifact_lifecycles(artifacts, [], deletes)
+
+        by_base = {c["base"]: c for c in candidates}
+        self.assertEqual([d["path"] for d in by_base["app42.exe"]["deletes"]], ["C:\\Users\\v\\Downloads\\app42.exe"])
+        self.assertEqual(sum(len(c["deletes"]) for c in candidates), 1)
+        self.assertLess(wrapped.call_count, 200)
+
+    def test_lifecycle_indexes_skip_irrelevant_rename_volume(self) -> None:
+        artifacts = [
+            self._artifact(f"C:\\Users\\v\\Downloads\\pkg{i}.exe", i, self.t0)
+            for i in range(100)
+        ]
+        renames = [
+            self._rename(
+                f"C:\\Users\\v\\Temp\\noise{i}.exe",
+                f"C:\\Users\\v\\Temp\\noise{i}.tmp",
+                1000 + i,
+                self.t0 + timedelta(minutes=2),
+            )
+            for i in range(1000)
+        ]
+        renames.append(
+            self._rename(
+                "C:\\Users\\v\\Downloads\\pkg17.exe",
+                "C:\\Users\\v\\AppData\\Local\\Temp\\payload.exe",
+                3000,
+                self.t0 + timedelta(minutes=3),
+                "500:1",
+            )
+        )
+
+        with patch.object(engine, "_candidate_matches_rename", wraps=engine._candidate_matches_rename) as wrapped:
+            candidates = engine._artifact_lifecycles(artifacts, renames, [])
+
+        by_base = {c["base"]: c for c in candidates}
+        self.assertEqual(by_base["pkg17.exe"]["segments"][-1]["base"], "payload.exe")
+        self.assertEqual(by_base["pkg17.exe"]["frn"], "500:1")
+        self.assertEqual(sum(len(c["renames"]) for c in candidates), 1)
+        self.assertLess(wrapped.call_count, 200)
+
+    def test_lifecycle_basename_delete_fallback_keeps_generic_names_out(self) -> None:
+        artifacts = [
+            self._artifact("C:\\Users\\v\\Downloads\\tool.exe", 1, self.t0),
+            self._artifact("C:\\Users\\v\\Downloads\\setup.exe", 2, self.t0),
+        ]
+        deletes = [
+            self._delete("D:\\Other\\tool.exe", 3, self.t0 + timedelta(minutes=15)),
+            self._delete("D:\\Other\\setup.exe", 4, self.t0 + timedelta(minutes=15)),
+        ]
+
+        candidates = engine._artifact_lifecycles(artifacts, [], deletes)
+        by_base = {c["base"]: c for c in candidates}
+
+        self.assertEqual([d["path"] for d in by_base["tool.exe"]["deletes"]], ["D:\\Other\\tool.exe"])
+        self.assertEqual(by_base["setup.exe"]["deletes"], [])
 
     def test_download_renamed_then_executed(self) -> None:
         case = cases.create_case("rename")
