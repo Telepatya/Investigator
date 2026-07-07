@@ -297,6 +297,87 @@ def _defender_proc(raw: dict[str, Any]) -> str:
     return _basename(_dstr(raw, "InitiatingProcessFolderPath")) or _dstr(raw, "InitiatingProcessFileName")
 
 
+def _defender_additional_fields(raw: dict[str, Any]) -> dict[str, Any]:
+    """Parse the DeviceEvents AdditionalFields JSON blob (a string) into a dict.
+    Returns {} when absent or unparseable."""
+    val = _row_get(raw, "AdditionalFields")
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+# DeviceEvents ActionTypes that describe cross-process access/injection. Mapped to
+# a synthetic Sysmon EventID so the engine's existing _check_cross_process_event
+# detection fires (remote-thread family -> 8, process-access/memory family -> 10).
+_DEFENDER_REMOTE_THREAD_ACTIONS = {
+    "createremotethreadapicall", "queueuserapcremoteapicall",
+    "setthreadcontextremoteapicall",
+}
+_DEFENDER_PROC_ACCESS_ACTIONS = {
+    "openprocessapicall", "readprocessmemoryapicall", "writeprocessmemoryapicall",
+    "writetolsassprocessmemory", "ntallocatevirtualmemoryremoteapicall",
+    "ntprotectvirtualmemoryremoteapicall", "ntmapviewofsectionremoteapicall",
+}
+
+
+def _map_defender_injection(event: dict[str, Any], raw: dict[str, Any], action: str) -> bool:
+    """Stamp the raw keys the engine's cross-process detection reads for injection
+    DeviceEvents. Returns True when the row was an injection action, else False."""
+    al = action.lower()
+    if al in _DEFENDER_REMOTE_THREAD_ACTIONS:
+        eid = "8"
+    elif al in _DEFENDER_PROC_ACCESS_ACTIONS:
+        eid = "10"
+    else:
+        return False
+
+    extra = _defender_additional_fields(raw)
+
+    def af(*names: str) -> str:
+        return _dstr(extra, *names) if extra else ""
+
+    source = _dstr(raw, "InitiatingProcessFolderPath") or _dstr(raw, "InitiatingProcessFileName")
+    source_pid = _dstr(raw, "InitiatingProcessId")
+    # For injection DeviceEvents the acted-upon (target) process is the row-level
+    # FileName/FolderPath; AdditionalFields carries target pid / access details.
+    target = (_dstr(raw, "FolderPath") or _dstr(raw, "FileName")
+              or af("TargetImageFileName", "TargetFileName", "TargetImage"))
+    target_pid = af("TargetProcessId", "TargetPID") or _dstr(raw, "TargetProcessId")
+    granted = af("GrantedAccess", "DesiredAccess", "AccessMask")
+
+    # No Channel is set (Defender rows have none), so _eid_channel_ok passes EID 8/10.
+    raw["EventID"] = eid
+    if source:
+        raw["SourceImage"] = source
+    if source_pid:
+        raw["SourceProcessId"] = source_pid
+    if target:
+        raw["TargetImage"] = target
+    if target_pid:
+        raw["TargetProcessId"] = target_pid
+    if granted:
+        raw["GrantedAccess"] = granted
+    start_addr = af("StartAddress", "RemoteThreadStartAddress")
+    if start_addr:
+        raw["StartAddress"] = start_addr
+
+    event["category"] = "process"
+    event["entity"] = _basename(source) or event.get("entity")
+    verb = "created a remote thread in" if eid == "8" else "accessed"
+    event["summary"] = (
+        f"{action}: {_basename(source) or 'process'} {verb} "
+        f"{_basename(target) or '<unknown>'}"
+        + (f" (access {granted})" if granted else "")
+    )
+    return True
+
+
 def _defender_file_tokens(action: str) -> list[str]:
     """USN-style reason tokens for a DeviceFileEvents ActionType, so the engine's
     existing file-lifecycle collectors track Defender file changes like a USN journal."""
@@ -396,6 +477,9 @@ def _map_defender_file(event: dict[str, Any], raw: dict[str, Any]) -> None:
 
 def _map_defender_deviceevents(event: dict[str, Any], raw: dict[str, Any]) -> None:
     action = _dstr(raw, "ActionType")
+    # Cross-process access / injection: feed the engine's existing EID 8/10 detection.
+    if _map_defender_injection(event, raw, action):
+        return
     proc = _defender_proc(raw)
     url = _dstr(raw, "RemoteUrl")
     if ("browserlaunched" in action.lower()) or (url and "url" in action.lower()):
