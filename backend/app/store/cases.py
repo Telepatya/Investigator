@@ -309,17 +309,44 @@ def add_events_bulk(session: Session, rows: Iterable[dict]) -> None:
     )
 
 
-def search_events(session: Session, query: str, limit: int = 50) -> list[Event]:
+def _fts_filter_sql(category: str | None, severity: str | None) -> tuple[str, str, dict]:
+    """Build the optional JOIN + WHERE clauses (and params) that apply the
+    category/severity filters to an FTS query, so text search still respects the
+    category/severity dropdowns instead of ignoring them."""
+    join = ""
+    conds = ""
+    params: dict[str, object] = {}
+    if category or severity:
+        join = "JOIN events e ON e.id = events_fts.rowid"
+        if category:
+            conds += " AND e.category = :category"
+            params["category"] = category
+        if severity:
+            conds += " AND e.severity = :severity"
+            params["severity"] = severity
+    return join, conds, params
+
+
+def search_events(
+    session: Session,
+    query: str,
+    limit: int = 50,
+    offset: int = 0,
+    category: str | None = None,
+    severity: str | None = None,
+) -> list[Event]:
+    join, conds, params = _fts_filter_sql(category, severity)
+    params.update({"q": query, "limit": limit, "offset": offset})
     rows = session.execute(
         text(
-            """
-            SELECT fts.rowid AS id FROM events_fts fts
-            WHERE events_fts MATCH :q
+            f"""
+            SELECT events_fts.rowid AS id FROM events_fts {join}
+            WHERE events_fts MATCH :q{conds}
             ORDER BY rank
-            LIMIT :limit
+            LIMIT :limit OFFSET :offset
             """
         ),
-        {"q": query, "limit": limit},
+        params,
     ).all()
     ids = [r[0] for r in rows if r[0]]
     if not ids:
@@ -329,11 +356,22 @@ def search_events(session: Session, query: str, limit: int = 50) -> list[Event]:
     return [by_id[i] for i in ids if i in by_id]
 
 
-def count_search_events(session: Session, query: str) -> int:
-    """Total number of events matching an FTS query (ignores paging limit)."""
+def count_search_events(
+    session: Session,
+    query: str,
+    category: str | None = None,
+    severity: str | None = None,
+) -> int:
+    """Total number of events matching an FTS query and the active category/
+    severity filters (ignores paging limit)."""
+    join, conds, params = _fts_filter_sql(category, severity)
+    params["q"] = query
     return session.scalar(
-        text("SELECT COUNT(*) FROM events_fts WHERE events_fts MATCH :q"),
-        {"q": query},
+        text(
+            f"SELECT COUNT(*) FROM events_fts {join} "
+            f"WHERE events_fts MATCH :q{conds}"
+        ),
+        params,
     ) or 0
 
 

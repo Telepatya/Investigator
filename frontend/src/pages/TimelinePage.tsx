@@ -28,6 +28,8 @@ export default function TimelinePage() {
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [disabledSources, setDisabledSources] = useState<Set<string>>(new Set());
   const [showSources, setShowSources] = useState(false);
+  const [disabledCategories, setDisabledCategories] = useState<Set<string>>(new Set());
+  const [showCategories, setShowCategories] = useState(false);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search.trim()), 400);
@@ -37,6 +39,7 @@ export default function TimelinePage() {
   // Latest known source list, readable inside queryFn without self-referencing
   // the query result.
   const sourcesRef = useRef<{ name: string; count: number }[]>([]);
+  const categoriesRef = useRef<{ name: string; count: number }[]>([]);
 
   // All filtering is server-side, so the source list and counts cover the whole
   // case (not just the first page of events) and filters reveal capped events.
@@ -47,6 +50,7 @@ export default function TimelinePage() {
       debouncedSearch,
       minSeverity,
       Array.from(disabledSources).sort().join("|"),
+      Array.from(disabledCategories).sort().join("|"),
     ],
     queryFn: () =>
       api.getTimeline(caseId!, {
@@ -60,23 +64,45 @@ export default function TimelinePage() {
                 .join(","),
             }
           : {}),
+        ...(disabledCategories.size > 0
+          ? {
+              categories: categoriesRef.current
+                .map((c) => c.name)
+                .filter((n) => !disabledCategories.has(n))
+                .join(","),
+            }
+          : {}),
       }),
     placeholderData: keepPreviousData,
   });
 
   useEffect(() => {
     if (data?.sources) sourcesRef.current = data.sources;
+    if (data?.categories) categoriesRef.current = data.categories;
   }, [data]);
 
   const events = useMemo(() => data?.events ?? [], [data]);
   const sources = data?.sources ?? [];
+  const categories = data?.categories ?? [];
   const total = data?.total ?? 0;
   const totalMatching = data?.total_matching ?? 0;
   const hasFilters =
-    debouncedSearch !== "" || minSeverity !== "info" || disabledSources.size > 0;
+    debouncedSearch !== "" ||
+    minSeverity !== "info" ||
+    disabledSources.size > 0 ||
+    disabledCategories.size > 0;
 
   const toggleSource = (name: string) => {
     setDisabledSources((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
+  const toggleCategory = (name: string) => {
+    setDisabledCategories((prev) => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name);
       else next.add(name);
@@ -195,6 +221,17 @@ export default function TimelinePage() {
               {disabledSources.size > 0 &&
                 ` (${sources.length - disabledSources.size}/${sources.length})`}
             </button>
+            <button
+              className={`chip cursor-pointer select-none ${
+                disabledCategories.size > 0 ? "text-accent-cyan border-accent-cyan/40" : "text-ink-300"
+              }`}
+              onClick={() => setShowCategories((v) => !v)}
+            >
+              <Filter size={12} />
+              Types
+              {disabledCategories.size > 0 &&
+                ` (${categories.length - disabledCategories.size}/${categories.length})`}
+            </button>
           </div>
         </div>
 
@@ -232,6 +269,46 @@ export default function TimelinePage() {
                   />
                   <span className="truncate font-mono">{s.name}</span>
                   <span className="text-ink-500 shrink-0">({s.count.toLocaleString()})</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {showCategories && (
+          <div className="border-t border-white/5 pt-3">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-xs uppercase tracking-wider text-ink-400">
+                Event types
+              </span>
+              <button
+                className="text-xs text-accent-cyan hover:underline"
+                onClick={() => setDisabledCategories(new Set())}
+              >
+                all
+              </button>
+              <button
+                className="text-xs text-accent-cyan hover:underline"
+                onClick={() => setDisabledCategories(new Set(categories.map((c) => c.name)))}
+              >
+                none
+              </button>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-4 gap-y-1 max-h-48 overflow-y-auto pr-2">
+              {categories.map((c) => (
+                <label
+                  key={c.name}
+                  className="flex items-center gap-2 text-xs text-ink-200 cursor-pointer hover:text-ink-50"
+                  title={c.name}
+                >
+                  <input
+                    type="checkbox"
+                    className="accent-cyan-400"
+                    checked={!disabledCategories.has(c.name)}
+                    onChange={() => toggleCategory(c.name)}
+                  />
+                  <span className="truncate font-mono">{c.name}</span>
+                  <span className="text-ink-500 shrink-0">({c.count.toLocaleString()})</span>
                 </label>
               ))}
             </div>

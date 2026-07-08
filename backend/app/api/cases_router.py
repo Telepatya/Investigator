@@ -194,28 +194,32 @@ async def get_events(
 ) -> dict:
     session = case_store.get_session(case_id)
     try:
-        if q:
-            try:
-                from app.llm.orchestrator import _fts_query
-                fts_query = _fts_query(q)
-                events = case_store.search_events(session, fts_query, limit=limit)
-                total = case_store.count_search_events(session, fts_query)
-            except Exception:
-                events = []
-                total = 0
-        else:
-            stmt = select(Event)
-            count_stmt = select(func.count()).select_from(Event)
-            if category:
-                stmt = stmt.where(Event.category == category)
-                count_stmt = count_stmt.where(Event.category == category)
-            if severity:
-                stmt = stmt.where(Event.severity == severity)
-                count_stmt = count_stmt.where(Event.severity == severity)
-            stmt = stmt.order_by(Event.timestamp.desc().nullslast()).limit(limit).offset(offset)
-            events = list(session.scalars(stmt))
-            # Count reflects the active filters so the UI's "showing X of N" is correct.
-            total = session.scalar(count_stmt) or 0
+        stmt = select(Event)
+        count_stmt = select(func.count()).select_from(Event)
+        if category:
+            stmt = stmt.where(Event.category == category)
+            count_stmt = count_stmt.where(Event.category == category)
+        if severity:
+            stmt = stmt.where(Event.severity == severity)
+            count_stmt = count_stmt.where(Event.severity == severity)
+        if q and q.strip():
+            # Plain case-insensitive "contains" match (not FTS token/prefix
+            # matching, which made "g" and "github" behave differently), applied
+            # on top of the category/severity filters so they combine.
+            like = f"%{q.strip()}%"
+            cond = (
+                Event.summary.ilike(like)
+                | Event.entity.ilike(like)
+                | Event.source.ilike(like)
+                | Event.category.ilike(like)
+                | Event.severity_reason.ilike(like)
+            )
+            stmt = stmt.where(cond)
+            count_stmt = count_stmt.where(cond)
+        stmt = stmt.order_by(Event.timestamp.desc().nullslast()).limit(limit).offset(offset)
+        events = list(session.scalars(stmt))
+        # Count reflects the active filters so the UI's "showing X of N" is correct.
+        total = session.scalar(count_stmt) or 0
         return {
             "total": total,
             "events": [
@@ -242,6 +246,7 @@ async def get_timeline(
     case_id: str,
     limit: int = 2000,
     sources: str | None = None,
+    categories: str | None = None,
     q: str | None = None,
     min_severity: str = "info",
 ) -> dict:
@@ -251,6 +256,9 @@ async def get_timeline(
         if sources is not None:
             wanted = [s for s in sources.split(",") if s]
             stmt = stmt.where(Event.source.in_(wanted))
+        if categories is not None:
+            wanted_cats = [c for c in categories.split(",") if c]
+            stmt = stmt.where(Event.category.in_(wanted_cats))
         if min_severity in _SEVERITY_LADDER and min_severity != "info":
             allowed = _SEVERITY_LADDER[_SEVERITY_LADDER.index(min_severity):]
             stmt = stmt.where(Event.severity.in_(allowed))
@@ -275,11 +283,19 @@ async def get_timeline(
             .group_by(Event.source)
             .order_by(func.count().desc())
         ).all()
+        # Category (type) counts drive a second filter alongside evidence sources.
+        category_rows = session.execute(
+            select(Event.category, func.count())
+            .where(Event.timestamp.isnot(None))
+            .group_by(Event.category)
+            .order_by(func.count().desc())
+        ).all()
         total = sum(r[1] for r in source_rows)
         return {
             "total": total,
             "total_matching": total_matching,
             "sources": [{"name": r[0], "count": r[1]} for r in source_rows],
+            "categories": [{"name": r[0], "count": r[1]} for r in category_rows],
             "events": [
                 {
                     "id": e.id,

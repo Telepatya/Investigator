@@ -35,9 +35,21 @@ TIMESTAMP_KEYS = [
     "CreateTime", "created", "Created", "mtime", "Mtime", "MTime",
     "LastRunTime", "LastModified", "KeyLastWriteTimestamp", "StartTime",
     "atime", "ctime", "btime", "LastWriteTime", "FirstRunTime",
+    # Sentinel / Log Analytics exports of the Defender tables use TimeGenerated.
+    "TimeGenerated",
 ]
 
-HOST_KEYS = ["Hostname", "hostname", "Computer", "computer", "Fqdn", "host", "Host", "ClientId"]
+# Normalized (lowercased, non-alphanumeric stripped) timestamp column names, used
+# as a fuzzy fallback so labelled variants that don't match a key above are still
+# recognized: "Timestamp [UTC]", "TimeStamp [UTC]", "TimeGenerated [UTC]",
+# "Time Generated", etc. (portal / Log Analytics / Sentinel CSV exports).
+_NORMALIZED_TS_KEYS = {re.sub(r"[^a-z0-9]", "", k.lower()) for k in TIMESTAMP_KEYS} | {
+    "timegeneratedutc", "timestamputc", "eventtimeutc", "createdtimeutc",
+    "generatedtime", "datetime", "datetimeutc",
+}
+
+HOST_KEYS = ["Hostname", "hostname", "Computer", "computer", "Fqdn", "host", "Host",
+             "DeviceName", "DeviceId", "ClientId"]
 
 
 def parse_timestamp(value: Any) -> datetime | None:
@@ -99,6 +111,14 @@ def extract_timestamp(row: dict[str, Any]) -> datetime | None:
     for key in TIMESTAMP_KEYS:
         if key in row and row[key]:
             ts = parse_timestamp(row[key])
+            if ts:
+                return ts
+    # Fuzzy fallback for labelled timestamp columns ("TimeGenerated",
+    # "Timestamp [UTC]", ...) so Sentinel / Log Analytics exports still populate
+    # the timeline (which requires a timestamp).
+    for key, val in row.items():
+        if isinstance(key, str) and val and re.sub(r"[^a-z0-9]", "", key.lower()) in _NORMALIZED_TS_KEYS:
+            ts = parse_timestamp(val)
             if ts:
                 return ts
     # nested SystemTime (EVTX style)
