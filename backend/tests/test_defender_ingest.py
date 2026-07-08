@@ -160,6 +160,27 @@ class DefenderMappingTests(unittest.TestCase):
         self.assertEqual(ev["category"], "browser")
         self.assertEqual(ev["raw"]["Url"], "https://evil.example/landing")
 
+    def test_csv_export_with_utf8_bom_parses_timestamp(self) -> None:
+        # Defender portal CSV exports are UTF-8 with a BOM and Timestamp is the
+        # first column. Without utf-8-sig the BOM mangles the header to
+        # "﻿Timestamp", nulling the timestamp -> the event would be missing
+        # from the timeline (which requires a timestamp) though it shows in Events.
+        import tempfile
+        from pathlib import Path
+        from app.ingest.parsers import parse_file
+
+        body = (
+            "Timestamp,DeviceName,ActionType,FileName,FolderPath,InitiatingProcessFileName\r\n"
+            "2026-04-14T13:20:00.7654321Z,WKS-01,FileCreated,a.exe,C:\\x\\a.exe,chrome.exe\r\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "DeviceFileEvents.csv"
+            p.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+            ev = list(parse_file(p, "DeviceFileEvents"))[0]
+        self.assertIsNotNone(ev["timestamp"], "BOM should not null the timestamp")
+        self.assertIn("Timestamp", ev["raw"])
+        self.assertNotIn("﻿Timestamp", ev["raw"])
+
     def test_unknown_table_generic_fallback(self) -> None:
         # An unmodeled Device*/AH table is still ingested best-effort, with host
         # attributed and all columns retained in raw (nothing dropped).

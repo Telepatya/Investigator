@@ -615,7 +615,7 @@ def _json_safe(obj: Any) -> Any:
 
 
 def parse_jsonl(path: Path, source: str) -> Iterator[dict[str, Any]]:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -629,13 +629,13 @@ def parse_jsonl(path: Path, source: str) -> Iterator[dict[str, Any]]:
 
 
 def parse_json(path: Path, source: str) -> Iterator[dict[str, Any]]:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         prefix = f.read(4096).lstrip()
     if prefix.startswith("["):
         yield from _parse_json_array_stream(path, source)
         return
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             data = json.load(f)
     except json.JSONDecodeError:
         return
@@ -654,7 +654,7 @@ def _parse_json_array_stream(path: Path, source: str) -> Iterator[dict[str, Any]
     in_array = False
     done = False
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         while not done:
             chunk = f.read(1024 * 1024)
             if chunk:
@@ -695,7 +695,7 @@ def _parse_json_array_stream(path: Path, source: str) -> Iterator[dict[str, Any]
 
 
 def parse_csv(path: Path, source: str) -> Iterator[dict[str, Any]]:
-    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
         try:
             reader = csv.DictReader(f)
             for row in reader:
@@ -1069,7 +1069,7 @@ _CLF_RE = re.compile(
 def parse_textlog(path: Path, source: str) -> Iterator[dict[str, Any]]:
     """Parse text logs. Recognizes web access logs (CLF/Combined); otherwise
     emits one event per line as a generic log entry."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.rstrip("\n").rstrip("\r")
             if not line.strip():
@@ -1131,7 +1131,7 @@ def parse_file(path: Path, source: str | None = None) -> Iterator[dict[str, Any]
         yield from parse_jsonl(path, src)
     elif suffix == ".json":
         # Velociraptor often writes JSONL with .json extension; sniff first line
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             prefix = f.read(8192).lstrip()
         if prefix.startswith("["):
             yield from parse_json(path, src)

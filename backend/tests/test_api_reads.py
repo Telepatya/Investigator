@@ -165,6 +165,65 @@ class ApiReadTests(unittest.TestCase):
         finally:
             s.close()
 
+    def test_search_events_respects_category_and_severity(self) -> None:
+        # Text search must combine with the category/severity dropdowns, not
+        # ignore them (the reported bug: typing text dropped the type filter).
+        case = cases.create_case("searchfilter")
+        self._seed(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            # "ran" appears in all 60 summaries; filters must still narrow it.
+            self.assertEqual(cases.count_search_events(s, "ran"), 60)
+            self.assertEqual(cases.count_search_events(s, "ran", category="process"), 30)
+            self.assertEqual(cases.count_search_events(s, "ran", severity="high"), 20)
+            self.assertEqual(
+                cases.count_search_events(s, "ran", category="process", severity="high"), 10
+            )
+            got = cases.search_events(s, "ran", limit=100, category="process", severity="high")
+            self.assertEqual(len(got), 10)
+            self.assertTrue(all(e.category == "process" and e.severity == "high" for e in got))
+        finally:
+            s.close()
+
+    def test_timeline_category_aggregation_and_filter(self) -> None:
+        # Mirror get_timeline's new category (type) aggregation + categories
+        # filter, which back the timeline's "Types" filter. Only timestamped
+        # events count (the timeline requires a timestamp).
+        from datetime import datetime, timezone
+
+        case = cases.create_case("tl")
+        s = cases.get_session(case["id"])
+        try:
+            for i in range(6):
+                cases.add_event(
+                    s, timestamp=datetime(2026, 1, 1, 0, i, tzinfo=timezone.utc),
+                    host="H", source="DeviceProcessEvents.json",
+                    category=("process" if i % 2 else "network"),
+                    entity=f"p{i}", severity="info", summary=f"s{i}", raw={},
+                )
+            # a null-timestamp event must be excluded from the timeline aggregation
+            cases.add_event(
+                s, timestamp=None, host="H", source="x", category="account",
+                entity="e", severity="info", summary="s", raw={},
+            )
+            s.commit()
+
+            cat_rows = s.execute(
+                select(Event.category, func.count())
+                .where(Event.timestamp.isnot(None))
+                .group_by(Event.category)
+            ).all()
+            self.assertEqual({r[0]: r[1] for r in cat_rows}, {"process": 3, "network": 3})
+
+            filtered = s.scalar(
+                select(func.count()).select_from(Event).where(
+                    Event.timestamp.isnot(None), Event.category.in_(["process"])
+                )
+            )
+            self.assertEqual(filtered, 3)
+        finally:
+            s.close()
+
 
 if __name__ == "__main__":
     unittest.main()

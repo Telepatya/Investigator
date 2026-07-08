@@ -137,8 +137,14 @@ class DefenderDownloadChainTests(unittest.TestCase):
                 for src, _v, dst in edges),
             f"missing file->process edge; edges={edges}",
         )
-        # the outbound network connection surfaces the C2 IP
+        # the outbound network connection surfaces the C2 IP, connected to the
+        # process that made it (not only to the device)
         self.assertIn("ip::203.0.113.5", node_ids, f"missing C2 ip node; nodes={node_ids}")
+        self.assertTrue(
+            any(src == "process::payload.exe" and dst == "ip::203.0.113.5"
+                for src, _v, dst in edges),
+            f"missing process->ip edge; edges={edges}",
+        )
 
     def test_download_and_execution_on_different_hosts_do_not_chain(self) -> None:
         # Same-named file downloaded on WKS-A but executed on WKS-B: host-scoping

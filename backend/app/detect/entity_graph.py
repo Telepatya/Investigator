@@ -273,10 +273,21 @@ def _extract_from_event(
         # host-scoped defense-evasion action
         g.edge(actor_node or host_node, host_node, verb or "modified host", sev, ts, summary)
 
-    # network connections (from memory netscan or sysmon 3)
+    # network connections (memory netscan, sysmon 3, or Defender DeviceNetworkEvents)
     if cat == "network":
-        owner = _norm(raw.get("Owner") or raw.get("Process"))
-        raddr = _norm(raw.get("Raddr") or raw.get("ForeignAddr") or raw.get("DestinationIp"))
+        # The initiating process lives under different keys per source: Owner
+        # (netscan), Image (sysmon 3), InitiatingProcessFileName (Defender). Fall
+        # back to the event entity, which the parsers set to the process basename.
+        owner_raw = (
+            raw.get("Owner") or raw.get("Process")
+            or raw.get("InitiatingProcessFileName") or raw.get("Image")
+            or raw.get("ProcessName") or ev.entity
+        )
+        owner = _basename(owner_raw) if owner_raw else None
+        raddr = _norm(
+            raw.get("Raddr") or raw.get("ForeignAddr")
+            or raw.get("DestinationIp") or raw.get("RemoteIP")
+        )
         oproc = g.node("process", owner) if owner else None
         rip = g.node("ip", raddr) if raddr and _looks_like_ip(raddr) else None
         g.bump(oproc, sev, ts)

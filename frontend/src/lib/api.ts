@@ -52,7 +52,13 @@ export const api = {
   },
   getTimeline: (
     id: string,
-    params: { q?: string; min_severity?: string; sources?: string; limit?: number } = {},
+    params: {
+      q?: string;
+      min_severity?: string;
+      sources?: string;
+      categories?: string;
+      limit?: number;
+    } = {},
   ) => {
     const qs = new URLSearchParams(
       Object.entries(params)
@@ -63,6 +69,7 @@ export const api = {
       total: number;
       total_matching: number;
       sources: { name: string; count: number }[];
+      categories: { name: string; count: number }[];
       events: TimelineEvt[];
     }>(`/cases/${id}/timeline${qs ? `?${qs}` : ""}`);
   },
