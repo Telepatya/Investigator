@@ -194,34 +194,32 @@ async def get_events(
 ) -> dict:
     session = case_store.get_session(case_id)
     try:
-        if q:
-            try:
-                from app.llm.orchestrator import _fts_query
-                fts_query = _fts_query(q)
-                # Text search must still honor the category/severity dropdowns.
-                events = case_store.search_events(
-                    session, fts_query, limit=limit, offset=offset,
-                    category=category, severity=severity,
-                )
-                total = case_store.count_search_events(
-                    session, fts_query, category=category, severity=severity,
-                )
-            except Exception:
-                events = []
-                total = 0
-        else:
-            stmt = select(Event)
-            count_stmt = select(func.count()).select_from(Event)
-            if category:
-                stmt = stmt.where(Event.category == category)
-                count_stmt = count_stmt.where(Event.category == category)
-            if severity:
-                stmt = stmt.where(Event.severity == severity)
-                count_stmt = count_stmt.where(Event.severity == severity)
-            stmt = stmt.order_by(Event.timestamp.desc().nullslast()).limit(limit).offset(offset)
-            events = list(session.scalars(stmt))
-            # Count reflects the active filters so the UI's "showing X of N" is correct.
-            total = session.scalar(count_stmt) or 0
+        stmt = select(Event)
+        count_stmt = select(func.count()).select_from(Event)
+        if category:
+            stmt = stmt.where(Event.category == category)
+            count_stmt = count_stmt.where(Event.category == category)
+        if severity:
+            stmt = stmt.where(Event.severity == severity)
+            count_stmt = count_stmt.where(Event.severity == severity)
+        if q and q.strip():
+            # Plain case-insensitive "contains" match (not FTS token/prefix
+            # matching, which made "g" and "github" behave differently), applied
+            # on top of the category/severity filters so they combine.
+            like = f"%{q.strip()}%"
+            cond = (
+                Event.summary.ilike(like)
+                | Event.entity.ilike(like)
+                | Event.source.ilike(like)
+                | Event.category.ilike(like)
+                | Event.severity_reason.ilike(like)
+            )
+            stmt = stmt.where(cond)
+            count_stmt = count_stmt.where(cond)
+        stmt = stmt.order_by(Event.timestamp.desc().nullslast()).limit(limit).offset(offset)
+        events = list(session.scalars(stmt))
+        # Count reflects the active filters so the UI's "showing X of N" is correct.
+        total = session.scalar(count_stmt) or 0
         return {
             "total": total,
             "events": [

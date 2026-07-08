@@ -181,6 +181,21 @@ class DefenderMappingTests(unittest.TestCase):
         self.assertIn("Timestamp", ev["raw"])
         self.assertNotIn("﻿Timestamp", ev["raw"])
 
+    def test_sentinel_timegenerated_and_utc_suffix_timestamps(self) -> None:
+        # Sentinel / Log Analytics exports label the time column TimeGenerated,
+        # and portal/LA CSVs sometimes render it "Timestamp [UTC]" / "TimeGenerated
+        # [UTC]". All must yield a non-null timestamp so the event reaches the
+        # timeline (which requires one).
+        for tskey in ("TimeGenerated", "Timestamp [UTC]", "TimeStamp [UTC]", "TimeGenerated [UTC]"):
+            row = {
+                tskey: "2026-04-14T13:20:00.7654321Z", "DeviceName": "WKS-01",
+                "ActionType": "ProcessCreated", "FileName": "a.exe",
+                "FolderPath": "C:\\x\\a.exe", "ProcessId": 5,
+                "InitiatingProcessFileName": "explorer.exe",
+            }
+            ev = normalize_row(row, "DeviceProcessEvents")
+            self.assertIsNotNone(ev["timestamp"], f"{tskey} should parse to a timestamp")
+
     def test_unknown_table_generic_fallback(self) -> None:
         # An unmodeled Device*/AH table is still ingested best-effort, with host
         # attributed and all columns retained in raw (nothing dropped).
