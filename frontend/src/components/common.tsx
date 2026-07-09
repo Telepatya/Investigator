@@ -225,9 +225,19 @@ export function DetailDrawer({
 
   const drawer = (
     <>
+      {/* Transparent click-catcher: dismiss on outside click without obscuring
+          the map/timeline behind the drawer, so context stays readable. */}
+      <div className="fixed inset-0 z-[999]" onClick={onClose} aria-hidden="true" />
+      {/* A narrow blurred strip hugging the drawer's left edge, fading out to the
+          left, gives a soft seam instead of frosting the whole screen. */}
       <div
-        className="fixed inset-0 z-[999] bg-[rgb(var(--shadow)/0.34)] backdrop-blur-sm"
-        onClick={onClose}
+        className="pointer-events-none fixed inset-y-0 right-0 z-[999] hidden w-24 md:right-[28rem] md:block"
+        style={{
+          backdropFilter: "blur(6px)",
+          WebkitBackdropFilter: "blur(6px)",
+          maskImage: "linear-gradient(to right, transparent, black)",
+          WebkitMaskImage: "linear-gradient(to right, transparent, black)",
+        }}
         aria-hidden="true"
       />
       <div
