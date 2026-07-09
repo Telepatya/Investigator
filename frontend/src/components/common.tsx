@@ -257,6 +257,61 @@ export function DetailDrawer({
   return createPortal(drawer, document.body);
 }
 
+export function ConfirmDialog({
+  title,
+  message,
+  confirmLabel = "Confirm",
+  cancelLabel = "Cancel",
+  danger,
+  busy,
+  onConfirm,
+  onClose,
+}: {
+  title: string;
+  message: ReactNode;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  danger?: boolean;
+  busy?: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busy) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, busy]);
+
+  return createPortal(
+    <div
+      className="modal-backdrop fixed inset-0 z-[1000] grid place-items-center p-4"
+      onClick={() => !busy && onClose()}
+    >
+      <div
+        className="modal-panel w-full max-w-sm rounded-2xl p-6"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="text-lg font-semibold text-ink-50">{title}</h2>
+        <div className="mt-2 text-sm text-ink-300">{message}</div>
+        <div className="mt-6 flex justify-end gap-2">
+          <button className="btn-ghost" onClick={onClose} disabled={busy}>
+            {cancelLabel}
+          </button>
+          <button className={danger ? "btn-danger" : "btn-primary"} onClick={onConfirm} disabled={busy}>
+            {busy ? "Working…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
 export function CodeBlock({ children }: { children: ReactNode }) {
   return (
     <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-[rgb(var(--border)/0.65)] bg-[rgb(var(--panel-muted)/0.72)] p-3 font-mono text-xs text-ink-200">

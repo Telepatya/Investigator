@@ -15,6 +15,7 @@ import ReactFlow, {
   useEdgesState,
   useNodesState,
 } from "reactflow";
+import "reactflow/dist/style.css";
 import {
   User,
   Users,
@@ -31,7 +32,7 @@ import {
   X,
 } from "lucide-react";
 import { api } from "../lib/api";
-import { EmptyState, PageShell, Spinner } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
 import { SEVERITY_COLORS } from "../lib/ui";
 import type { EntityGraph, EntityNode, EntityType, Severity } from "../lib/types";
 import { EntityDossierPanel } from "../components/EntityDossierPanel";
@@ -277,6 +278,11 @@ export default function EntityMapPage() {
 
   return (
     <PageShell>
+      <PageTitle
+        icon={<Boxes size={22} />}
+        title="Entities"
+        subtitle="Reconstructed users, hosts, IPs, processes, and services, and the actions between them."
+      />
       {focusActive ? (
         <div className="card flex items-center justify-between gap-3 border-accent-blue/40 p-3 flex-wrap">
           <div className="flex items-center gap-2 flex-wrap min-w-0">

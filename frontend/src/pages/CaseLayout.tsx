@@ -1,5 +1,5 @@
 import { NavLink, Outlet, useParams } from "react-router-dom";
-import type { ReactNode } from "react";
+import { Suspense, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
@@ -20,6 +20,7 @@ import { clsx } from "clsx";
 import { api } from "../lib/api";
 import { UploadPanel } from "../components/UploadPanel";
 import { AnalyzeButton } from "../components/AnalyzeButton";
+import { Spinner } from "../components/common";
 import { fmtTime } from "../lib/ui";
 
 const TABS = [
@@ -116,7 +117,9 @@ export default function CaseLayout() {
         </div>
       </div>
 
-      <Outlet />
+      <Suspense fallback={<Spinner label="Loading…" />}>
+        <Outlet />
+      </Suspense>
     </div>
   );
 }

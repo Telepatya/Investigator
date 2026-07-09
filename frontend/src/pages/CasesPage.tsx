@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import type { Case } from "../lib/types";
-import { EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
+import { ConfirmDialog, EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
 import { fmtRelative } from "../lib/ui";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -29,6 +29,7 @@ export default function CasesPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<Case | null>(null);
 
   const { data: cases, isLoading } = useQuery({
     queryKey: ["cases"],
@@ -48,7 +49,10 @@ export default function CasesPage() {
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => api.deleteCase(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["cases"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["cases"] });
+      setPendingDelete(null);
+    },
   });
 
   return (
@@ -80,9 +84,27 @@ export default function CasesPage() {
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {cases.map((c) => (
-            <CaseCard key={c.id} c={c} onDelete={() => deleteMut.mutate(c.id)} />
+            <CaseCard key={c.id} c={c} onDelete={() => setPendingDelete(c)} />
           ))}
         </div>
+      )}
+
+      {pendingDelete && (
+        <ConfirmDialog
+          title="Delete investigation?"
+          message={
+            <>
+              <span className="font-semibold text-ink-100">{pendingDelete.name}</span> and all of its
+              parsed events, findings, processes, and memory results will be permanently removed. This
+              cannot be undone.
+            </>
+          }
+          confirmLabel="Delete case"
+          danger
+          busy={deleteMut.isPending}
+          onConfirm={() => deleteMut.mutate(pendingDelete.id)}
+          onClose={() => !deleteMut.isPending && setPendingDelete(null)}
+        />
       )}
 
       {showCreate && (

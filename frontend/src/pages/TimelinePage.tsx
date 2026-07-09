@@ -5,7 +5,7 @@ import { Timeline } from "vis-timeline/standalone";
 import { DataSet } from "vis-data";
 import "vis-timeline/styles/vis-timeline-graph2d.css";
 import { api } from "../lib/api";
-import { DetailDrawer, EmptyState, PageShell, SeverityBadge, CodeBlock, Spinner } from "../components/common";
+import { DetailDrawer, EmptyState, PageShell, PageTitle, SeverityBadge, CodeBlock, Spinner } from "../components/common";
 import { SEVERITY_COLORS, fmtTime } from "../lib/ui";
 import type { Severity, TimelineEvt } from "../lib/types";
 import { CalendarDays, Clock, Filter, Search, SlidersHorizontal, X, ZoomIn, ZoomOut } from "lucide-react";
@@ -186,20 +186,13 @@ export default function TimelinePage() {
 
   return (
     <PageShell>
+      <PageTitle
+        icon={<Clock size={22} />}
+        title="Timeline"
+        subtitle="Review events and evidence over time to understand the sequence of activity."
+      />
       <section className="surface overflow-hidden p-5">
-        <div className="flex items-start gap-3">
-          <div className="grid h-11 w-11 place-items-center rounded-2xl bg-accent-blue/10 text-accent-blue ring-1 ring-accent-blue/20">
-            <Clock size={22} />
-          </div>
-          <div>
-            <h1 className="text-2xl font-extrabold tracking-tight text-ink-50">Timeline</h1>
-            <p className="mt-1 text-sm text-ink-300">
-              Review events and evidence over time to understand the sequence of activity.
-            </p>
-          </div>
-        </div>
-
-      <div className="mt-5 space-y-3 rounded-3xl border border-[rgb(var(--border)/0.7)] bg-[rgb(var(--panel)/0.56)] p-3">
+      <div className="space-y-3 rounded-3xl border border-[rgb(var(--border)/0.7)] bg-[rgb(var(--panel)/0.56)] p-3">
         <div className="flex items-center justify-between flex-wrap gap-3">
           <div className="flex items-center gap-2 text-sm text-ink-300">
             <Clock size={16} className="text-accent-cyan" />
