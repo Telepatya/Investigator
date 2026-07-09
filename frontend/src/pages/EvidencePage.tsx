@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -13,11 +13,11 @@ import {
   File,
 } from "lucide-react";
 import { api } from "../lib/api";
-import { EmptyState, Spinner } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
 import { fmtTime } from "../lib/ui";
 import type { EvidenceFile } from "../lib/types";
 
-const KIND_META: Record<EvidenceFile["kind"], { icon: React.ReactNode; label: string; color: string }> = {
+const KIND_META: Record<EvidenceFile["kind"], { icon: ReactNode; label: string; color: string }> = {
   memory: { icon: <HardDrive size={16} />, label: "Memory dump", color: "#a78bfa" },
   archive: { icon: <Archive size={16} />, label: "Collector archive", color: "#22d3ee" },
   eventlog: { icon: <ScrollText size={16} />, label: "Event log", color: "#f59e0b" },
@@ -90,7 +90,12 @@ export default function EvidencePage() {
   const totalEvents = files.reduce((s, f) => s + f.event_count, 0);
 
   return (
-    <div className="space-y-4">
+    <PageShell>
+      <PageTitle
+        icon={<FolderOpen size={22} />}
+        title="Evidence"
+        subtitle="Uploaded files, parsed sources, and re-ingestion controls."
+      />
       <div className="card p-3 flex items-center gap-4 text-sm text-ink-300 flex-wrap">
         <span className="flex items-center gap-2">
           <FolderOpen size={16} className="text-accent-cyan" />
@@ -205,6 +210,6 @@ export default function EvidencePage() {
         Deleting evidence removes the file and all events, processes and memory results extracted
         from it, then re-runs detections so findings reflect the remaining evidence.
       </p>
-    </div>
+    </PageShell>
   );
 }

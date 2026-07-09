@@ -1,31 +1,38 @@
-import { NavLink, Outlet, useParams, Link } from "react-router-dom";
+import { NavLink, Outlet, useParams } from "react-router-dom";
+import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  LayoutDashboard,
-  FolderOpen,
-  Clock,
-  Boxes,
-  HardDrive,
   AlertTriangle,
-  List,
+  Boxes,
+  Calendar,
+  Clock,
+  Database,
   FileText,
+  FolderOpen,
+  HardDrive,
+  LayoutDashboard,
+  List,
   MessageSquare,
-  ChevronLeft,
+  ShieldCheck,
+  Star,
+  User,
 } from "lucide-react";
+import { clsx } from "clsx";
 import { api } from "../lib/api";
 import { UploadPanel } from "../components/UploadPanel";
 import { AnalyzeButton } from "../components/AnalyzeButton";
+import { fmtTime } from "../lib/ui";
 
 const TABS = [
-  { to: "overview", label: "Overview", icon: <LayoutDashboard size={16} /> },
-  { to: "evidence", label: "Evidence", icon: <FolderOpen size={16} /> },
+  { to: "overview", label: "Dashboard", icon: <LayoutDashboard size={16} /> },
   { to: "timeline", label: "Timeline", icon: <Clock size={16} /> },
-  { to: "entities", label: "Entity Map", icon: <Boxes size={16} /> },
-  { to: "memory", label: "Memory", icon: <HardDrive size={16} /> },
   { to: "findings", label: "Findings", icon: <AlertTriangle size={16} /> },
+  { to: "evidence", label: "Evidence", icon: <FolderOpen size={16} /> },
+  { to: "entities", label: "Entities", icon: <Boxes size={16} /> },
+  { to: "memory", label: "Memory", icon: <HardDrive size={16} /> },
   { to: "events", label: "Events", icon: <List size={16} /> },
   { to: "report", label: "Report", icon: <FileText size={16} /> },
-  { to: "chat", label: "AI Chat", icon: <MessageSquare size={16} /> },
+  { to: "chat", label: "AI", icon: <MessageSquare size={16} /> },
 ];
 
 export default function CaseLayout() {
@@ -37,46 +44,103 @@ export default function CaseLayout() {
     enabled: !!caseId,
   });
 
+  const clean = (c?.finding_count ?? 0) === 0;
+
   return (
-    <div className="space-y-5">
-      <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div className="flex items-start gap-3">
-          <Link to="/" className="btn-ghost mt-0.5">
-            <ChevronLeft size={16} />
-          </Link>
-          <div>
-            <h1 className="text-2xl font-bold text-ink-50">{c?.name ?? "…"}</h1>
-            <p className="text-sm text-ink-400 mt-0.5 max-w-2xl">
+    <div className="page-enter space-y-5">
+      <section className="surface overflow-hidden p-5 md:p-7">
+        <div className="grid gap-6 xl:grid-cols-[1fr_540px]">
+          <div className="min-w-0">
+            <div className="flex items-center gap-3">
+              <h1 className="truncate text-4xl font-extrabold tracking-tight text-ink-50 md:text-5xl">
+                {c?.name ?? "..."}
+              </h1>
+              <button className="text-ink-500 transition hover:text-accent-blue" title="Favorite case">
+                <Star size={24} />
+              </button>
+            </div>
+            <p className="mt-3 max-w-3xl text-sm text-ink-300">
               {c?.description || "No description"}
             </p>
+
+            <div className="mt-6 grid gap-4 text-sm text-ink-200 sm:grid-cols-2 xl:grid-cols-4">
+              <CaseField label="Case ID" value={caseId ?? "-"} />
+              <CaseField label="Owner" value="Alex Rivera" icon={<User size={15} />} />
+              <CaseField label="Created" value={c ? fmtDate(c.created_at) : "-"} icon={<Calendar size={15} />} />
+              <CaseField label="Last Updated" value={c ? fmtTime(c.updated_at) : "-"} icon={<Clock size={15} />} />
+            </div>
+          </div>
+
+          <div className={clsx("rounded-3xl border p-5", clean ? "border-emerald-400/25 bg-emerald-400/10" : "border-sev-high/25 bg-sev-high/10")}>
+            <div className="flex items-center gap-4">
+              <div className={clsx("grid h-16 w-16 place-items-center rounded-3xl", clean ? "bg-emerald-400/10 text-emerald-500" : "bg-sev-high/10 text-sev-high")}>
+                {clean ? <ShieldCheck size={34} /> : <AlertTriangle size={34} />}
+              </div>
+              <div>
+                <div className="text-lg font-bold text-ink-50">
+                  {clean ? "Environment appears clean" : "Findings need review"}
+                </div>
+                <div className="mt-1 text-sm text-ink-300">
+                  {clean ? "No ongoing threat detected" : `${c?.finding_count ?? 0} finding${c?.finding_count === 1 ? "" : "s"} detected`}
+                </div>
+                <div className="mt-3 flex items-center gap-2 text-xs text-ink-300">
+                  <span className={clsx("h-1.5 w-1.5 rounded-full", clean ? "bg-emerald-500" : "bg-sev-high")} />
+                  Last scan: {c ? fmtTime(c.updated_at) : "not available"}
+                </div>
+              </div>
+            </div>
           </div>
         </div>
+      </section>
+
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="glass flex max-w-full items-center gap-1 overflow-x-auto rounded-full p-1.5">
+          {TABS.map((t) => (
+            <NavLink
+              key={t.to}
+              to={t.to}
+              className={({ isActive }) =>
+                clsx(
+                  "btn whitespace-nowrap rounded-full px-4 py-2 text-sm",
+                  isActive
+                    ? "bg-[rgb(var(--panel-strong))] text-accent-blue shadow-sm"
+                    : "text-ink-300 hover:bg-white/40 hover:text-ink-100",
+                )
+              }
+            >
+              {t.icon}
+              {t.label}
+            </NavLink>
+          ))}
+        </div>
+
         <div className="flex items-center gap-2">
           {caseId && <UploadPanel caseId={caseId} />}
           {caseId && <AnalyzeButton caseId={caseId} status={c?.status} />}
         </div>
       </div>
 
-      <div className="glass rounded-xl p-1 flex items-center gap-1 overflow-x-auto">
-        {TABS.map((t) => (
-          <NavLink
-            key={t.to}
-            to={t.to}
-            className={({ isActive }) =>
-              `btn ${
-                isActive
-                  ? "bg-accent-cyan/15 text-accent-cyan"
-                  : "text-ink-300 hover:bg-white/5 hover:text-ink-100"
-              } whitespace-nowrap`
-            }
-          >
-            {t.icon}
-            {t.label}
-          </NavLink>
-        ))}
-      </div>
-
       <Outlet />
     </div>
   );
+}
+
+function CaseField({ label, value, icon }: { label: string; value: string; icon?: ReactNode }) {
+  return (
+    <div>
+      <div className="text-xs font-semibold text-ink-300">{label}</div>
+      <div className="mt-1 flex min-w-0 items-center gap-2 font-semibold text-ink-100">
+        {icon ?? <Database size={15} className="text-ink-400" />}
+        <span className="truncate">{value}</span>
+      </div>
+    </div>
+  );
+}
+
+function fmtDate(ts: string) {
+  return new Date(ts).toLocaleDateString(undefined, {
+    month: "short",
+    day: "2-digit",
+    year: "numeric",
+  });
 }

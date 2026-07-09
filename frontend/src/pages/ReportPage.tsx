@@ -1,7 +1,7 @@
 import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { EmptyState, Spinner, SeverityBadge } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner, SeverityBadge } from "../components/common";
 import { FileText, Download, Sparkles, Clock } from "lucide-react";
 import type { Severity } from "../lib/types";
 
@@ -52,14 +52,21 @@ export default function ReportPage() {
   }
 
   return (
-    <div className="space-y-5 max-w-4xl">
+    <PageShell className="max-w-5xl">
+      <PageTitle
+        icon={<FileText size={22} />}
+        title="Report"
+        subtitle="Executive summary, timeline narrative, and finding verdicts."
+        right={
+          <button className="btn-ghost" onClick={exportReport}>
+            <Download size={16} /> Export Markdown
+          </button>
+        }
+      />
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-sm text-ink-400">
           <Clock size={14} /> Generated {new Date(report.generated_at!).toLocaleString()}
         </div>
-        <button className="btn-ghost" onClick={exportReport}>
-          <Download size={16} /> Export Markdown
-        </button>
       </div>
 
       <div className="card p-6">
@@ -98,7 +105,7 @@ export default function ReportPage() {
           </div>
         </div>
       )}
-    </div>
+    </PageShell>
   );
 }
 

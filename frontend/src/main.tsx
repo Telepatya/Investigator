@@ -17,6 +17,7 @@ import FindingsPage from "./pages/FindingsPage";
 import EventsPage from "./pages/EventsPage";
 import ChatPage from "./pages/ChatPage";
 import ReportPage from "./pages/ReportPage";
+import { ThemeProvider } from "./lib/theme";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
@@ -51,8 +52,10 @@ const router = createBrowserRouter([
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
-    </QueryClientProvider>
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>
+    </ThemeProvider>
   </React.StrictMode>,
 );

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import type { Case } from "../lib/types";
-import { EmptyState, Spinner } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
 import { fmtRelative } from "../lib/ui";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -52,18 +52,17 @@ export default function CasesPage() {
   });
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-ink-50">Investigations</h1>
-          <p className="text-sm text-ink-400 mt-1">
-            Ingest Velociraptor collections and memory dumps, then let the AI map the machine.
-          </p>
-        </div>
+    <PageShell>
+      <PageTitle
+        icon={<FolderSearch size={22} />}
+        title="Investigations"
+        subtitle="Ingest Velociraptor collections and memory dumps, then map the machine."
+        right={
         <button className="btn-primary" onClick={() => setShowCreate(true)}>
           <Plus size={16} /> New Case
         </button>
-      </div>
+        }
+      />
 
       {isLoading ? (
         <Spinner label="Loading cases…" />
@@ -79,7 +78,7 @@ export default function CasesPage() {
           }
         />
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {cases.map((c) => (
             <CaseCard key={c.id} c={c} onDelete={() => deleteMut.mutate(c.id)} />
           ))}
@@ -87,7 +86,7 @@ export default function CasesPage() {
       )}
 
       {showCreate && (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4">
+        <div className="fixed inset-0 z-50 grid place-items-center bg-[rgb(var(--base-900)/0.38)] backdrop-blur-md p-4">
           <div className="card p-6 w-full max-w-md">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-ink-50">New investigation</h2>
@@ -131,13 +130,13 @@ export default function CasesPage() {
           </div>
         </div>
       )}
-    </div>
+    </PageShell>
   );
 }
 
 function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
   return (
-    <div className="card p-5 hover:border-accent-cyan/30 transition group relative">
+    <div className="card interactive-lift group relative p-5 hover:border-accent-blue/30">
       <div className="flex items-start justify-between">
         <Link to={`/cases/${c.id}/overview`} className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
@@ -150,7 +149,7 @@ function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
               </span>
             )}
           </div>
-          <h3 className="text-lg font-semibold text-ink-50 mt-2 truncate group-hover:text-accent-cyan transition">
+          <h3 className="text-lg font-semibold text-ink-50 mt-2 truncate transition group-hover:text-accent-blue">
             {c.name}
           </h3>
           <p className="text-sm text-ink-400 line-clamp-2 mt-1 min-h-[2.5rem]">
@@ -175,7 +174,7 @@ function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
   );
 }
 
-function Stat({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
+function Stat({ icon, label, value }: { icon: ReactNode; label: string; value: number }) {
   return (
     <div className="flex flex-col items-center">
       <div className="flex items-center gap-1 text-ink-200 font-semibold">

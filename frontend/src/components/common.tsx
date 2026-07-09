@@ -1,11 +1,58 @@
-import type { ReactNode } from "react";
+import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { clsx } from "clsx";
 import type { Severity } from "../lib/types";
 import { severityChip } from "../lib/ui";
 
+export function PageShell({ children, className }: { children: ReactNode; className?: string }) {
+  return <div className={clsx("page-enter space-y-5", className)}>{children}</div>;
+}
+
+export function GlassPanel({
+  children,
+  className,
+  as = "div",
+}: {
+  children: ReactNode;
+  className?: string;
+  as?: "div" | "section" | "article";
+}) {
+  const Tag = as;
+  return <Tag className={clsx("card", className)}>{children}</Tag>;
+}
+
+export function PageTitle({
+  icon,
+  title,
+  subtitle,
+  right,
+}: {
+  icon?: ReactNode;
+  title: string;
+  subtitle?: ReactNode;
+  right?: ReactNode;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-4 flex-wrap">
+      <div className="flex items-start gap-3 min-w-0">
+        {icon && (
+          <div className="grid h-11 w-11 place-items-center rounded-2xl bg-accent-blue/10 text-accent-blue ring-1 ring-accent-blue/20">
+            {icon}
+          </div>
+        )}
+        <div className="min-w-0">
+          <h1 className="text-2xl font-extrabold tracking-tight text-ink-50">{title}</h1>
+          {subtitle && <div className="mt-1 text-sm text-ink-300">{subtitle}</div>}
+        </div>
+      </div>
+      {right}
+    </div>
+  );
+}
+
 export function SeverityBadge({ severity }: { severity: Severity }) {
   return (
-    <span className={`chip ${severityChip(severity)}`}>
-      <span className="w-1.5 h-1.5 rounded-full bg-current" />
+    <span className={`chip capitalize ${severityChip(severity)}`}>
+      <span className="h-1.5 w-1.5 rounded-full bg-current" />
       {severity}
     </span>
   );
@@ -13,8 +60,8 @@ export function SeverityBadge({ severity }: { severity: Severity }) {
 
 export function Spinner({ label }: { label?: string }) {
   return (
-    <div className="flex items-center gap-3 text-ink-300 text-sm">
-      <span className="w-4 h-4 rounded-full border-2 border-accent-cyan/30 border-t-accent-cyan animate-spin" />
+    <div className="card flex items-center gap-3 px-4 py-3 text-sm text-ink-300">
+      <span className="h-4 w-4 rounded-full border-2 border-accent-blue/25 border-t-accent-blue animate-spin" />
       {label}
     </div>
   );
@@ -32,59 +79,76 @@ export function EmptyState({
   action?: ReactNode;
 }) {
   return (
-    <div className="card p-12 flex flex-col items-center justify-center text-center gap-3">
-      {icon && <div className="text-ink-400">{icon}</div>}
+    <div className="card flex min-h-[280px] flex-col items-center justify-center gap-3 p-12 text-center">
+      {icon && (
+        <div className="grid h-16 w-16 place-items-center rounded-3xl bg-accent-blue/10 text-accent-blue ring-1 ring-accent-blue/20">
+          {icon}
+        </div>
+      )}
       <div className="text-lg font-semibold text-ink-100">{title}</div>
-      {hint && <div className="text-sm text-ink-400 max-w-md">{hint}</div>}
+      {hint && <div className="max-w-md text-sm text-ink-300">{hint}</div>}
       {action}
     </div>
   );
 }
 
-export function StatCard({
+export function MetricCard({
   label,
   value,
   accent,
   icon,
+  trend,
 }: {
   label: string;
   value: ReactNode;
   accent?: string;
   icon?: ReactNode;
+  trend?: ReactNode;
 }) {
+  const color = accent ?? "rgb(var(--accent-blue))";
   return (
-    <div className="card p-4 flex items-center gap-4">
+    <div className="card interactive-lift flex min-h-[92px] items-center gap-4 p-4">
       {icon && (
         <div
-          className="grid place-items-center w-11 h-11 rounded-lg"
-          style={{ background: `${accent ?? "#22d3ee"}18`, color: accent ?? "#22d3ee" }}
+          className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl"
+          style={{ background: `color-mix(in srgb, ${color} 14%, transparent)`, color }}
         >
           {icon}
         </div>
       )}
-      <div>
-        <div className="text-2xl font-bold text-ink-50 leading-none">{value}</div>
-        <div className="text-xs uppercase tracking-wider text-ink-400 mt-1">{label}</div>
+      <div className="min-w-0">
+        <div className="text-xs font-medium text-ink-300">{label}</div>
+        <div className="mt-1 text-2xl font-extrabold leading-none text-ink-50">{value}</div>
+        {trend && <div className="mt-2 text-[11px] text-ink-300">{trend}</div>}
       </div>
     </div>
   );
+}
+
+export function StatCard(props: {
+  label: string;
+  value: ReactNode;
+  accent?: string;
+  icon?: ReactNode;
+}) {
+  return <MetricCard {...props} />;
 }
 
 export function Section({
   title,
   right,
   children,
+  className,
 }: {
   title: string;
   right?: ReactNode;
   children: ReactNode;
+  className?: string;
 }) {
   return (
-    <div className="card p-5">
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-ink-200">
-          {title}
-        </h2>
+    <div className={clsx("card p-5", className)}>
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <h2 className="text-sm font-bold text-ink-100">{title}</h2>
         {right}
       </div>
       {children}
@@ -92,9 +156,89 @@ export function Section({
   );
 }
 
+export function SegmentedControl<T extends string>({
+  value,
+  options,
+  onChange,
+  className,
+}: {
+  value: T;
+  options: { value: T; label: ReactNode; icon?: ReactNode }[];
+  onChange: (value: T) => void;
+  className?: string;
+}) {
+  return (
+    <div className={clsx("glass inline-flex items-center gap-1 rounded-2xl p-1", className)}>
+      {options.map((option) => (
+        <button
+          key={option.value}
+          className={clsx(
+            "btn px-3 py-1.5 text-xs",
+            value === option.value
+              ? "bg-[rgb(var(--panel-strong))] text-accent-blue shadow-sm"
+              : "text-ink-300 hover:bg-white/40 hover:text-ink-100",
+          )}
+          onClick={() => onChange(option.value)}
+        >
+          {option.icon}
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export function IconButton({
+  children,
+  label,
+  active,
+  danger,
+  className,
+  ...props
+}: {
+  children: ReactNode;
+  label: string;
+  active?: boolean;
+  danger?: boolean;
+  className?: string;
+} & ButtonHTMLAttributes<HTMLButtonElement>) {
+  return (
+    <button
+      aria-label={label}
+      title={label}
+      className={clsx(
+        "grid h-10 w-10 place-items-center rounded-2xl border transition-all duration-200",
+        active
+          ? "border-accent-blue/40 bg-accent-blue/10 text-accent-blue shadow-glow"
+          : danger
+            ? "border-sev-critical/20 bg-sev-critical/10 text-sev-critical hover:bg-sev-critical/15"
+            : "border-[rgb(var(--border)/0.65)] bg-[rgb(var(--panel-strong)/0.58)] text-ink-300 hover:-translate-y-0.5 hover:text-accent-blue",
+        className,
+      )}
+      {...props}
+    >
+      {children}
+    </button>
+  );
+}
+
+export function Drawer({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={clsx("fixed inset-y-0 right-0 z-50 flex w-full max-w-lg flex-col glass border-l p-0 shadow-2xl", className)}>
+      {children}
+    </div>
+  );
+}
+
 export function CodeBlock({ children }: { children: ReactNode }) {
   return (
-    <pre className="bg-base-900/70 border border-white/5 rounded-lg p-3 text-xs font-mono text-ink-200 overflow-x-auto whitespace-pre-wrap break-words">
+    <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-2xl border border-[rgb(var(--border)/0.65)] bg-[rgb(var(--panel-muted)/0.72)] p-3 font-mono text-xs text-ink-200">
       {children}
     </pre>
   );

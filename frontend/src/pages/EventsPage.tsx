@@ -1,19 +1,36 @@
-import { useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { Spinner, SeverityBadge, CodeBlock, EmptyState } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
 import { fmtTime } from "../lib/ui";
 import { List, Search, X } from "lucide-react";
 import type { EventRow, Severity } from "../lib/types";
 
 export default function EventsPage() {
   const { caseId } = useParams();
-  const [search, setSearch] = useState("");
-  const [query, setQuery] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialQuery = searchParams.get("q") ?? "";
+  const [search, setSearch] = useState(initialQuery);
+  const [query, setQuery] = useState(initialQuery);
   const [category, setCategory] = useState<string>("");
   const [severity, setSeverity] = useState<string>("");
   const [selected, setSelected] = useState<EventRow | null>(null);
+
+  useEffect(() => {
+    const q = searchParams.get("q") ?? "";
+    setSearch(q);
+    setQuery(q);
+  }, [searchParams]);
+
+  function submitSearch() {
+    const q = search.trim();
+    setQuery(q);
+    const next = new URLSearchParams(searchParams);
+    if (q) next.set("q", q);
+    else next.delete("q");
+    setSearchParams(next, { replace: true });
+  }
 
   const { data: cats } = useQuery({
     queryKey: ["categories", caseId],
@@ -35,7 +52,12 @@ export default function EventsPage() {
   const events = data?.events ?? [];
 
   return (
-    <div className="space-y-4">
+    <PageShell>
+      <PageTitle
+        icon={<List size={22} />}
+        title="Events"
+        subtitle="Search raw evidence rows and inspect normalized records."
+      />
       <div className="card p-3 flex items-center gap-2 flex-wrap">
         <div className="relative flex-1 min-w-[220px]">
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-400" />
@@ -44,10 +66,10 @@ export default function EventsPage() {
             placeholder="Full-text search events…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && setQuery(search)}
+            onKeyDown={(e) => e.key === "Enter" && submitSearch()}
           />
         </div>
-        <button className="btn-ghost" onClick={() => setQuery(search)}>
+        <button className="btn-ghost" onClick={submitSearch}>
           Search
         </button>
         <select className="input w-auto py-2" value={category} onChange={(e) => setCategory(e.target.value)}>
@@ -135,7 +157,7 @@ export default function EventsPage() {
           </div>
         </div>
       )}
-    </div>
+    </PageShell>
   );
 }
 

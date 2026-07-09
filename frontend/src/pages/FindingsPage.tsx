@@ -2,7 +2,7 @@ import { useState, type ReactNode } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { EmptyState, Spinner, SeverityBadge, CodeBlock } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
 import {
   ChevronDown,
   ChevronRight,
@@ -80,7 +80,12 @@ export default function FindingsPage() {
   const suppressedCount = findings.filter((f) => f.suppressed).length;
 
   return (
-    <div className="space-y-4">
+    <PageShell>
+      <PageTitle
+        icon={<Shield size={22} />}
+        title="Findings"
+        subtitle="Detections, analyst overrides, AI verdicts, and mapped evidence."
+      />
       {disabledRules.length > 0 && (
         <div className="card p-3">
           <div className="flex items-center gap-2 mb-2 text-xs font-semibold uppercase tracking-wider text-ink-400">
@@ -142,7 +147,7 @@ export default function FindingsPage() {
             <FindingRow key={f.id} f={f} setBenign={setBenign} setRule={setRule} />
           ))}
       </div>
-    </div>
+    </PageShell>
   );
 }
 

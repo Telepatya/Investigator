@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Server,
@@ -12,9 +12,9 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import type { LLMConfig, ModelInfo, Provider } from "../lib/types";
-import { Section } from "../components/common";
+import { PageShell, PageTitle, Section } from "../components/common";
 
-const PROVIDERS: { id: Provider; name: string; icon: React.ReactNode; local: boolean }[] = [
+const PROVIDERS: { id: Provider; name: string; icon: ReactNode; local: boolean }[] = [
   { id: "ollama", name: "Ollama (Local)", icon: <Server size={18} />, local: true },
   { id: "openai", name: "OpenAI (ChatGPT)", icon: <Cloud size={18} />, local: false },
   { id: "anthropic", name: "Anthropic (Claude)", icon: <Cloud size={18} />, local: false },
@@ -122,14 +122,12 @@ export default function SettingsPage() {
   const current = PROVIDERS.find((p) => p.id === provider)!;
 
   return (
-    <div className="space-y-6 max-w-3xl">
-      <div>
-        <h1 className="text-2xl font-bold text-ink-50">Settings</h1>
-        <p className="text-sm text-ink-400 mt-1">
-          Configure the AI backend. Everything runs locally; API keys are stored in your OS
-          credential vault.
-        </p>
-      </div>
+    <PageShell className="max-w-4xl">
+      <PageTitle
+        icon={<Server size={22} />}
+        title="Settings"
+        subtitle="Configure AI providers, detection paths, and local forensic engines."
+      />
 
       <Section title="AI Provider">
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-5">
@@ -274,7 +272,7 @@ export default function SettingsPage() {
           </span>
         )}
       </div>
-    </div>
+    </PageShell>
   );
 }
 

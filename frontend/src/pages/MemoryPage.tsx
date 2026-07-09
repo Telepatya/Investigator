@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, downloadMemoryVfsArchive, memoryVfsDownloadUrl } from "../lib/api";
-import { EmptyState, Spinner, SeverityBadge, CodeBlock } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
 import {
   Archive,
   ArrowUp,
@@ -46,7 +46,12 @@ export default function MemoryPage() {
   );
 
   return (
-    <div className="space-y-4">
+    <PageShell>
+      <PageTitle
+        icon={<HardDrive size={22} />}
+        title="Memory"
+        subtitle="MemProcFS findings, retained dump browsing, modules, handles, and extraction."
+      />
       <div className="glass rounded-xl p-1 flex items-center gap-1 w-fit">
         <button
           className={`btn ${tab === "findings" ? "bg-accent-cyan/15 text-accent-cyan" : "text-ink-300 hover:bg-white/5"}`}
@@ -101,7 +106,7 @@ export default function MemoryPage() {
           )}
         </>
       )}
-    </div>
+    </PageShell>
   );
 }
 
