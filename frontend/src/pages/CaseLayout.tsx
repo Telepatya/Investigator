@@ -44,7 +44,11 @@ export default function CaseLayout() {
     enabled: !!caseId,
   });
 
-  const clean = (c?.finding_count ?? 0) === 0;
+  // Reflect only findings that still need review: suppressed (disabled-rule or
+  // marked-benign) findings should not keep the banner in an alerting state.
+  const activeFindings = c?.active_finding_count ?? 0;
+  const clean = activeFindings === 0;
+  const suppressedCount = (c?.finding_count ?? 0) - activeFindings;
 
   return (
     <div className="page-enter space-y-5">
@@ -78,7 +82,13 @@ export default function CaseLayout() {
                   {clean ? "Environment appears clean" : "Findings need review"}
                 </div>
                 <div className="mt-1 text-sm text-ink-300">
-                  {clean ? "No ongoing threat detected" : `${c?.finding_count ?? 0} finding${c?.finding_count === 1 ? "" : "s"} detected`}
+                  {clean
+                    ? suppressedCount > 0
+                      ? `No active findings · ${suppressedCount} suppressed`
+                      : "No ongoing threat detected"
+                    : `${activeFindings} active finding${activeFindings === 1 ? "" : "s"}${
+                        suppressedCount > 0 ? ` · ${suppressedCount} suppressed` : ""
+                      }`}
                 </div>
                 <div className="mt-3 flex items-center gap-2 text-xs text-ink-300">
                   <span className={clsx("h-1.5 w-1.5 rounded-full", clean ? "bg-emerald-500" : "bg-sev-high")} />

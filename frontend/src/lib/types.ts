@@ -11,6 +11,7 @@ export interface Case {
   updated_at: string;
   event_count: number;
   finding_count: number;
+  active_finding_count: number;
   process_count: number;
   has_memory_dump: boolean;
   ai_summary: string | null;

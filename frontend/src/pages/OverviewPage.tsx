@@ -56,7 +56,7 @@ export default function OverviewPage() {
         />
         <MetricCard
           label="Findings"
-          value={c?.finding_count ?? 0}
+          value={c?.active_finding_count ?? findings.length}
           icon={<FileText size={23} />}
           accent="#a855f7"
           trend={findings.length ? `${counts.high ?? 0} high priority` : "none active"}

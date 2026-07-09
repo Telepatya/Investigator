@@ -416,25 +416,65 @@ function layoutGraph(
   const layers: Record<number, EntityNode[]> = {};
   for (const n of nodes) (layers[layerFor[n.type] ?? 2] ??= []).push(n);
 
-  const COL_W = 330;
-  const ROW_H = 112;
+  const COL_W = 340;
+  const ROW_H = 118;
+
+  // Columns are the semantic lanes (external -> identity -> process -> system),
+  // ordered left to right. Empty lanes are skipped so there are no blank gaps.
+  const colKeys = Object.keys(layers).map(Number).sort((a, b) => a - b);
+
+  // Undirected adjacency restricted to nodes actually in this (filtered) view.
+  const present = new Set(nodes.map((n) => n.id));
+  const adj = new Map<string, string[]>();
+  for (const e of edges) {
+    if (!present.has(e.source) || !present.has(e.target)) continue;
+    (adj.get(e.source) ?? adj.set(e.source, []).get(e.source)!).push(e.target);
+    (adj.get(e.target) ?? adj.set(e.target, []).get(e.target)!).push(e.source);
+  }
+
+  // Strongest signal first, so high-severity / findings-heavy hubs anchor the
+  // top of their lane and ties are broken deterministically.
+  const scoreOf = (n: EntityNode) =>
+    SEVERITY_RANK[n.severity] * 1000 + n.findings.length * 100 + n.action_count;
+  for (const key of colKeys) {
+    layers[key].sort((a, b) => scoreOf(b) - scoreOf(a) || a.label.localeCompare(b.label));
+  }
+
+  // Barycenter ordering (Sugiyama): repeatedly reorder each lane by the mean row
+  // of its connected neighbors so linked entities line up across columns and
+  // edge crossings drop sharply. A handful of alternating passes converge for
+  // graphs this size, replacing the old fixed stacking that let branches overlap.
+  const rowOf = new Map<string, number>();
+  for (const key of colKeys) layers[key].forEach((n, i) => rowOf.set(n.id, i));
+  const barycenter = (n: EntityNode) => {
+    const nb = adj.get(n.id);
+    if (!nb || nb.length === 0) return rowOf.get(n.id)!;
+    let sum = 0;
+    for (const id of nb) sum += rowOf.get(id) ?? 0;
+    return sum / nb.length;
+  };
+  for (let pass = 0; pass < 6; pass++) {
+    const sweep = pass % 2 === 0 ? colKeys : [...colKeys].reverse();
+    for (const key of sweep) {
+      const col = layers[key];
+      const bc = new Map(col.map((n) => [n.id, barycenter(n)] as const));
+      col.sort((a, b) => bc.get(a.id)! - bc.get(b.id)! || scoreOf(b) - scoreOf(a));
+      col.forEach((n, i) => rowOf.set(n.id, i));
+    }
+  }
+
+  // Center each lane vertically around a shared axis so branches stay balanced.
+  const tallest = Math.max(1, ...colKeys.map((k) => layers[k].length));
   const flowNodes: Node[] = [];
-  const tallest = Math.max(1, ...Object.values(layers).map((layer) => layer.length));
-  for (const [layerKey, group] of Object.entries(layers).sort(([a], [b]) => Number(a) - Number(b))) {
-    if (!group?.length) continue;
-    const colIdx = Number(layerKey);
-    const sorted = [...group].sort((a, b) => {
-      const aScore = SEVERITY_RANK[a.severity] * 1000 + a.findings.length * 100 + a.action_count;
-      const bScore = SEVERITY_RANK[b.severity] * 1000 + b.findings.length * 100 + b.action_count;
-      return bScore - aScore || a.label.localeCompare(b.label);
-    });
-    const offset = Math.max(0, (tallest - sorted.length) * ROW_H * 0.28);
-    sorted.forEach((n, i) => {
+  colKeys.forEach((key, colIdx) => {
+    const col = layers[key];
+    const offset = ((tallest - col.length) * ROW_H) / 2;
+    col.forEach((n, i) => {
       const color = SEVERITY_COLORS[n.severity];
       flowNodes.push({
         id: n.id,
         type: "entity",
-        position: { x: colIdx * COL_W, y: offset + i * ROW_H + (colIdx % 2 ? 28 : 0) },
+        position: { x: colIdx * COL_W, y: offset + i * ROW_H },
         data: {
           type: n.type,
           label: n.label,
@@ -450,7 +490,7 @@ function layoutGraph(
         },
       });
     });
-  }
+  });
 
   const flowEdges: Edge[] = edges.map((e, i) => {
     const active = e.severity !== "info";

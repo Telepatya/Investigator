@@ -250,21 +250,35 @@ def cleanup_stale_case_artifacts() -> list[dict[str, str]]:
 
 def get_case_stats(case_id: str) -> dict:
     if not case_db_path(case_id).exists():
-        return {"event_count": 0, "finding_count": 0, "process_count": 0}
+        return {
+            "event_count": 0,
+            "finding_count": 0,
+            "active_finding_count": 0,
+            "process_count": 0,
+        }
     session = get_session(case_id)
     try:
-        # One round trip instead of three: list_cases polls this per case every
+        # One round trip instead of several: list_cases polls this per case every
         # few seconds, so collapsing the counts matters at N cases.
-        event_count, finding_count, process_count = session.execute(
+        #
+        # active_finding_count excludes suppressed findings. A suppressed finding
+        # (disabled rule or marked-benign) keeps its row but has its original
+        # severity stashed in evidence['suppressed_from'] by apply_overrides, which
+        # runs on every detection pass and on every suppression toggle -- so the
+        # presence of that key is an up-to-date marker we can count in SQL.
+        event_count, finding_count, active_finding_count, process_count = session.execute(
             text(
                 "SELECT (SELECT COUNT(*) FROM events), "
                 "(SELECT COUNT(*) FROM findings), "
+                "(SELECT COUNT(*) FROM findings "
+                "  WHERE json_extract(evidence, '$.suppressed_from') IS NULL), "
                 "(SELECT COUNT(*) FROM processes)"
             )
         ).one()
         return {
             "event_count": event_count,
             "finding_count": finding_count,
+            "active_finding_count": active_finding_count,
             "process_count": process_count,
         }
     finally:

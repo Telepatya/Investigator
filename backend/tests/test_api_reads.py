@@ -45,6 +45,7 @@ from sqlalchemy import func, select
 from app.store import cases
 from app.store import database
 from app.store.database import Event, Finding, Process
+from app.detect import overrides
 
 
 class ApiReadTests(unittest.TestCase):
@@ -98,13 +99,38 @@ class ApiReadTests(unittest.TestCase):
             pr = s.scalar(select(func.count()).select_from(Process))
         finally:
             s.close()
-        self.assertEqual(stats, {"event_count": ev, "finding_count": fi, "process_count": pr})
+        self.assertEqual(
+            stats,
+            {"event_count": ev, "finding_count": fi, "active_finding_count": fi, "process_count": pr},
+        )
         self.assertEqual((ev, fi, pr), (60, 5, 7))
+
+    def test_active_finding_count_excludes_suppressed(self) -> None:
+        case = cases.create_case("suppressed-stats")
+        self._seed(case["id"])
+        # Mark two of the five findings benign; apply_overrides stashes the
+        # original severity in evidence['suppressed_from'], which the stats query
+        # uses to exclude them from the active count.
+        s = cases.get_session(case["id"])
+        try:
+            targets = list(s.scalars(select(Finding)))[:2]
+            for f in targets:
+                overrides.set_finding_benign(
+                    s, overrides.finding_key(f.title, f.evidence), True
+                )
+            overrides.apply_overrides(s)
+            s.commit()
+        finally:
+            s.close()
+
+        stats = cases.get_case_stats(case["id"])
+        self.assertEqual(stats["finding_count"], 5)
+        self.assertEqual(stats["active_finding_count"], 3)
 
     def test_get_case_stats_missing_db(self) -> None:
         self.assertEqual(
             cases.get_case_stats("nonexistent"),
-            {"event_count": 0, "finding_count": 0, "process_count": 0},
+            {"event_count": 0, "finding_count": 0, "active_finding_count": 0, "process_count": 0},
         )
 
     def test_search_events_order_and_objects(self) -> None:

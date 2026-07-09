@@ -188,7 +188,7 @@ function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
       </div>
       <div className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-white/5">
         <Stat icon={<Activity size={14} />} label="events" value={c.event_count} />
-        <Stat icon={<AlertTriangle size={14} />} label="findings" value={c.finding_count} />
+        <Stat icon={<AlertTriangle size={14} />} label="findings" value={c.active_finding_count ?? c.finding_count} />
         <Stat icon={<Cpu size={14} />} label="procs" value={c.process_count} />
       </div>
       <div className="text-[11px] text-ink-500 mt-3">Updated {fmtRelative(c.updated_at)}</div>
