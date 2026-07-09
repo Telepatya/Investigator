@@ -86,6 +86,26 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ rule_id: ruleId, disabled }),
     }),
+  createManualFinding: (
+    id: string,
+    payload: {
+      title: string;
+      severity: string;
+      description?: string;
+      mitre_techniques?: string[];
+      ref_type: "event" | "entity";
+      ref_id: string;
+      ref_label: string;
+    },
+  ) =>
+    req<{ ok: boolean; manual_id: string }>(`/cases/${id}/findings/manual`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteManualFinding: (id: string, manualId: string) =>
+    req<{ ok: boolean; removed: boolean }>(`/cases/${id}/findings/manual/${manualId}`, {
+      method: "DELETE",
+    }),
   getAttackMatrix: (id: string) =>
     req<{ techniques: AttackTechnique[] }>(`/cases/${id}/attack-matrix`),
   getProcessSessions: (id: string) =>

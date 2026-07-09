@@ -339,6 +339,7 @@ async def get_findings(case_id: str) -> dict:
         for f in findings:
             rid = overrides.rule_id_for(f.title, f.source)
             reason = overrides.is_suppressed(f.title, f.source, f.evidence, disabled, benign)
+            ev = f.evidence or {}
             out.append({
                 "id": f.id, "title": f.title, "description": f.description,
                 "severity": f.severity, "mitre_techniques": f.mitre_techniques,
@@ -349,6 +350,8 @@ async def get_findings(case_id: str) -> dict:
                 "suppressed_reason": reason,
                 "benign": overrides.finding_key(f.title, f.evidence) in benign,
                 "rule_disabled": rid in disabled,
+                "manual": bool(f.source == "manual" or ev.get("manual")),
+                "manual_id": ev.get("manual_id"),
             })
         return {"findings": out, "disabled_rules": sorted(disabled)}
     finally:
@@ -385,6 +388,53 @@ async def set_rule_disabled(case_id: str, body: dict) -> dict:
         overrides.apply_overrides(session)
         session.commit()
         return {"ok": True, "rule_id": rule_id, "disabled": disabled, "disabled_rules": sorted(rules)}
+    finally:
+        session.close()
+
+
+@router.post("/{case_id}/findings/manual")
+async def add_manual_finding(case_id: str, body: dict) -> dict:
+    """Analyst-created finding for an event or entity, tagged manual and
+    persisted so it survives detection rebuilds."""
+    from app.detect import manual
+    title = str(body.get("title") or "").strip()
+    severity = str(body.get("severity") or "").strip().lower()
+    if not title:
+        raise HTTPException(400, "title required")
+    if severity not in manual.SEVERITIES:
+        raise HTTPException(400, "invalid severity")
+    mitre = body.get("mitre_techniques")
+    session = case_store.get_session(case_id)
+    try:
+        item = manual.add_manual_finding(
+            session,
+            title=title,
+            severity=severity,
+            description=str(body.get("description") or ""),
+            mitre_techniques=mitre if isinstance(mitre, list) else [],
+            ref_type=str(body.get("ref_type") or ""),
+            ref_id=str(body.get("ref_id") or ""),
+            ref_label=str(body.get("ref_label") or ""),
+        )
+        manual.apply_manual_findings(session)
+        overrides.apply_overrides(session)
+        session.commit()
+        return {"ok": True, "manual_id": item["id"]}
+    finally:
+        session.close()
+
+
+@router.delete("/{case_id}/findings/manual/{manual_id}")
+async def delete_manual_finding(case_id: str, manual_id: str) -> dict:
+    """Remove an analyst-created finding (does not touch detector findings)."""
+    from app.detect import manual
+    session = case_store.get_session(case_id)
+    try:
+        removed = manual.remove_manual_finding(session, manual_id)
+        manual.apply_manual_findings(session)
+        overrides.apply_overrides(session)
+        session.commit()
+        return {"ok": True, "removed": removed}
     finally:
         session.close()
 

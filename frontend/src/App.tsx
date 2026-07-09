@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Clock, Folder, Moon, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
 import { clsx } from "clsx";
 import { CodeBlock, DetailDrawer, IconButton, SeverityBadge } from "./components/common";
+import { FlagAsFinding } from "./components/FlagAsFinding";
 import { useTheme } from "./lib/theme";
 import { api } from "./lib/api";
 import { fmtTime } from "./lib/ui";
@@ -205,6 +206,18 @@ export default function App() {
               <div className="label">Raw</div>
               <CodeBlock>{JSON.stringify(selectedEvent.raw, null, 2)}</CodeBlock>
             </div>
+            {caseId && (
+              <div className="border-t border-[rgb(var(--border)/0.5)] pt-3">
+                <FlagAsFinding
+                  caseId={caseId}
+                  refType="event"
+                  refId={String(selectedEvent.id)}
+                  refLabel={selectedEvent.summary}
+                  defaultTitle={`Analyst-flagged event: ${selectedEvent.summary.slice(0, 140)}`}
+                  defaultSeverity={selectedEvent.severity === "info" ? "medium" : selectedEvent.severity}
+                />
+              </div>
+            )}
           </div>
         </DetailDrawer>
       )}

@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { api, memoryModuleDownloadUrl, memoryProcessDownloadUrl, wsUrl } from "../lib/api";
 import { DetailDrawer, SeverityBadge, Spinner, CodeBlock } from "./common";
+import { FlagAsFinding } from "./FlagAsFinding";
 import { fmtTime, SEVERITY_COLORS } from "../lib/ui";
 import type { EntityDossier, MemoryModule, MemoryProcessCandidate, MemoryProcessHandle, Severity } from "../lib/types";
 
@@ -83,6 +84,18 @@ export function EntityDossierPanel({
             <Crosshair size={14} />
             {focused ? "Focused on map" : "Focus on map"}
           </button>
+        )}
+        {data && (
+          <div className="mt-3">
+            <FlagAsFinding
+              caseId={caseId}
+              refType="entity"
+              refId={entityId}
+              refLabel={data.entity.value}
+              defaultTitle={`Analyst-flagged ${data.entity.type}: ${data.entity.value}`}
+              defaultSeverity={data.entity.severity === "info" ? "medium" : data.entity.severity}
+            />
+          </div>
         )}
         <div className="flex items-center gap-1 mt-4 flex-wrap">
           {tabs.map((t) => (

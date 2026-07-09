@@ -3,6 +3,7 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { DetailDrawer, EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
+import { FlagAsFinding } from "../components/FlagAsFinding";
 import { fmtTime } from "../lib/ui";
 import { List, Search } from "lucide-react";
 import type { EventRow, Severity } from "../lib/types";
@@ -148,6 +149,18 @@ export default function EventsPage() {
               <div className="label">Raw</div>
               <CodeBlock>{JSON.stringify(selected.raw, null, 2)}</CodeBlock>
             </div>
+            {caseId && (
+              <div className="border-t border-[rgb(var(--border)/0.5)] pt-3">
+                <FlagAsFinding
+                  caseId={caseId}
+                  refType="event"
+                  refId={String(selected.id)}
+                  refLabel={selected.summary}
+                  defaultTitle={`Analyst-flagged event: ${selected.summary.slice(0, 140)}`}
+                  defaultSeverity={selected.severity === "info" ? "medium" : selected.severity}
+                />
+              </div>
+            )}
           </div>
         </DetailDrawer>
       )}

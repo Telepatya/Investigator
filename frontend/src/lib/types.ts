@@ -78,6 +78,8 @@ export interface Finding {
   suppressed_reason: string | null;
   benign: boolean;
   rule_disabled: boolean;
+  manual: boolean;
+  manual_id: string | null;
 }
 
 export interface FindingsResponse {

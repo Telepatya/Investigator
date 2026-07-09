@@ -26,6 +26,7 @@ from app.detect.rules import (
     WEB_ATTACK_PATTERNS,
     WEB_USER_AGENT_PATTERNS,
 )
+from app.detect.manual import apply_manual_findings
 from app.detect.overrides import (
     apply_overrides,
     get_benign_keys,
@@ -3487,6 +3488,9 @@ def run_detections_sync(case_id: str) -> int:
         # independent rule corroborates it on the same/related entity.
         _corroborate_findings(session, processes, disabled_rules, benign_keys)
         mark_phase("corroboration")
+        # Re-materialise analyst-created findings, wiped with the rest of the table
+        # on a rebuild, before overrides so a benign mark on one still applies.
+        apply_manual_findings(session)
         # User overrides last: disabled-rule and benign findings are forced to info
         # regardless of anything above (and survive this rebuild via case_meta).
         apply_overrides(session)

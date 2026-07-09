@@ -6,6 +6,7 @@ import { DataSet } from "vis-data";
 import "vis-timeline/styles/vis-timeline-graph2d.css";
 import { api } from "../lib/api";
 import { DetailDrawer, EmptyState, PageShell, PageTitle, SeverityBadge, CodeBlock, Spinner } from "../components/common";
+import { FlagAsFinding } from "../components/FlagAsFinding";
 import { SEVERITY_COLORS, fmtTime } from "../lib/ui";
 import type { Severity, TimelineEvt } from "../lib/types";
 import { CalendarDays, Clock, Filter, Search, SlidersHorizontal, X, ZoomIn, ZoomOut } from "lucide-react";
@@ -410,6 +411,18 @@ export default function TimelinePage() {
               <div className="label">Raw evidence</div>
               <CodeBlock>{JSON.stringify(selected.raw, null, 2)}</CodeBlock>
             </div>
+            {caseId && (
+              <div className="border-t border-[rgb(var(--border)/0.5)] pt-3">
+                <FlagAsFinding
+                  caseId={caseId}
+                  refType="event"
+                  refId={String(selected.id)}
+                  refLabel={selected.content}
+                  defaultTitle={`Analyst-flagged event: ${selected.content.slice(0, 140)}`}
+                  defaultSeverity={selected.severity === "info" ? "medium" : selected.severity}
+                />
+              </div>
+            )}
           </div>
         </DetailDrawer>
       )}

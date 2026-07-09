@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+# ruff: noqa: E402
+
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+class _BaseModel:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+sys.modules.setdefault("keyring", types.SimpleNamespace(
+    get_password=lambda *_a, **_k: None,
+    set_password=lambda *_a, **_k: None,
+    delete_password=lambda *_a, **_k: None,
+    errors=types.SimpleNamespace(PasswordDeleteError=Exception),
+))
+sys.modules.setdefault("pydantic", types.SimpleNamespace(
+    BaseModel=_BaseModel,
+    Field=lambda default=None, default_factory=None, **_k: default_factory() if default_factory else default,
+))
+
+from sqlalchemy import delete as sqldelete, func, select
+from app.store import cases
+from app.store import database
+from app.store.database import Finding
+from app.detect import manual, overrides
+
+
+class ManualFindingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.patches = [
+            patch.object(cases, "get_cases_dir", return_value=self.root),
+            patch.object(cases, "case_db_path", side_effect=lambda cid: self.root / cid / "case.db"),
+        ]
+        for p in self.patches:
+            p.start()
+        self.case = cases.create_case("manual")["id"]
+
+    def tearDown(self) -> None:
+        database.dispose_all_db_engines()
+        for p in reversed(self.patches):
+            p.stop()
+        self.tmp.cleanup()
+
+    def _add(self, **kw):
+        s = cases.get_session(self.case)
+        try:
+            item = manual.add_manual_finding(s, **kw)
+            manual.apply_manual_findings(s)
+            overrides.apply_overrides(s)
+            s.commit()
+            return item
+        finally:
+            s.close()
+
+    def test_add_materialises_tagged_finding_and_counts_active(self) -> None:
+        self._add(title="Suspicious explorer.exe", severity="high",
+                  ref_type="entity", ref_id="e1", ref_label="explorer.exe")
+        s = cases.get_session(self.case)
+        try:
+            rows = list(s.scalars(select(Finding)))
+        finally:
+            s.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].source, "manual")
+        self.assertEqual(rows[0].severity, "high")
+        self.assertTrue(rows[0].evidence.get("manual"))
+        stats = cases.get_case_stats(self.case)
+        self.assertEqual(stats["finding_count"], 1)
+        self.assertEqual(stats["active_finding_count"], 1)
+
+    def test_survives_findings_table_wipe(self) -> None:
+        item = self._add(title="Manual net beacon", severity="medium",
+                         ref_type="event", ref_id="42", ref_label="10.0.0.5")
+        # Simulate a detections rebuild wiping the findings table, then the
+        # re-materialisation step the engine runs at the end of every pass.
+        s = cases.get_session(self.case)
+        try:
+            s.execute(sqldelete(Finding))
+            s.commit()
+            self.assertEqual(s.scalar(select(func.count()).select_from(Finding)), 0)
+            manual.apply_manual_findings(s)
+            s.commit()
+            rows = list(s.scalars(select(Finding)))
+        finally:
+            s.close()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].evidence.get("manual_id"), item["id"])
+
+    def test_remove_deletes_it(self) -> None:
+        item = self._add(title="Temp flag", severity="low",
+                         ref_type="entity", ref_id="e9", ref_label="x")
+        s = cases.get_session(self.case)
+        try:
+            self.assertTrue(manual.remove_manual_finding(s, item["id"]))
+            manual.apply_manual_findings(s)
+            s.commit()
+            self.assertEqual(s.scalar(select(func.count()).select_from(Finding)), 0)
+        finally:
+            s.close()
+
+    def test_benign_mark_survives_rematerialisation(self) -> None:
+        item = self._add(title="Manual host flag", severity="high",
+                         ref_type="entity", ref_id="h1", ref_label="WORKSTATION-07")
+        s = cases.get_session(self.case)
+        try:
+            row = s.scalars(select(Finding)).one()
+            overrides.set_finding_benign(
+                s, overrides.finding_key(row.title, row.evidence), True
+            )
+            # Re-materialise (new row) then re-apply overrides: the benign mark,
+            # keyed off title + evidence summary, must still catch it.
+            manual.apply_manual_findings(s)
+            overrides.apply_overrides(s)
+            s.commit()
+            row = s.scalars(select(Finding)).one()
+            self.assertEqual(row.severity, "info")
+            self.assertEqual(row.evidence.get("suppressed_from"), "high")
+        finally:
+            s.close()
+        self.assertEqual(cases.get_case_stats(self.case)["active_finding_count"], 0)
+        self.assertEqual(item["severity"], "high")
+
+
+if __name__ == "__main__":
+    unittest.main()
