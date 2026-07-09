@@ -1,5 +1,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { clsx } from "clsx";
+import { X } from "lucide-react";
 import type { Severity } from "../lib/types";
 import { severityChip } from "../lib/ui";
 
@@ -234,6 +236,45 @@ export function Drawer({
       {children}
     </div>
   );
+}
+
+export function DetailDrawer({
+  eyebrow,
+  title,
+  children,
+  onClose,
+  ariaLabel,
+}: {
+  eyebrow: ReactNode;
+  title?: ReactNode;
+  children: ReactNode;
+  onClose: () => void;
+  ariaLabel?: string;
+}) {
+  const drawer = (
+    <div
+      className="detail-drawer-surface fixed inset-y-0 right-0 z-[1000] w-full max-w-md overflow-y-auto p-5"
+      role="dialog"
+      aria-label={ariaLabel ?? "Detail drawer"}
+    >
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-xs font-semibold uppercase tracking-wider text-ink-400">{eyebrow}</div>
+          {title && <div className="mt-1 truncate text-lg font-semibold text-ink-50">{title}</div>}
+        </div>
+        <button
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[rgb(var(--panel-strong)/0.78)] text-ink-400 transition hover:bg-[rgb(var(--panel-strong)/0.96)] hover:text-ink-100"
+          onClick={onClose}
+          title="Close"
+        >
+          <X size={18} />
+        </button>
+      </div>
+      {children}
+    </div>
+  );
+
+  return createPortal(drawer, document.body);
 }
 
 export function CodeBlock({ children }: { children: ReactNode }) {

@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
+import { DetailDrawer, EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
 import { fmtTime } from "../lib/ui";
-import { List, Search, X } from "lucide-react";
+import { List, Search } from "lucide-react";
 import type { EventRow, Severity } from "../lib/types";
 
 export default function EventsPage() {
@@ -124,13 +124,7 @@ export default function EventsPage() {
       )}
 
       {selected && (
-        <div className="fixed inset-y-0 right-0 z-50 w-full max-w-md glass border-l border-white/10 p-5 overflow-y-auto shadow-2xl">
-          <div className="flex items-start justify-between mb-4">
-            <div className="text-xs uppercase tracking-wider text-ink-400">Event detail</div>
-            <button className="text-ink-400 hover:text-ink-100" onClick={() => setSelected(null)}>
-              <X size={18} />
-            </button>
-          </div>
+        <DetailDrawer eyebrow="Event detail" title={selected.category} onClose={() => setSelected(null)} ariaLabel="Event detail">
           <div className="space-y-3 text-sm">
             <div className="flex items-center gap-2">
               <SeverityBadge severity={selected.severity} />
@@ -155,7 +149,7 @@ export default function EventsPage() {
               <CodeBlock>{JSON.stringify(selected.raw, null, 2)}</CodeBlock>
             </div>
           </div>
-        </div>
+        </DetailDrawer>
       )}
     </PageShell>
   );

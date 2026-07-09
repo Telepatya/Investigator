@@ -3,7 +3,7 @@ import { Link, Outlet, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, Clock, Folder, Moon, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
 import { clsx } from "clsx";
-import { CodeBlock, IconButton, SeverityBadge } from "./components/common";
+import { CodeBlock, DetailDrawer, IconButton, SeverityBadge } from "./components/common";
 import { useTheme } from "./lib/theme";
 import { api } from "./lib/api";
 import { fmtTime } from "./lib/ui";
@@ -178,16 +178,12 @@ export default function App() {
       </div>
 
       {selectedEvent && (
-        <div className="fixed inset-y-0 right-0 z-[60] w-full max-w-md overflow-y-auto border-l border-[rgb(var(--border)/0.72)] glass p-5 shadow-2xl">
-          <div className="mb-4 flex items-start justify-between gap-3">
-            <div>
-              <div className="text-xs font-semibold uppercase tracking-wider text-ink-400">Event detail</div>
-              <div className="mt-1 text-lg font-semibold text-ink-50">{selectedEvent.category}</div>
-            </div>
-            <button className="text-ink-400 transition hover:text-ink-100" onClick={() => setSelectedEvent(null)}>
-              <X size={18} />
-            </button>
-          </div>
+        <DetailDrawer
+          eyebrow="Event detail"
+          title={selectedEvent.category}
+          onClose={() => setSelectedEvent(null)}
+          ariaLabel="Event detail"
+        >
           <div className="space-y-3 text-sm">
             <div className="flex items-center gap-2">
               <SeverityBadge severity={selectedEvent.severity} />
@@ -211,7 +207,7 @@ export default function App() {
               <CodeBlock>{JSON.stringify(selectedEvent.raw, null, 2)}</CodeBlock>
             </div>
           </div>
-        </div>
+        </DetailDrawer>
       )}
 
       <div

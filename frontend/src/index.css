@@ -134,8 +134,16 @@ textarea {
   .glass {
     background: linear-gradient(145deg, rgb(var(--panel) / 0.78), rgb(var(--panel-muted) / 0.58));
     border: 1px solid rgb(var(--border) / 0.7);
+    -webkit-backdrop-filter: blur(26px) saturate(1.15);
     backdrop-filter: blur(26px) saturate(1.15);
     box-shadow: 0 24px 70px -42px rgb(var(--shadow) / 0.55), inset 0 1px 0 rgb(255 255 255 / 0.46);
+  }
+  .detail-drawer-surface {
+    background: linear-gradient(145deg, rgb(var(--panel) / 0.985), rgb(var(--panel-muted) / 0.965));
+    border: 1px solid rgb(var(--border) / 0.78);
+    -webkit-backdrop-filter: blur(30px) saturate(1.18);
+    backdrop-filter: blur(30px) saturate(1.18);
+    box-shadow: 0 24px 70px -42px rgb(var(--shadow) / 0.65), inset 0 1px 0 rgb(255 255 255 / 0.5);
   }
   .card {
     @apply glass rounded-2xl;

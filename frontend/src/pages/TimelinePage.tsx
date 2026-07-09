@@ -5,7 +5,7 @@ import { Timeline } from "vis-timeline/standalone";
 import { DataSet } from "vis-data";
 import "vis-timeline/styles/vis-timeline-graph2d.css";
 import { api } from "../lib/api";
-import { EmptyState, PageShell, SeverityBadge, CodeBlock, Spinner } from "../components/common";
+import { DetailDrawer, EmptyState, PageShell, SeverityBadge, CodeBlock, Spinner } from "../components/common";
 import { SEVERITY_COLORS, fmtTime } from "../lib/ui";
 import type { Severity, TimelineEvt } from "../lib/types";
 import { CalendarDays, Clock, Filter, Search, SlidersHorizontal, X, ZoomIn, ZoomOut } from "lucide-react";
@@ -356,16 +356,7 @@ export default function TimelinePage() {
       </section>
 
       {selected && (
-        <div className="fixed inset-y-0 right-0 z-50 w-full max-w-md glass border-l border-white/10 p-5 overflow-y-auto shadow-2xl">
-          <div className="flex items-start justify-between mb-4">
-            <div>
-              <div className="text-xs uppercase tracking-wider text-ink-400">Event detail</div>
-              <div className="text-lg font-semibold text-ink-50 mt-1">{selected.group}</div>
-            </div>
-            <button className="text-ink-400 hover:text-ink-100" onClick={() => setSelected(null)}>
-              <X size={18} />
-            </button>
-          </div>
+        <DetailDrawer eyebrow="Event detail" title={selected.group} onClose={() => setSelected(null)} ariaLabel="Event detail">
           <div className="space-y-3 text-sm">
             <div className="flex items-center gap-2">
               <SeverityBadge severity={selected.severity} />
@@ -393,7 +384,7 @@ export default function TimelinePage() {
               <CodeBlock>{JSON.stringify(selected.raw, null, 2)}</CodeBlock>
             </div>
           </div>
-        </div>
+        </DetailDrawer>
       )}
     </PageShell>
   );

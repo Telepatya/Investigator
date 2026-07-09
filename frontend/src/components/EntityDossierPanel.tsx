@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  X,
   Sparkles,
   ArrowRight,
   ArrowLeft,
@@ -14,7 +13,7 @@ import {
   Crosshair,
 } from "lucide-react";
 import { api, memoryModuleDownloadUrl, memoryProcessDownloadUrl, wsUrl } from "../lib/api";
-import { SeverityBadge, Spinner, CodeBlock } from "./common";
+import { DetailDrawer, SeverityBadge, Spinner, CodeBlock } from "./common";
 import { fmtTime, SEVERITY_COLORS } from "../lib/ui";
 import type { EntityDossier, MemoryModule, MemoryProcessCandidate, MemoryProcessHandle, Severity } from "../lib/types";
 
@@ -48,12 +47,13 @@ export function EntityDossierPanel({
   }, [entityId, tab, hasMemoryProcesses]);
 
   return (
-    <div
-      className="fixed inset-y-0 right-0 z-[60] w-full max-w-md overflow-y-auto border-l border-[rgb(var(--border)/0.72)] glass p-5 shadow-2xl"
-      role="dialog"
-      aria-label="Entity investigation details"
+    <DetailDrawer
+      eyebrow={`${data?.entity.type ?? "entity"} investigation`}
+      title={data?.entity.value ?? "..."}
+      onClose={onClose}
+      ariaLabel="Entity investigation details"
     >
-      <div className="mb-4 flex items-start justify-between gap-3">
+      <div className="hidden">
           <div className="min-w-0">
             <div className="text-xs font-semibold uppercase tracking-wider text-ink-400">
               {data?.entity.type ?? "entity"} investigation
@@ -62,14 +62,6 @@ export function EntityDossierPanel({
               {data?.entity.value ?? "…"}
             </div>
           </div>
-          <button
-            type="button"
-            className="text-ink-400 transition hover:text-ink-100"
-            onClick={onClose}
-            title="Close entity details"
-          >
-            <X size={18} />
-          </button>
         </div>
         {data && (
           <div className="flex items-center gap-2 mt-3 flex-wrap">
@@ -139,7 +131,7 @@ export function EntityDossierPanel({
           <AiInvestigate caseId={caseId} entityId={entityId} />
         )}
       </div>
-    </div>
+    </DetailDrawer>
   );
 }
 
