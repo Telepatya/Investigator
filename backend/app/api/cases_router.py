@@ -415,6 +415,7 @@ async def add_manual_finding(case_id: str, body: dict) -> dict:
             ref_type=str(body.get("ref_type") or ""),
             ref_id=str(body.get("ref_id") or ""),
             ref_label=str(body.get("ref_label") or ""),
+            ref_entity=str(body.get("ref_entity") or ""),
         )
         manual.apply_manual_findings(session)
         overrides.apply_overrides(session)

@@ -109,6 +109,26 @@ class ManualFindingTests(unittest.TestCase):
         finally:
             s.close()
 
+    def test_manual_finding_colours_matching_entity_node(self) -> None:
+        from app.detect.entity_graph import build_entity_graph
+        from app.store.database import Process
+        s = cases.get_session(self.case)
+        try:
+            s.add(Process(pid=666, ppid=None, name="evil.exe", session_id="live", severity="info"))
+            s.commit()
+        finally:
+            s.close()
+        self._add(title="Manual critical on evil.exe", severity="critical",
+                  ref_type="entity", ref_id="process:evil.exe", ref_label="evil.exe",
+                  ref_entity="evil.exe")
+        graph = build_entity_graph(self.case, min_severity="info", max_nodes=500)
+        procs = [n for n in graph["nodes"] if n["type"] == "process" and n["value"] == "evil.exe"]
+        self.assertEqual(len(procs), 1)
+        self.assertEqual(procs[0]["severity"], "critical")
+        self.assertTrue(
+            any(f.get("title", "").startswith("Manual critical") for f in procs[0]["findings"])
+        )
+
     def test_benign_mark_survives_rematerialisation(self) -> None:
         item = self._add(title="Manual host flag", severity="high",
                          ref_type="entity", ref_id="h1", ref_label="WORKSTATION-07")

@@ -57,6 +57,7 @@ def add_manual_finding(
     ref_type: str = "",
     ref_id: str = "",
     ref_label: str = "",
+    ref_entity: str = "",
 ) -> dict:
     title = (title or "").strip()
     if not title:
@@ -72,6 +73,10 @@ def add_manual_finding(
         "ref_type": ref_type,
         "ref_id": str(ref_id),
         "ref_label": (ref_label or "")[:200],
+        # Entity value this finding should colour on the map. For an entity flag
+        # that is the entity itself; for an event flag it is the event's entity
+        # (if any). Empty means the finding stays list-only.
+        "ref_entity": (ref_entity or (ref_label if ref_type == "entity" else "") or "")[:200],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     items = _load(session)
@@ -99,6 +104,22 @@ def apply_manual_findings(session) -> int:
     for it in items:
         label = it.get("ref_label") or it["title"]
         ref_type = it.get("ref_type") or "item"
+        evidence = {
+            "manual": True,
+            "manual_id": it["id"],
+            "ref_type": it.get("ref_type"),
+            "ref_id": it.get("ref_id"),
+            "ref_label": it.get("ref_label"),
+            # Kept stable so overrides.finding_key() (and thus a benign mark)
+            # survives re-materialisation across rebuilds.
+            "summary": label,
+            "created_at": it.get("created_at"),
+        }
+        # An "entity" token lets _attach_findings() colour the matching map node
+        # with this finding's severity, so a manual critical flag lights up the
+        # entity graph the same way a detector finding does.
+        if it.get("ref_entity"):
+            evidence["entity"] = it["ref_entity"]
         session.add(
             Finding(
                 title=it["title"],
@@ -106,17 +127,7 @@ def apply_manual_findings(session) -> int:
                 severity=it["severity"],
                 mitre_techniques=list(it.get("mitre_techniques") or []),
                 source="manual",
-                evidence={
-                    "manual": True,
-                    "manual_id": it["id"],
-                    "ref_type": it.get("ref_type"),
-                    "ref_id": it.get("ref_id"),
-                    "ref_label": it.get("ref_label"),
-                    # Kept stable so overrides.finding_key() (and thus a benign
-                    # mark) survives re-materialisation across rebuilds.
-                    "summary": label,
-                    "created_at": it.get("created_at"),
-                },
+                evidence=evidence,
             )
         )
     session.flush()

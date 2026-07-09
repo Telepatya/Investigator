@@ -20,6 +20,7 @@ export function FlagAsFinding({
   refLabel,
   defaultTitle,
   defaultSeverity = "medium",
+  entityHint,
 }: {
   caseId: string;
   refType: "event" | "entity";
@@ -27,6 +28,9 @@ export function FlagAsFinding({
   refLabel: string;
   defaultTitle: string;
   defaultSeverity?: Severity;
+  // Entity value this finding should colour on the map (an event's entity).
+  // For entity flags the backend derives it from the entity itself.
+  entityHint?: string;
 }) {
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
@@ -42,6 +46,7 @@ export function FlagAsFinding({
         ref_type: refType,
         ref_id: refId,
         ref_label: refLabel,
+        ...(entityHint ? { ref_entity: entityHint } : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["findings", caseId] });

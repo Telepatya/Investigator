@@ -96,6 +96,7 @@ export const api = {
       ref_type: "event" | "entity";
       ref_id: string;
       ref_label: string;
+      ref_entity?: string;
     },
   ) =>
     req<{ ok: boolean; manual_id: string }>(`/cases/${id}/findings/manual`, {

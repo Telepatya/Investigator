@@ -156,6 +156,7 @@ export default function EventsPage() {
                   refType="event"
                   refId={String(selected.id)}
                   refLabel={selected.summary}
+                  entityHint={selected.entity ?? undefined}
                   defaultTitle={`Analyst-flagged event: ${selected.summary.slice(0, 140)}`}
                   defaultSeverity={selected.severity === "info" ? "medium" : selected.severity}
                 />

@@ -208,12 +208,17 @@ export function DetailDrawer({
   children,
   onClose,
   ariaLabel,
+  dismissOnOutsideClick = true,
 }: {
   eyebrow: ReactNode;
   title?: ReactNode;
   children: ReactNode;
   onClose: () => void;
   ariaLabel?: string;
+  // When false, the area outside the drawer stays interactive (no click-catcher)
+  // so a live canvas behind it -- e.g. the entity map, where double-click expands
+  // a focused node -- keeps working. Escape and the X still close.
+  dismissOnOutsideClick?: boolean;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -226,8 +231,11 @@ export function DetailDrawer({
   const drawer = (
     <>
       {/* Transparent click-catcher: dismiss on outside click without obscuring
-          the map/timeline behind the drawer, so context stays readable. */}
-      <div className="fixed inset-0 z-[999]" onClick={onClose} aria-hidden="true" />
+          the map/timeline behind the drawer, so context stays readable. Omitted
+          when the caller wants the content behind to stay interactive. */}
+      {dismissOnOutsideClick && (
+        <div className="fixed inset-0 z-[999]" onClick={onClose} aria-hidden="true" />
+      )}
       {/* A narrow blurred strip hugging the drawer's left edge, fading out to the
           left, gives a soft seam instead of frosting the whole screen. */}
       <div
@@ -243,7 +251,7 @@ export function DetailDrawer({
       <div
         className="detail-drawer-surface fixed inset-y-0 right-0 z-[1000] w-full max-w-md overflow-y-auto p-5"
         role="dialog"
-        aria-modal="true"
+        aria-modal={dismissOnOutsideClick}
         aria-label={ariaLabel ?? "Detail drawer"}
       >
       <div className="mb-4 flex items-start justify-between gap-3">

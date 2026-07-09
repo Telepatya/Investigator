@@ -53,6 +53,7 @@ export function EntityDossierPanel({
       title={data?.entity.value ?? "..."}
       onClose={onClose}
       ariaLabel="Entity investigation details"
+      dismissOnOutsideClick={false}
     >
       {data && (
           <div className="flex items-center gap-2 mt-3 flex-wrap">
