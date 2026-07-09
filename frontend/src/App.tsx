@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ChevronDown, Clock, Folder, Moon, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
+import { Clock, Folder, Moon, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
 import { clsx } from "clsx";
 import { CodeBlock, DetailDrawer, IconButton, SeverityBadge } from "./components/common";
 import { useTheme } from "./lib/theme";
@@ -62,14 +62,13 @@ export default function App() {
 
           <div className="hidden border-t border-[rgb(var(--border)/0.58)] pt-4 lg:block">
             <div className="flex items-center gap-3">
-              <div className="grid h-10 w-10 place-items-center rounded-full bg-emerald-500/15 text-sm font-bold text-emerald-600 ring-1 ring-emerald-500/20">
-                AR
+              <div className="grid h-10 w-10 place-items-center rounded-full bg-emerald-500/15 text-emerald-600 ring-1 ring-emerald-500/20">
+                <ShieldCheck size={18} />
               </div>
               <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-semibold text-ink-100">Alex Rivera</div>
-                <div className="truncate text-xs text-ink-300">Senior Analyst</div>
+                <div className="truncate text-sm font-semibold text-ink-100">Local session</div>
+                <div className="truncate text-xs text-ink-300">Offline analysis</div>
               </div>
-              <ChevronDown size={16} className="text-ink-400" />
             </div>
           </div>
 

@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { useEffect, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { clsx } from "clsx";
 import { X } from "lucide-react";
@@ -7,19 +7,6 @@ import { severityChip } from "../lib/ui";
 
 export function PageShell({ children, className }: { children: ReactNode; className?: string }) {
   return <div className={clsx("page-enter space-y-5", className)}>{children}</div>;
-}
-
-export function GlassPanel({
-  children,
-  className,
-  as = "div",
-}: {
-  children: ReactNode;
-  className?: string;
-  as?: "div" | "section" | "article";
-}) {
-  const Tag = as;
-  return <Tag className={clsx("card", className)}>{children}</Tag>;
 }
 
 export function PageTitle({
@@ -127,15 +114,6 @@ export function MetricCard({
   );
 }
 
-export function StatCard(props: {
-  label: string;
-  value: ReactNode;
-  accent?: string;
-  icon?: ReactNode;
-}) {
-  return <MetricCard {...props} />;
-}
-
 export function Section({
   title,
   right,
@@ -224,20 +202,6 @@ export function IconButton({
   );
 }
 
-export function Drawer({
-  children,
-  className,
-}: {
-  children: ReactNode;
-  className?: string;
-}) {
-  return (
-    <div className={clsx("fixed inset-y-0 right-0 z-50 flex w-full max-w-lg flex-col glass border-l p-0 shadow-2xl", className)}>
-      {children}
-    </div>
-  );
-}
-
 export function DetailDrawer({
   eyebrow,
   title,
@@ -251,12 +215,27 @@ export function DetailDrawer({
   onClose: () => void;
   ariaLabel?: string;
 }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const drawer = (
-    <div
-      className="detail-drawer-surface fixed inset-y-0 right-0 z-[1000] w-full max-w-md overflow-y-auto p-5"
-      role="dialog"
-      aria-label={ariaLabel ?? "Detail drawer"}
-    >
+    <>
+      <div
+        className="fixed inset-0 z-[999] bg-[rgb(var(--shadow)/0.34)] backdrop-blur-sm"
+        onClick={onClose}
+        aria-hidden="true"
+      />
+      <div
+        className="detail-drawer-surface fixed inset-y-0 right-0 z-[1000] w-full max-w-md overflow-y-auto p-5"
+        role="dialog"
+        aria-modal="true"
+        aria-label={ariaLabel ?? "Detail drawer"}
+      >
       <div className="mb-4 flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="text-xs font-semibold uppercase tracking-wider text-ink-400">{eyebrow}</div>
@@ -270,8 +249,9 @@ export function DetailDrawer({
           <X size={18} />
         </button>
       </div>
-      {children}
-    </div>
+        {children}
+      </div>
+    </>
   );
 
   return createPortal(drawer, document.body);

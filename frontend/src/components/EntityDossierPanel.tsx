@@ -53,17 +53,7 @@ export function EntityDossierPanel({
       onClose={onClose}
       ariaLabel="Entity investigation details"
     >
-      <div className="hidden">
-          <div className="min-w-0">
-            <div className="text-xs font-semibold uppercase tracking-wider text-ink-400">
-              {data?.entity.type ?? "entity"} investigation
-            </div>
-            <div className="text-lg font-semibold text-ink-50 mt-1 truncate" title={data?.entity.value}>
-              {data?.entity.value ?? "…"}
-            </div>
-          </div>
-        </div>
-        {data && (
+      {data && (
           <div className="flex items-center gap-2 mt-3 flex-wrap">
             <SeverityBadge severity={data.entity.severity} />
             <span className="chip bg-white/5 text-ink-300">

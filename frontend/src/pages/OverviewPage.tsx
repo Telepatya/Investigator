@@ -52,7 +52,7 @@ export default function OverviewPage() {
           value={(c?.event_count ?? 0).toLocaleString()}
           icon={<Activity size={23} />}
           accent="#3b82f6"
-          trend={<span className="text-emerald-500">up to date</span>}
+          trend={c ? `updated ${fmtRelative(c.updated_at)}` : "loading…"}
         />
         <MetricCard
           label="Findings"
@@ -61,7 +61,7 @@ export default function OverviewPage() {
           accent="#a855f7"
           trend={findings.length ? `${counts.high ?? 0} high priority` : "none active"}
         />
-        <MetricCard label="Hosts" value={c?.process_count ? 1 : 0} icon={<Cpu size={23} />} accent="#22c55e" trend="from process inventory" />
+        <MetricCard label="Processes" value={(c?.process_count ?? 0).toLocaleString()} icon={<Cpu size={23} />} accent="#22c55e" trend="from process inventory" />
         <MetricCard label="Evidence Sources" value={evidence.length} icon={<FolderOpen size={23} />} accent="#38bdf8" trend={`${sumEvents(evidence).toLocaleString()} parsed events`} />
         <MetricCard label="Memory Artifacts" value={c?.has_memory_dump ? "Yes" : "No"} icon={<HardDrive size={23} />} accent="#a855f7" trend={c?.has_memory_dump ? "retained for review" : "not uploaded"} />
       </div>
@@ -91,7 +91,7 @@ export default function OverviewPage() {
                 ? truncate(report.summary, 260)
                 : "Initial triage is waiting for AI analysis. Upload evidence and run analysis to generate a concise analyst summary."}
               <div className="mt-4 text-xs text-ink-400">
-                Alex Rivera - {c ? fmtTime(c.updated_at) : "not available"}
+                AI-generated summary · {c ? fmtTime(c.updated_at) : "not available"}
               </div>
             </div>
           </div>
@@ -113,8 +113,11 @@ export default function OverviewPage() {
 
 function CoverageScore({ findings }: { findings: Finding[] }) {
   const techniques = new Set(findings.flatMap((f) => f.mitre_techniques));
-  const pct = Math.min(100, Math.round((techniques.size / 18) * 100));
-  return <span className="chip text-accent-blue">{pct}% coverage</span>;
+  return (
+    <span className="chip text-accent-blue">
+      {techniques.size} technique{techniques.size === 1 ? "" : "s"}
+    </span>
+  );
 }
 
 function ActivityList({ events, evidence }: { events: TimelineEvt[]; evidence: EvidenceFile[] }) {

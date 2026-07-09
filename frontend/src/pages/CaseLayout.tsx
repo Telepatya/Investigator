@@ -2,6 +2,7 @@ import { NavLink, Outlet, useParams } from "react-router-dom";
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
+  Activity,
   AlertTriangle,
   Boxes,
   Calendar,
@@ -14,8 +15,6 @@ import {
   List,
   MessageSquare,
   ShieldCheck,
-  Star,
-  User,
 } from "lucide-react";
 import { clsx } from "clsx";
 import { api } from "../lib/api";
@@ -55,9 +54,6 @@ export default function CaseLayout() {
               <h1 className="truncate text-4xl font-extrabold tracking-tight text-ink-50 md:text-5xl">
                 {c?.name ?? "..."}
               </h1>
-              <button className="text-ink-500 transition hover:text-accent-blue" title="Favorite case">
-                <Star size={24} />
-              </button>
             </div>
             <p className="mt-3 max-w-3xl text-sm text-ink-300">
               {c?.description || "No description"}
@@ -65,7 +61,7 @@ export default function CaseLayout() {
 
             <div className="mt-6 grid gap-4 text-sm text-ink-200 sm:grid-cols-2 xl:grid-cols-4">
               <CaseField label="Case ID" value={caseId ?? "-"} />
-              <CaseField label="Owner" value="Alex Rivera" icon={<User size={15} />} />
+              <CaseField label="Status" value={c?.status ?? "-"} icon={<Activity size={15} />} />
               <CaseField label="Created" value={c ? fmtDate(c.created_at) : "-"} icon={<Calendar size={15} />} />
               <CaseField label="Last Updated" value={c ? fmtTime(c.updated_at) : "-"} icon={<Clock size={15} />} />
             </div>
