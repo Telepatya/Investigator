@@ -157,6 +157,8 @@ export interface EntityNodeMeta extends Record<string, unknown> {
   flags?: string[];
   state?: string;
   pids?: number[];
+  // True when an analyst raised this node via a manual finding.
+  manual?: boolean;
 }
 
 export interface EntityEdge {

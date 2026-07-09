@@ -97,6 +97,14 @@ function EntityNodeCard({ data }: { data: any }) {
       <div className="flex items-center gap-1.5">
         <span style={{ color: active ? color : "rgb(var(--ink-300))" }}>{TYPE_ICON[data.type as EntityType]}</span>
         <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-300">{data.type}</span>
+        {data.manual && (
+          <span
+            className="text-[9px] px-1 rounded bg-accent-cyan/20 text-accent-cyan uppercase tracking-wider"
+            title="Created from a manual finding"
+          >
+            manual
+          </span>
+        )}
         {hidden > 0 && (
           <span
             className="ml-auto text-[9px] px-1 rounded bg-accent-cyan/20 text-accent-cyan"
@@ -484,6 +492,7 @@ function layoutGraph(
           finding_count: n.findings.length,
           dead: n.meta?.dead ?? false,
           state: n.meta?.state,
+          manual: n.meta?.manual ?? false,
           focused: focus?.focusId === n.id,
           hiddenNeighbors: focus?.hiddenNeighbors?.get(n.id) ?? 0,
           color,

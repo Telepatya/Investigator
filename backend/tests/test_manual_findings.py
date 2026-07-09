@@ -119,8 +119,8 @@ class ManualFindingTests(unittest.TestCase):
         finally:
             s.close()
         self._add(title="Manual critical on evil.exe", severity="critical",
-                  ref_type="entity", ref_id="process:evil.exe", ref_label="evil.exe",
-                  ref_entity="evil.exe")
+                  ref_type="entity", ref_id="process::evil.exe", ref_label="evil.exe",
+                  node_type="process", node_value="evil.exe")
         graph = build_entity_graph(self.case, min_severity="info", max_nodes=500)
         procs = [n for n in graph["nodes"] if n["type"] == "process" and n["value"] == "evil.exe"]
         self.assertEqual(len(procs), 1)
@@ -128,6 +128,41 @@ class ManualFindingTests(unittest.TestCase):
         self.assertTrue(
             any(f.get("title", "").startswith("Manual critical") for f in procs[0]["findings"])
         )
+
+    def test_manual_flag_creates_missing_node_and_links(self) -> None:
+        from app.detect.entity_graph import build_entity_graph
+        # Nothing about badsite.com exists in the graph yet.
+        self._add(title="Manual C2 domain", severity="critical",
+                  ref_type="event", ref_id="1", ref_label="badsite.com",
+                  node_type="domain", node_value="badsite.com",
+                  links=[{"type": "host", "value": "WS-07", "verb": "seen on"}])
+        graph = build_entity_graph(self.case, min_severity="info", max_nodes=500)
+        by_id = {n["id"]: n for n in graph["nodes"]}
+        dom = by_id.get("domain::badsite.com")
+        host = by_id.get("host::WS-07")
+        self.assertIsNotNone(dom)
+        self.assertEqual(dom["severity"], "critical")
+        self.assertTrue(dom["meta"].get("manual"))
+        self.assertIsNotNone(host)  # link target materialised too
+        # The correlation edge exists between the new node and its linked host.
+        self.assertTrue(
+            any(e["source"] == "domain::badsite.com" and e["target"] == "host::WS-07"
+                for e in graph["edges"])
+        )
+
+    def test_derive_event_node_infers_type_and_links(self) -> None:
+        from app.store.database import Event
+        ev = Event(
+            timestamp=None, host="WS-07", source="sysmon", category="process",
+            entity="evil.exe", severity="info", summary="ran evil.exe",
+            raw={"Computer": "WS-07", "SubjectUserName": "victim", "Image": "C:/tmp/evil.exe"},
+        )
+        ntype, nval, links = manual.derive_event_node(ev)
+        self.assertEqual(ntype, "process")
+        self.assertEqual(nval, "evil.exe")
+        link_types = {lk["type"] for lk in links}
+        self.assertIn("host", link_types)
+        self.assertIn("user", link_types)
 
     def test_benign_mark_survives_rematerialisation(self) -> None:
         item = self._add(title="Manual host flag", severity="high",

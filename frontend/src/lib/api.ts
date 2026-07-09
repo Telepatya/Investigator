@@ -97,6 +97,7 @@ export const api = {
       ref_id: string;
       ref_label: string;
       ref_entity?: string;
+      entity_type?: string;
     },
   ) =>
     req<{ ok: boolean; manual_id: string }>(`/cases/${id}/findings/manual`, {

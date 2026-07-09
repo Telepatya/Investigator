@@ -93,6 +93,8 @@ export function EntityDossierPanel({
               refType="entity"
               refId={entityId}
               refLabel={data.entity.value}
+              entityHint={data.entity.value}
+              entityType={data.entity.type}
               defaultTitle={`Analyst-flagged ${data.entity.type}: ${data.entity.value}`}
               defaultSeverity={data.entity.severity === "info" ? "medium" : data.entity.severity}
             />

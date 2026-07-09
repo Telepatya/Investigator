@@ -353,6 +353,11 @@ def _attach_findings(g: _Graph, findings: list[Finding]) -> None:
 
     for f in findings:
         ev = f.evidence or {}
+        # Manual findings materialise their own node via _attach_manual_nodes so
+        # they can create one that does not exist yet; skip them here to avoid
+        # double-attaching the finding to a same-named node.
+        if ev.get("manual"):
+            continue
         candidates: set[str] = set()
         for key in ("entity", "client_ip", "parent", "process", "path", "name", "service"):
             val = ev.get(key)
@@ -391,6 +396,50 @@ def _attach_chain_edges(g: _Graph, findings: list[Finding]) -> None:
             g.bump(dst, f.severity, None, source="finding")
             g.edge(src, dst, str(edge.get("verb") or "correlated with"),
                    f.severity, None, f.title)
+
+
+def _attach_manual_nodes(g: _Graph, findings: list[Finding]) -> None:
+    """Materialize analyst-created findings onto the map.
+
+    Unlike detector findings (which only colour entities already present),
+    a manual finding creates its node when it does not exist yet and draws
+    correlation edges to the related entities captured when it was raised, so a
+    freshly flagged item is not left floating.
+    """
+    for f in findings:
+        ev = f.evidence or {}
+        if not ev.get("manual"):
+            continue
+        ntype = str(ev.get("node_type") or "")
+        nval = str(ev.get("node_value") or "")
+        if ntype not in ENTITY_TYPES or not nval:
+            continue
+        nid = g.node(ntype, nval)
+        if not nid:
+            continue
+        node = g.nodes[nid]
+        node["meta"]["manual"] = True
+        g.bump(nid, f.severity, None, source="finding")
+        g.mark_severity(nid, f.severity, source="finding")
+        if not any(x.get("id") == f.id for x in node["findings"]):
+            node["findings"].append({
+                "id": f.id, "title": f.title, "severity": f.severity,
+                "techniques": f.mitre_techniques,
+            })
+        for link in ev.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            lt = str(link.get("type") or "")
+            lv = str(link.get("value") or "")
+            if lt not in ENTITY_TYPES or not lv:
+                continue
+            lid = g.node(lt, lv)
+            if not lid:
+                continue
+            # Keep the linked node visible without recolouring it: the edge, not
+            # the neighbour, carries the manual finding's severity.
+            g.bump(lid, "info", None)
+            g.edge(nid, lid, str(link.get("verb") or "connected to"), f.severity, None, f.title)
 
 
 def _suppression_tokens(evidence: dict) -> set[str]:
@@ -473,6 +522,7 @@ def build_entity_graph(
 
         _attach_chain_edges(g, findings)
         _attach_findings(g, findings)
+        _attach_manual_nodes(g, findings)
         _finalize_node_severities(g)
 
         min_rank = SEVERITY_RANK.get(min_severity, 0)
@@ -521,6 +571,7 @@ def entity_dossier(case_id: str, entity_id: str, action_limit: int = 500) -> dic
             _extract_from_event(g, ev, suppressed_event_ids, suppressed_entities)
         _attach_chain_edges(g, findings)
         _attach_findings(g, findings)
+        _attach_manual_nodes(g, findings)
         _finalize_node_severities(g)
 
         node = g.nodes.get(entity_id)

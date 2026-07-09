@@ -404,18 +404,36 @@ async def add_manual_finding(case_id: str, body: dict) -> dict:
     if severity not in manual.SEVERITIES:
         raise HTTPException(400, "invalid severity")
     mitre = body.get("mitre_techniques")
+    ref_type = str(body.get("ref_type") or "")
+    ref_id = str(body.get("ref_id") or "")
+    ref_label = str(body.get("ref_label") or "")
     session = case_store.get_session(case_id)
     try:
+        # Decide which map node this finding materialises, and what to link it to.
+        # Entity flags target the entity itself; event flags derive the node and
+        # its correlations from the referenced event so a new node is not floating.
+        node_type = ""
+        node_value = ""
+        links: list = []
+        if ref_type == "entity":
+            node_type = str(body.get("entity_type") or "")
+            node_value = str(body.get("ref_entity") or ref_label)
+        elif ref_type == "event" and ref_id.isdigit():
+            ev = session.get(Event, int(ref_id))
+            if ev is not None:
+                node_type, node_value, links = manual.derive_event_node(ev)
         item = manual.add_manual_finding(
             session,
             title=title,
             severity=severity,
             description=str(body.get("description") or ""),
             mitre_techniques=mitre if isinstance(mitre, list) else [],
-            ref_type=str(body.get("ref_type") or ""),
-            ref_id=str(body.get("ref_id") or ""),
-            ref_label=str(body.get("ref_label") or ""),
-            ref_entity=str(body.get("ref_entity") or ""),
+            ref_type=ref_type,
+            ref_id=ref_id,
+            ref_label=ref_label,
+            node_type=node_type,
+            node_value=node_value,
+            links=links,
         )
         manual.apply_manual_findings(session)
         overrides.apply_overrides(session)
