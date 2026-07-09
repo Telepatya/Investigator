@@ -209,7 +209,7 @@ export function IconButton({
       aria-label={label}
       title={label}
       className={clsx(
-        "grid h-10 w-10 place-items-center rounded-2xl border transition-all duration-200",
+        "grid h-10 w-10 place-items-center rounded-2xl border transition-all duration-200 active:scale-95",
         active
           ? "border-accent-blue/40 bg-accent-blue/10 text-accent-blue shadow-glow"
           : danger
@@ -263,7 +263,7 @@ export function DetailDrawer({
           {title && <div className="mt-1 truncate text-lg font-semibold text-ink-50">{title}</div>}
         </div>
         <button
-          className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[rgb(var(--panel-strong)/0.78)] text-ink-400 transition hover:bg-[rgb(var(--panel-strong)/0.96)] hover:text-ink-100"
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[rgb(var(--panel-strong)/0.78)] text-ink-400 transition hover:bg-[rgb(var(--panel-strong)/0.96)] hover:text-ink-100 active:scale-95"
           onClick={onClose}
           title="Close"
         >

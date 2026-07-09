@@ -30,6 +30,7 @@ export default function TimelinePage() {
   const [showSources, setShowSources] = useState(false);
   const [disabledCategories, setDisabledCategories] = useState<Set<string>>(new Set());
   const [showCategories, setShowCategories] = useState(false);
+  const [timelineReady, setTimelineReady] = useState(false);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search.trim()), 400);
@@ -111,7 +112,11 @@ export default function TimelinePage() {
   };
 
   useEffect(() => {
-    if (!containerRef.current || events.length === 0) return;
+    setTimelineReady(false);
+    if (!containerRef.current || events.length === 0) {
+      setTimelineReady(true);
+      return;
+    }
 
     const groups = new DataSet(
       Array.from(new Set(events.map((e) => e.group))).map((g) => ({
@@ -142,6 +147,17 @@ export default function TimelinePage() {
       orientation: "top",
     });
 
+    let cancelled = false;
+    const revealTimeline = () => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (!cancelled) setTimelineReady(true);
+        });
+      });
+    };
+    const fallback = window.setTimeout(revealTimeline, 180);
+    timeline.on("changed", revealTimeline);
+
     timeline.on("doubleClick", (props) => {
       const id = props.item;
       const evt = events.find((e) => e.id === id);
@@ -150,6 +166,9 @@ export default function TimelinePage() {
 
     timelineRef.current = timeline;
     return () => {
+      cancelled = true;
+      window.clearTimeout(fallback);
+      timeline.off("changed", revealTimeline);
       timeline.destroy();
       timelineRef.current = null;
     };
@@ -328,13 +347,28 @@ export default function TimelinePage() {
 
       <div className="timeline-board grid overflow-hidden rounded-3xl border border-[rgb(var(--border)/0.7)] bg-[rgb(var(--panel-strong)/0.5)] md:grid-cols-[190px_minmax(0,1fr)]">
         <TimelineRail events={events} />
-        <div className="min-w-0 p-2">
+        <div className="relative min-w-0 p-2">
         {events.length === 0 ? (
           <div className="p-10 text-center text-sm text-ink-400">
             No events match the current filters.
           </div>
         ) : (
-          <div ref={containerRef} />
+          <>
+            {!timelineReady && (
+              <div className="absolute inset-2 z-10 grid place-items-center rounded-2xl bg-[rgb(var(--panel-strong)/0.82)] text-sm text-ink-300">
+                <span className="inline-flex items-center gap-3">
+                  <span className="h-4 w-4 animate-spin rounded-full border-2 border-accent-blue/25 border-t-accent-blue" />
+                  Arranging timeline...
+                </span>
+              </div>
+            )}
+            <div
+              ref={containerRef}
+              className={`min-h-[460px] transition-opacity duration-150 ${
+                timelineReady ? "opacity-100" : "opacity-0"
+              }`}
+            />
+          </>
         )}
         </div>
       </div>

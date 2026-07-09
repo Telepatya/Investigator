@@ -86,11 +86,11 @@ export default function CasesPage() {
       )}
 
       {showCreate && (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-[rgb(var(--base-900)/0.38)] backdrop-blur-md p-4">
-          <div className="card p-6 w-full max-w-md">
+        <div className="modal-backdrop fixed inset-0 z-50 grid place-items-center p-4">
+          <div className="modal-panel w-full max-w-md rounded-2xl p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-ink-50">New investigation</h2>
-              <button className="text-ink-400 hover:text-ink-100" onClick={() => setShowCreate(false)}>
+              <button className="text-ink-400 transition hover:text-ink-100 active:scale-95" onClick={() => setShowCreate(false)}>
                 <X size={18} />
               </button>
             </div>
