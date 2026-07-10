@@ -190,7 +190,7 @@ class ManualFindingTests(_ManualFindingBase):
                 )
                 manual.apply_manual_findings(session)
                 session.commit()
-            except BaseException as exc:
+            except Exception as exc:
                 errors.append(exc)
             finally:
                 session.close()
