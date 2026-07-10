@@ -32,8 +32,13 @@ export default function App() {
     queryKey: ["global-event-search", caseId, q],
     queryFn: ({ signal }) => api.getEvents(caseId, { q, limit: 8 }, signal),
     enabled: searchOpen && Boolean(caseId) && q.length >= 2,
-    placeholderData: (prev) => prev,
   });
+
+  useEffect(() => {
+    setSearchOpen(false);
+    setSearch("");
+    setSelectedEvent(null);
+  }, [caseId]);
 
   useEffect(() => {
     if (searchOpen) searchRef.current?.focus();

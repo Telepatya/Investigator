@@ -145,6 +145,10 @@ class SerializedWriteSession(Session):
             self._write_lock.acquire()
             self._owns_write_lock = True
 
+    def acquire_write_lock(self) -> None:
+        """Lock before a read-modify-write sequence begins."""
+        self._acquire_write_lock()
+
     def _release_write_lock(self) -> None:
         if self._owns_write_lock:
             self._owns_write_lock = False
@@ -189,6 +193,13 @@ class SerializedWriteSession(Session):
 
 def _normalize_db_path(db_path: str | Path) -> Path:
     return Path(db_path).expanduser().resolve()
+
+
+def acquire_session_write_lock(session: Session) -> None:
+    """Acquire the case writer gate before reading state that will be changed."""
+    acquire = getattr(session, "acquire_write_lock", None)
+    if acquire is not None:
+        acquire()
 
 
 def get_engine(db_path: str | Path) -> Engine:

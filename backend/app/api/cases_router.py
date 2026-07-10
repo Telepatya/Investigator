@@ -53,9 +53,12 @@ def get_case(case_id: str) -> dict:
 
 
 @router.delete("/{case_id}")
-def delete_case(case_id: str) -> dict:
-    if not case_store.delete_case(case_id):
+async def delete_case(case_id: str) -> dict:
+    if not await asyncio.to_thread(case_store.case_exists, case_id):
         raise HTTPException(404, "Case not found")
+    async with coordinator.run(case_id, "case deletion"):
+        if not await asyncio.to_thread(case_store.delete_case, case_id):
+            raise HTTPException(404, "Case not found")
     return {"ok": True}
 
 
@@ -197,6 +200,9 @@ def get_events(
 ) -> dict:
     session = case_store.get_session(case_id)
     try:
+        from app.detect import manual
+        if manual.ensure_manual_findings_applied(session):
+            session.commit()
         stmt = select(Event)
         count_stmt = select(func.count()).select_from(Event)
         if category:
@@ -243,6 +249,8 @@ def get_events(
 
 @router.get("/{case_id}/events/{event_id}")
 def get_event(case_id: str, event_id: int) -> dict:
+    if not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
     session = case_store.get_session(case_id)
     try:
         event = session.get(Event, event_id)
@@ -279,6 +287,9 @@ def get_timeline(
 ) -> dict:
     session = case_store.get_session(case_id)
     try:
+        from app.detect import manual
+        if manual.ensure_manual_findings_applied(session):
+            session.commit()
         filters = [Event.timestamp.isnot(None)]
         if sources is not None:
             wanted = [s for s in sources.split(",") if s]
@@ -406,7 +417,11 @@ def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
         f = session.get(Finding, finding_id)
         if not f:
             raise HTTPException(404, "Finding not found")
+        manual_finding = bool(f.source == "manual" or (f.evidence or {}).get("manual"))
         overrides.set_finding_benign(session, overrides.finding_key(f.title, f.evidence), benign)
+        if manual_finding:
+            from app.detect import manual
+            manual.apply_manual_findings(session)
         overrides.apply_overrides(session)
         session.commit()
         return {"ok": True, "finding_id": finding_id, "benign": benign}
@@ -436,6 +451,8 @@ def add_manual_finding(case_id: str, body: dict) -> dict:
     """Analyst-created finding for an event or entity, tagged manual and
     persisted so it survives detection rebuilds."""
     from app.detect import manual
+    if not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
     title = str(body.get("title") or "").strip()
     severity = str(body.get("severity") or "").strip().lower()
     if not title:
@@ -486,6 +503,8 @@ def add_manual_finding(case_id: str, body: dict) -> dict:
 def delete_manual_finding(case_id: str, manual_id: str) -> dict:
     """Remove an analyst-created finding (does not touch detector findings)."""
     from app.detect import manual
+    if not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
     session = case_store.get_session(case_id)
     try:
         removed = manual.remove_manual_finding(session, manual_id)
@@ -506,8 +525,10 @@ async def run_detections(case_id: str, rebuild: bool = True) -> dict:
 
     def _run() -> int:
         if rebuild:
+            from app.detect import manual
             session = case_store.get_session(case_id)
             try:
+                manual.restore_manual_event_severities(session)
                 session.execute(sqldelete(Finding))
                 session.execute(
                     sqlupdate(Event)

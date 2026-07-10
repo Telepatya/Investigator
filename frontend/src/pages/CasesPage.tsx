@@ -157,6 +157,7 @@ export default function CasesPage() {
 }
 
 function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
+  const operationActive = c.status === "ingesting" || c.status === "analyzing";
   return (
     <div className="card interactive-lift group relative p-5 hover:border-accent-blue/30">
       <div className="flex items-start justify-between">
@@ -179,9 +180,10 @@ function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
           </p>
         </Link>
         <button
-          className="text-ink-500 hover:text-sev-critical p-1 opacity-0 group-hover:opacity-100 transition"
+          className="text-ink-500 hover:text-sev-critical p-1 opacity-0 group-hover:opacity-100 transition disabled:cursor-not-allowed disabled:opacity-30"
           onClick={onDelete}
-          title="Delete case"
+          disabled={operationActive}
+          title={operationActive ? "Wait for the active case operation to finish" : "Delete case"}
         >
           <Trash2 size={16} />
         </button>

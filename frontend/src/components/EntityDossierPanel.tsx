@@ -11,6 +11,7 @@ import {
   Cpu,
   Database,
   Crosshair,
+  Share2,
 } from "lucide-react";
 import { api, memoryModuleDownloadUrl, memoryProcessDownloadUrl, wsUrl } from "../lib/api";
 import { DetailDrawer, SeverityBadge, Spinner, CodeBlock } from "./common";
@@ -65,6 +66,14 @@ export function EntityDossierPanel({
             {data.entity.finding_count > 0 && (
               <span className="chip bg-sev-high/15 text-sev-high">
                 <AlertTriangle size={11} /> {data.entity.finding_count} findings
+              </span>
+            )}
+            {Boolean(data.entity.meta.manual) && typeof data.entity.meta.correlated === "number" && (
+              <span
+                className="chip bg-accent-cyan/10 text-accent-cyan"
+                title="Related entities linked from event evidence for this flagged item"
+              >
+                <Share2 size={11} /> correlated with {data.entity.meta.correlated} entities
               </span>
             )}
             {data.entity.first_seen && (

@@ -135,6 +135,12 @@ def update_case_meta(case_id: str, *, include_stats: bool = True, **kwargs) -> d
     return {**meta, **get_case_stats(case_id)}
 
 
+def case_exists(case_id: str) -> bool:
+    if not _CASE_ID_RE.fullmatch(case_id or ""):
+        return False
+    return case_id in _load_registry().get("cases", {})
+
+
 def delete_case(case_id: str) -> bool:
     with _REGISTRY_LOCK:
         registry = _load_registry()

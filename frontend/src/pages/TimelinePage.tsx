@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
-import { useQuery, keepPreviousData } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { Timeline } from "vis-timeline/standalone";
 import { DataSet } from "vis-data";
 import "vis-timeline/styles/vis-timeline-graph2d.css";
@@ -21,7 +21,7 @@ function escapeHtml(s: string): string {
 
 export default function TimelinePage() {
   const { caseId } = useParams();
-  const containerRef = useRef<HTMLDivElement>(null);
+  const [timelineContainer, setTimelineContainer] = useState<HTMLDivElement | null>(null);
   const timelineRef = useRef<Timeline | null>(null);
   const eventsRef = useRef<TimelineEvt[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -39,10 +39,30 @@ export default function TimelinePage() {
     return () => clearTimeout(t);
   }, [search]);
 
-  // Latest known source list, readable inside queryFn without self-referencing
-  // the query result.
-  const sourcesRef = useRef<{ name: string; count: number }[]>([]);
-  const categoriesRef = useRef<{ name: string; count: number }[]>([]);
+  useEffect(() => {
+    setSearch("");
+    setDebouncedSearch("");
+    setMinSeverity("info");
+    setDisabledSources(new Set());
+    setDisabledCategories(new Set());
+    setSelectedId(null);
+  }, [caseId]);
+
+  const { data: facetData } = useQuery({
+    queryKey: ["timeline-facets", caseId],
+    queryFn: ({ signal }) =>
+      api.getTimeline(caseId!, { limit: 0, include_facets: true }, signal),
+    enabled: !!caseId,
+    staleTime: 30_000,
+  });
+  const sources = facetData?.sources ?? [];
+  const categories = facetData?.categories ?? [];
+  const sourceFacetKey = disabledSources.size > 0
+    ? sources.map((source) => source.name).sort().join("|")
+    : "";
+  const categoryFacetKey = disabledCategories.size > 0
+    ? categories.map((category) => category.name).sort().join("|")
+    : "";
 
   // All filtering is server-side, so the source list and counts cover the whole
   // case (not just the first page of events) and filters reveal capped events.
@@ -54,6 +74,8 @@ export default function TimelinePage() {
       minSeverity,
       Array.from(disabledSources).sort().join("|"),
       Array.from(disabledCategories).sort().join("|"),
+      sourceFacetKey,
+      categoryFacetKey,
     ],
     queryFn: ({ signal }) =>
       api.getTimeline(caseId!, {
@@ -61,7 +83,7 @@ export default function TimelinePage() {
         ...(minSeverity !== "info" ? { min_severity: minSeverity } : {}),
         ...(disabledSources.size > 0
           ? {
-              sources: sourcesRef.current
+              sources: sources
                 .map((s) => s.name)
                 .filter((n) => !disabledSources.has(n))
                 .join(","),
@@ -69,26 +91,20 @@ export default function TimelinePage() {
           : {}),
         ...(disabledCategories.size > 0
           ? {
-              categories: categoriesRef.current
+              categories: categories
                 .map((c) => c.name)
                 .filter((n) => !disabledCategories.has(n))
                 .join(","),
             }
           : {}),
-        include_facets: sourcesRef.current.length === 0 || categoriesRef.current.length === 0,
+        include_facets: false,
       }, signal),
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[1] === caseId ? previousData : undefined,
   });
 
-  useEffect(() => {
-    if (data?.sources?.length) sourcesRef.current = data.sources;
-    if (data?.categories?.length) categoriesRef.current = data.categories;
-  }, [data]);
-
   const events = useMemo(() => data?.events ?? [], [data]);
-  const sources = data?.sources?.length ? data.sources : sourcesRef.current;
-  const categories = data?.categories?.length ? data.categories : categoriesRef.current;
-  const total = data?.total ?? 0;
+  const total = facetData?.total ?? data?.total ?? 0;
   const totalMatching = data?.total_matching ?? 0;
   const hasFilters =
     debouncedSearch !== "" ||
@@ -142,8 +158,8 @@ export default function TimelinePage() {
   }, [events]);
 
   useEffect(() => {
-    if (isLoading || !containerRef.current || timelineRef.current) return;
-    const timeline = new Timeline(containerRef.current, new DataSet([]), new DataSet([]), {
+    if (!timelineContainer || timelineRef.current) return;
+    const timeline = new Timeline(timelineContainer, new DataSet([]), new DataSet([]), {
       stack: true,
       cluster: { maxItems: 8, fitOnDoubleClick: true },
       maxHeight: 460,
@@ -166,7 +182,7 @@ export default function TimelinePage() {
       timeline.destroy();
       timelineRef.current = null;
     };
-  }, [isLoading]);
+  }, [timelineContainer]);
 
   useEffect(() => {
     const timeline = timelineRef.current;
@@ -205,7 +221,7 @@ export default function TimelinePage() {
       cancelAnimationFrame(frame);
       window.clearTimeout(fallback);
     };
-  }, [events]);
+  }, [events, timelineContainer]);
 
   if (isLoading) return <Spinner label="Building timeline…" />;
   if (total === 0 && !hasFilters)
@@ -389,7 +405,7 @@ export default function TimelinePage() {
               </div>
             )}
             <div
-              ref={containerRef}
+              ref={setTimelineContainer}
               className={`min-h-[460px] transition-opacity duration-150 ${
                 timelineReady ? "opacity-100" : "opacity-0"
               }`}

@@ -163,7 +163,8 @@ export default function EntityMapPage() {
     queryKey: ["entities", caseId, maxNodes],
     queryFn: ({ signal }) => api.getEntities(caseId!, { min_severity: "info", max_nodes: maxNodes }, signal),
     enabled: !!caseId,
-    placeholderData: (prev) => prev,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[1] === caseId ? previousData : undefined,
   });
 
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
@@ -171,6 +172,18 @@ export default function EntityMapPage() {
   const [mapReady, setMapReady] = useState(false);
   const [, startLayoutTransition] = useTransition();
   const rfRef = useRef<ReactFlowInstance | null>(null);
+
+  useEffect(() => {
+    setMinSeverity("info");
+    setActiveTypes(new Set(ALL_TYPES));
+    setShowTerminated(false);
+    setSelected(null);
+    setFocusId(null);
+    setExpanded(new Set());
+    setNodes([]);
+    setEdges([]);
+    setMapReady(false);
+  }, [caseId, setNodes, setEdges]);
 
   const deadCount = useMemo(
     () => (data ? data.nodes.filter((n) => n.meta?.dead).length : 0),

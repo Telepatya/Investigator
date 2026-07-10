@@ -22,7 +22,7 @@ import re
 from sqlalchemy import select
 
 from app.store import cases as case_store
-from app.store.database import Finding
+from app.store.database import Finding, acquire_session_write_lock
 
 _DISABLED_RULES_KEY = "disabled_rules"
 _BENIGN_FINDINGS_KEY = "benign_findings"
@@ -103,6 +103,7 @@ def get_benign_keys(session) -> set[str]:
 
 
 def set_rule_disabled(session, rule_id: str, disabled: bool) -> set[str]:
+    acquire_session_write_lock(session)
     rules = get_disabled_rules(session)
     if disabled:
         rules.add(rule_id)
@@ -113,6 +114,7 @@ def set_rule_disabled(session, rule_id: str, disabled: bool) -> set[str]:
 
 
 def set_finding_benign(session, key: str, benign: bool) -> set[str]:
+    acquire_session_write_lock(session)
     keys = get_benign_keys(session)
     if benign:
         keys.add(key)
@@ -138,6 +140,7 @@ def apply_overrides(session) -> int:
     """Force every disabled-rule / benign finding to ``info`` (stashing the
     original severity), and restore any finding no longer suppressed. Returns
     the number of findings whose severity changed."""
+    acquire_session_write_lock(session)
     disabled = get_disabled_rules(session)
     benign = get_benign_keys(session)
     changed = 0

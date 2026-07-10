@@ -40,7 +40,7 @@ async def start_analysis(case_id: str) -> dict:
         async def emit(phase: str, message: str, percent: float) -> None:
             _broadcast_analysis(case_id, {
                 "case_id": case_id, "phase": phase, "message": message,
-                "percent": percent, "done": phase == "done",
+                "percent": percent, "done": phase in {"done", "error"},
             })
 
         active = coordinator.snapshot(case_id).get("active")
@@ -48,6 +48,9 @@ async def start_analysis(case_id: str) -> dict:
             await emit("queued", f"Waiting for {active} to finish", 0)
         try:
             async with coordinator.run(case_id, "AI analysis"):
+                if not await asyncio.to_thread(case_store.case_exists, case_id):
+                    await emit("error", "Analysis cancelled because the case no longer exists", 100)
+                    return
                 await analyze_case(case_id, emit=emit)
         except Exception as e:
             _broadcast_analysis(case_id, {

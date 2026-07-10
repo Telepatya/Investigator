@@ -363,6 +363,16 @@ class IngestionManager:
                 "error": None,
             })
         async with coordinator.run(case_id, "evidence ingestion"):
+            if not await asyncio.to_thread(case_store.case_exists, case_id):
+                self._broadcast(case_id, {
+                    "case_id": case_id,
+                    "phase": "error",
+                    "percent": 100,
+                    "message": "Ingestion cancelled because the case no longer exists",
+                    "done": True,
+                    "error": "Case not found",
+                })
+                return
             await self._run_ingestion_locked(case_id, file_path, file_type, memory_options)
 
     async def _run_ingestion_locked(

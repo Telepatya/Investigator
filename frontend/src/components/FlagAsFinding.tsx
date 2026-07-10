@@ -58,6 +58,11 @@ export function FlagAsFinding({
       qc.invalidateQueries({ queryKey: ["case", caseId] });
       qc.invalidateQueries({ queryKey: ["entities", caseId] });
       qc.invalidateQueries({ queryKey: ["entity-dossier", caseId] });
+      qc.invalidateQueries({ queryKey: ["events", caseId] });
+      qc.invalidateQueries({ queryKey: ["timeline", caseId] });
+      qc.invalidateQueries({ queryKey: ["timeline-facets", caseId] });
+      qc.invalidateQueries({ queryKey: ["event-detail", caseId] });
+      qc.invalidateQueries({ queryKey: ["global-event-search", caseId] });
       setOpen(false);
     },
   });

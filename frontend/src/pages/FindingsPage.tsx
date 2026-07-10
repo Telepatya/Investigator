@@ -38,7 +38,10 @@ export default function FindingsPage() {
       "entity-dossier",
       "attack-matrix",
       "timeline",
+      "timeline-facets",
       "events",
+      "event-detail",
+      "global-event-search",
       "categories",
     ]) {
       qc.invalidateQueries({ queryKey: [key, caseId] });

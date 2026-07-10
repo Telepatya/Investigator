@@ -159,6 +159,8 @@ export interface EntityNodeMeta extends Record<string, unknown> {
   pids?: number[];
   // True when an analyst raised this node via a manual finding.
   manual?: boolean;
+  // On manual nodes: number of related entities correlated from event evidence.
+  correlated?: number;
 }
 
 export interface EntityEdge {

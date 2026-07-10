@@ -31,7 +31,9 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - **APT hunting.** YARA sweep of memory using a bundled C2 / offensive-tooling ruleset (Cobalt Strike, Meterpreter, Sliver/Covenant/Havoc, Mimikatz, Rubeus, reflective loaders, shellcode markers) plus your own rules directory.
 - **Deterministic detection engine.** LOLBins, suspicious parent/child chains, masquerading, execution from staging directories, persistence, log clearing, and C2 beaconing — every finding mapped to MITRE ATT&CK before the LLM ever runs.
 - **AI orchestration.** Map-reduce analysis over the evidence produces an executive summary, a timeline narrative, and per-finding verdicts. During correlation, verdicts, and chat, the model can query the case database itself (full-text event search, process trees, memory correlation data, findings, aggregates) through a provider-agnostic tool loop — it pulls the actual log lines behind a claim before committing to it. A retrieval-augmented chat answers questions from the case's own data and keeps a compact rolling memo of long conversations, so context truncation doesn't lose the investigation thread.
-- **Slick UI.** Dark, glassmorphic React interface: cases dashboard, overview with verdict banner and ATT&CK heat map, zoomable timeline, interactive entity/process map with per-process dossiers, memory results, findings, event explorer, report export, and streaming AI chat.
+- **Analyst workstation UI.** Responsive glass-panel workspace with system-aware light/dark themes, a persistent case shell, expandable current-case event search, reusable detail drawers, subtle loading/interaction animation, and case-scoped busy states.
+- **Investigation views.** A server-filtered chronological timeline, deterministic layered entity map, overview dashboard, memory explorer, findings and event tables, evidence management, report export, and streaming AI chat. Timeline and entity-map bundles load only when those routes are opened.
+- **Analyst findings.** Events and entities can be promoted to durable manual findings. Event flags carry their chosen severity into the referenced event and exact-entity-related timeline activity, while benign/delete actions restore the prior parser or detector severity.
 
 | Entity map | Timeline |
 | --- | --- |
@@ -90,6 +92,10 @@ With Ollama, no case data ever leaves your machine. With a remote provider, only
 3. **Run AI analysis** — correlates everything into a report, timeline narrative, and per-finding verdicts.
 4. **Explore** the **Overview**, **Timeline**, **Entity Map**, **Memory**, **Findings**, and **Events** tabs, export the **Report**, or interrogate the case in **AI Chat**.
 
+The magnifying-glass control in the workspace header expands into a current-case event search. Results stay in place under the field; double-click a result to open its full raw event drawer. Timeline events also open on double-click. In Entity Map, a single click opens the entity dossier, while double-click expands or compacts one-hop relationships in focus mode.
+
+Manual findings are analyst intent, not destructive edits to source evidence. The app stores the finding and the event's previous severity separately. Removing the finding or marking it benign restores the previous severity; detection rebuilds restore their baseline first and then reapply active manual findings.
+
 Cases and configuration live under `~/.investigator/` — one self-contained SQLite database per case.
 
 ## How analysis works
@@ -122,8 +128,8 @@ Memory correlation combines MemProcFS process, module, VAD, thread, handle, serv
 
 The short version:
 
-- **Backend** (`backend/app`): FastAPI + SQLAlchemy, one SQLite database per case with FTS5 full-text search. Modules: `ingest/` (parsers + pipeline), `memory/` (MemProcFS runner, YARA scanner, analysis pipeline), `detect/` (rules, detection engine, process tree, entity graph), `llm/` (provider abstraction, prompts, tool loop, orchestrator), `api/` (REST + WebSocket routers), `store/` (case registry + models).
-- **Frontend** (`frontend/src`): React + TypeScript + Vite + Tailwind, with React Flow (entity/process maps), vis-timeline, Recharts, and TanStack Query. Built to static files and served by the backend, so the whole app runs from one local process.
+- **Backend** (`backend/app`): FastAPI + SQLAlchemy, one SQLite database per case with FTS5 search. A per-case async operation coordinator serializes ingestion, analysis, detection rebuilds, and deletion; a per-database writer gate serializes SQLite write transactions while WAL keeps reads available. CPU/blocking graph and dossier work is moved off the event loop.
+- **Frontend** (`frontend/src`): React + TypeScript + Vite + Tailwind, with tokenized light/dark themes, React Flow, vis-timeline, Recharts, and TanStack Query. Query keys and transient UI state are case-scoped, long operations remain visible through WebSockets, and heavy visualization routes are code-split.
 
 ## Development
 

@@ -16,16 +16,33 @@ tag it and this module can find and replace exactly its own rows.
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import delete as sqldelete
+from sqlalchemy import delete as sqldelete, select
 
 from app.store import cases as case_store
-from app.store.database import Finding
+from app.store.database import Event, Finding, acquire_session_write_lock
 
 _MANUAL_KEY = "manual_findings"
+_MANUAL_EVENT_BASELINES_KEY = "manual_event_severity_baselines"
+_MANUAL_EVENT_SYNC_KEY = "manual_event_severity_sync"
+_MANUAL_EVENT_SYNC_VERSION = "2"
+_MANUAL_EVENT_REASON = "Analyst-flagged event"
 SEVERITIES = {"info", "low", "medium", "high", "critical"}
+_SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+_FILE_PATH_KEYS = (
+    "DownloadedFilePath", "FullPath", "OSPath", "TargetFilename",
+    "Target Filename", "Path", "FilePath", "TargetPath", "FileName",
+    "Filename", "ServiceFileName", "ImagePath", "PathName",
+)
+_PROCESS_PATH_KEYS = (
+    "NewProcessName", "Image", "ProcessName", "ParentProcessName",
+    "ParentImage", "Owner", "Process",
+)
 
 
 def _load(session) -> list[dict]:
@@ -54,8 +71,41 @@ _NODE_TYPES = {
 
 
 def _basename(v: str) -> str:
-    import re
     return re.split(r"[\\/]", (v or "").strip())[-1] or (v or "").strip()
+
+
+def _clean_path(value: object) -> str:
+    path = str(value or "").strip().strip('"')
+    path = re.split(r";\s*(?:Mtime|_ZoneIdentifier)", path, maxsplit=1, flags=re.IGNORECASE)[0]
+    for prefix in ("\\\\?\\", "\\\\.\\", "\\??\\"):
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+            break
+    return path.replace("/", "\\").rstrip("\\")
+
+
+def _same_pathish(target: str, candidate: object) -> bool:
+    candidate_path = _clean_path(candidate)
+    if not candidate_path:
+        return False
+    target_path = _clean_path(target)
+    if "\\" in target_path or "/" in target:
+        return candidate_path.lower() == target_path.lower()
+    return _basename(candidate_path).lower() == _basename(target_path).lower()
+
+
+def _event_file_path(ev) -> str:
+    raw = ev.raw or {}
+    for key in _FILE_PATH_KEYS:
+        value = _clean_path(raw.get(key))
+        if value:
+            return value
+    match = re.search(
+        r"(?:DownloadedFilePath|FullPath|OSPath|TargetFilename)=([^;\r\n]+)",
+        ev.summary or "",
+        re.IGNORECASE,
+    )
+    return _clean_path(match.group(1)) if match else ""
 
 
 def _looks_like_ip(v: str) -> bool:
@@ -77,13 +127,18 @@ def derive_event_node(ev) -> tuple[str, str, list[dict]]:
     host = norm(raw.get("Computer") or raw.get("Hostname") or ev.host)
     actor = norm(raw.get("SubjectUserName") or raw.get("User") or raw.get("AccountName"))
     proc = norm(raw.get("NewProcessName") or raw.get("Image") or raw.get("ProcessName"))
-    entity = norm(ev.entity) or (_basename(proc) if proc else host)
+    file_path = _event_file_path(ev)
+    entity = file_path or norm(ev.entity) or (_basename(proc) if proc else host)
     if not entity:
         return "", "", []
 
     low = entity.lower()
-    if _looks_like_ip(entity):
+    if file_path:
+        ntype, nval = "file", file_path
+    elif _looks_like_ip(entity):
         ntype, nval = "ip", entity
+    elif ev.category == "filesystem" and ("\\" in entity or "/" in entity):
+        ntype, nval = "file", _clean_path(entity)
     elif low.endswith((".exe", ".dll", ".sys", ".scr")):
         ntype, nval = "process", entity if ("\\" in entity or "/" in entity) else _basename(entity)
     elif ev.category == "process" or ev.category == "network":
@@ -105,6 +160,158 @@ def derive_event_node(ev) -> tuple[str, str, list[dict]]:
     return ntype, nval, links
 
 
+def _event_mentions_node(ev, node_type: str, node_value: str) -> bool:
+    raw = ev.raw or {}
+    if node_type == "file":
+        values = [raw.get(key) for key in _FILE_PATH_KEYS]
+        values.append(ev.entity)
+        match = re.search(
+            r"(?:DownloadedFilePath|FullPath|OSPath|TargetFilename)=([^;\r\n]+)",
+            ev.summary or "",
+            re.IGNORECASE,
+        )
+        if match:
+            values.append(match.group(1))
+        return any(_same_pathish(node_value, value) for value in values)
+    if node_type == "process":
+        return any(
+            _same_pathish(node_value, raw.get(key)) for key in _PROCESS_PATH_KEYS
+        ) or _same_pathish(node_value, ev.entity)
+    if node_type in {"user", "account"}:
+        return any(
+            str(raw.get(key) or "").lower() == node_value.lower()
+            for key in ("user", "SubjectUserName", "TargetUserName", "User", "AccountName")
+        )
+    if node_type == "host":
+        return (ev.host or "").lower() == node_value.lower() or any(
+            str(raw.get(key) or "").lower() == node_value.lower()
+            for key in ("Computer", "Hostname")
+        )
+    if node_type == "ip":
+        return any(
+            str(raw.get(key) or "").lower() == node_value.lower()
+            for key in ("client_ip", "IpAddress", "SourceIp", "Raddr", "ForeignAddr", "DestinationIp")
+        )
+    return node_value.lower() in (ev.summary or "").lower()
+
+
+def _impact_signature(items: list[dict]) -> str:
+    relevant = [
+        {
+            key: item.get(key)
+            for key in ("id", "severity", "ref_type", "ref_id", "node_type", "node_value")
+        }
+        for item in items
+    ]
+    payload = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(f"{_MANUAL_EVENT_SYNC_VERSION}:{payload}".encode()).hexdigest()
+
+
+def _load_event_baselines(session) -> dict[str, dict]:
+    raw = case_store.get_meta(session, _MANUAL_EVENT_BASELINES_KEY)
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def restore_manual_event_severities(session) -> int:
+    """Restore detector/parser severity before rebuilding manual event impacts."""
+    acquire_session_write_lock(session)
+    baselines = _load_event_baselines(session)
+    restored = 0
+    for event_id, baseline in baselines.items():
+        if not str(event_id).isdigit() or not isinstance(baseline, dict):
+            continue
+        event = session.get(Event, int(event_id))
+        if event is None or not (event.severity_reason or "").startswith(_MANUAL_EVENT_REASON):
+            continue
+        event.severity = str(baseline.get("severity") or "info")
+        event.severity_reason = baseline.get("severity_reason")
+        restored += 1
+    case_store.set_meta(session, _MANUAL_EVENT_BASELINES_KEY, "{}")
+    case_store.set_meta(session, _MANUAL_EVENT_SYNC_KEY, "")
+    return restored
+
+
+def _sync_manual_event_severities(session, items: list[dict]) -> None:
+    from app.detect import overrides
+
+    restore_manual_event_severities(session)
+    event_items = [
+        item for item in items
+        if item.get("ref_type") == "event" and str(item.get("ref_id") or "").isdigit()
+    ]
+    if not event_items:
+        return
+
+    events = list(session.scalars(select(Event)))
+    by_id = {event.id: event for event in events}
+    impacts: dict[int, tuple[int, dict]] = {}
+    metadata_changed = False
+    benign_keys = overrides.get_benign_keys(session)
+    for item in event_items:
+        referenced = by_id.get(int(item["ref_id"]))
+        if referenced is None:
+            continue
+        node_type, node_value, links = derive_event_node(referenced)
+        if node_type and node_value and (
+            item.get("node_type") != node_type or item.get("node_value") != node_value
+        ):
+            item["node_type"] = node_type
+            item["node_value"] = node_value
+            item["links"] = links
+            metadata_changed = True
+
+        evidence = {"summary": item.get("ref_label") or item.get("title")}
+        if node_type and node_value:
+            evidence["entity"] = node_value
+        is_benign = overrides.finding_key(str(item.get("title") or ""), evidence) in benign_keys
+        rank = 0 if is_benign else _SEVERITY_RANK.get(str(item.get("severity") or "info"), 0)
+        candidates = [referenced]
+        if node_type and node_value:
+            candidates.extend(
+                event for event in events
+                if event.id != referenced.id and _event_mentions_node(event, node_type, node_value)
+            )
+        for event in candidates:
+            current = impacts.get(event.id)
+            if current is None or rank > current[0]:
+                impacts[event.id] = (rank, item)
+
+    if metadata_changed:
+        _store(session, items)
+
+    baselines: dict[str, dict] = {}
+    for event_id, (rank, item) in impacts.items():
+        event = by_id[event_id]
+        if rank <= _SEVERITY_RANK.get(event.severity, 0):
+            continue
+        baselines[str(event_id)] = {
+            "severity": event.severity,
+            "severity_reason": event.severity_reason,
+        }
+        event.severity = str(item["severity"])
+        relation = "referenced directly" if str(event.id) == str(item["ref_id"]) else "references the same entity"
+        event.severity_reason = (
+            f"{_MANUAL_EVENT_REASON}: {relation} as manual finding "
+            f"{item['id']} ({item['title']})"
+        )
+    case_store.set_meta(session, _MANUAL_EVENT_BASELINES_KEY, json.dumps(baselines))
+
+
+def ensure_manual_findings_applied(session) -> bool:
+    """Repair legacy manual event findings once, then remain a cheap metadata check."""
+    items = _load(session)
+    if case_store.get_meta(session, _MANUAL_EVENT_SYNC_KEY) == _impact_signature(items):
+        return False
+    apply_manual_findings(session)
+    return True
+
+
 def add_manual_finding(
     session,
     *,
@@ -119,6 +326,7 @@ def add_manual_finding(
     node_value: str = "",
     links: list | None = None,
 ) -> dict:
+    acquire_session_write_lock(session)
     title = (title or "").strip()
     if not title:
         raise ValueError("title required")
@@ -154,6 +362,7 @@ def add_manual_finding(
 
 
 def remove_manual_finding(session, manual_id: str) -> bool:
+    acquire_session_write_lock(session)
     items = _load(session)
     kept = [it for it in items if it.get("id") != manual_id]
     if len(kept) == len(items):
@@ -169,6 +378,7 @@ def apply_manual_findings(session) -> int:
     add/remove (some manual rows may already be present)."""
     session.execute(sqldelete(Finding).where(Finding.source == "manual"))
     items = _load(session)
+    _sync_manual_event_severities(session, items)
     for it in items:
         label = it.get("ref_label") or it["title"]
         ref_type = it.get("ref_type") or "item"
@@ -204,4 +414,5 @@ def apply_manual_findings(session) -> int:
             )
         )
     session.flush()
+    case_store.set_meta(session, _MANUAL_EVENT_SYNC_KEY, _impact_signature(items))
     return len(items)

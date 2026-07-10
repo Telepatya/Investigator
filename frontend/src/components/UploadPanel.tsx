@@ -27,6 +27,21 @@ export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseS
       if (p.done) {
         qc.invalidateQueries({ queryKey: ["case", caseId] });
         qc.invalidateQueries({ queryKey: ["cases"] });
+        for (const key of [
+          "evidence",
+          "events",
+          "timeline",
+          "timeline-facets",
+          "categories",
+          "findings",
+          "entities",
+          "entity-dossier",
+          "attack-matrix",
+          "memory",
+          "memory-dumps",
+        ]) {
+          qc.invalidateQueries({ queryKey: [key, caseId] });
+        }
         setTimeout(() => setProgress(null), 4000);
       } else {
         qc.invalidateQueries({ queryKey: ["case", caseId] });
