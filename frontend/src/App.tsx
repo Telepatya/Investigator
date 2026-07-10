@@ -30,7 +30,7 @@ export default function App() {
 
   const { data: searchResults, isFetching: searching } = useQuery({
     queryKey: ["global-event-search", caseId, q],
-    queryFn: () => api.getEvents(caseId, { q, limit: 8 }),
+    queryFn: ({ signal }) => api.getEvents(caseId, { q, limit: 8 }, signal),
     enabled: searchOpen && Boolean(caseId) && q.length >= 2,
     placeholderData: (prev) => prev,
   });

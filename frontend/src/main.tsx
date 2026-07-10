@@ -23,7 +23,15 @@ const TimelinePage = lazy(() => import("./pages/TimelinePage"));
 const EntityMapPage = lazy(() => import("./pages/EntityMapPage"));
 
 const queryClient = new QueryClient({
-  defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
+  defaultOptions: {
+    queries: {
+      refetchOnWindowFocus: false,
+      retry: 1,
+      staleTime: 10_000,
+      gcTime: 5 * 60_000,
+    },
+    mutations: { retry: 0 },
+  },
 });
 
 const router = createBrowserRouter([

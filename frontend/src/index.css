@@ -37,26 +37,31 @@
 
 [data-theme="dark"] {
   color-scheme: dark;
-  --base-900: 7 10 20;
-  --base-800: 13 18 31;
-  --base-750: 18 25 42;
-  --base-700: 25 34 55;
-  --base-600: 36 48 74;
-  --base-500: 55 70 101;
-  --ink-50: 244 247 255;
-  --ink-100: 223 230 244;
-  --ink-200: 188 199 224;
-  --ink-300: 143 158 194;
-  --ink-400: 105 122 161;
-  --ink-500: 81 96 130;
-  --ink-600: 57 69 97;
-  --panel: 19 26 43;
-  --panel-strong: 24 32 52;
-  --panel-muted: 13 18 31;
-  --border: 66 82 116;
-  --border-strong: 91 111 151;
+  --base-900: 3 3 7;
+  --base-800: 7 7 12;
+  --base-750: 10 9 17;
+  --base-700: 17 15 26;
+  --base-600: 31 27 44;
+  --base-500: 54 47 74;
+  --ink-50: 255 255 255;
+  --ink-100: 245 243 255;
+  --ink-200: 224 217 247;
+  --ink-300: 188 177 220;
+  --ink-400: 145 133 172;
+  --ink-500: 105 94 128;
+  --ink-600: 72 64 90;
+  --accent-cyan: 233 227 255;
+  --accent-blue: 168 85 247;
+  --accent-violet: 217 70 239;
+  --sev-low: 168 85 247;
+  --sev-info: 148 135 170;
+  --panel: 12 10 18;
+  --panel-strong: 18 15 27;
+  --panel-muted: 8 7 13;
+  --border: 71 61 92;
+  --border-strong: 116 94 148;
   --shadow: 0 0 0;
-  --graph-grid: 58 73 105;
+  --graph-grid: 58 48 76;
 }
 
 html,
@@ -80,9 +85,9 @@ body {
 
 [data-theme="dark"] body {
   background:
-    radial-gradient(900px 540px at 76% -16%, rgb(var(--accent-blue) / 0.22), transparent 58%),
-    radial-gradient(700px 560px at 4% 4%, rgb(var(--accent-violet) / 0.14), transparent 52%),
-    linear-gradient(180deg, rgb(7 10 20), rgb(12 17 30) 54%, rgb(6 9 17));
+    radial-gradient(840px 520px at 78% -18%, rgb(var(--accent-blue) / 0.28), transparent 56%),
+    radial-gradient(620px 520px at 5% 2%, rgb(var(--accent-violet) / 0.16), transparent 54%),
+    linear-gradient(180deg, rgb(3 3 7), rgb(7 6 12) 52%, rgb(2 2 5));
 }
 
 body::before {
@@ -154,8 +159,8 @@ textarea {
   }
   [data-theme="dark"] .modal-backdrop {
     background:
-      radial-gradient(circle at 50% 42%, rgb(37 99 235 / 0.12), transparent 30%),
-      rgb(3 6 14 / 0.82);
+      radial-gradient(circle at 50% 42%, rgb(var(--accent-blue) / 0.16), transparent 30%),
+      rgb(3 3 7 / 0.86);
   }
   .modal-panel {
     background: linear-gradient(145deg, rgb(var(--panel) / 0.92), rgb(var(--panel-muted) / 0.86));
@@ -188,6 +193,10 @@ textarea {
     @apply btn text-white;
     background: linear-gradient(135deg, rgb(var(--accent-blue)), rgb(28 113 246));
     box-shadow: 0 14px 30px -20px rgb(var(--accent-blue) / 0.9);
+  }
+  [data-theme="dark"] .btn-primary {
+    background: linear-gradient(135deg, rgb(168 85 247), rgb(217 70 239));
+    box-shadow: 0 16px 34px -22px rgb(168 85 247 / 0.92);
   }
   .btn-primary:hover {
     filter: brightness(1.04);

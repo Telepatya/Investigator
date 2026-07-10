@@ -13,6 +13,7 @@ import {
   HardDrive,
   LayoutDashboard,
   List,
+  Loader2,
   MessageSquare,
   ShieldCheck,
 } from "lucide-react";
@@ -39,7 +40,7 @@ export default function CaseLayout() {
   const { caseId } = useParams();
   const { data: c } = useQuery({
     queryKey: ["case", caseId],
-    queryFn: () => api.getCase(caseId!),
+    queryFn: ({ signal }) => api.getCase(caseId!, signal),
     refetchInterval: 4000,
     enabled: !!caseId,
   });
@@ -49,6 +50,7 @@ export default function CaseLayout() {
   const activeFindings = c?.active_finding_count ?? 0;
   const clean = activeFindings === 0;
   const suppressedCount = (c?.finding_count ?? 0) - activeFindings;
+  const caseBusy = c?.status === "ingesting" || c?.status === "analyzing";
 
   return (
     <div className="page-enter space-y-5">
@@ -122,13 +124,29 @@ export default function CaseLayout() {
         </div>
 
         <div className="flex items-center gap-2">
-          {caseId && <UploadPanel caseId={caseId} />}
+          {caseId && <UploadPanel caseId={caseId} status={c?.status} />}
           {caseId && <AnalyzeButton caseId={caseId} status={c?.status} />}
         </div>
       </div>
 
+      {caseBusy && (
+        <div className="glass flex items-center gap-3 rounded-2xl border border-accent-blue/25 px-4 py-3 text-sm text-ink-200" role="status">
+          <Loader2 size={17} className="animate-spin text-accent-blue" />
+          <div className="min-w-0">
+            <div className="font-semibold text-ink-100">
+              {c?.status === "ingesting" ? "Evidence processing is running" : "Case analysis is running"}
+            </div>
+            <div className="truncate text-xs text-ink-400">
+              The case stays readable while editing actions wait for this operation to finish.
+            </div>
+          </div>
+        </div>
+      )}
+
       <Suspense fallback={<Spinner label="Loading…" />}>
-        <Outlet />
+        <div aria-busy={caseBusy}>
+          <Outlet />
+        </div>
       </Suspense>
     </div>
   );

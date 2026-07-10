@@ -12,6 +12,7 @@ import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
@@ -30,6 +31,7 @@ from app.store.database import (
 
 REGISTRY_FILE = "registry.json"
 _CASE_ID_RE = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
+_REGISTRY_LOCK = RLock()
 
 
 def _registry_path() -> Path:
@@ -37,15 +39,19 @@ def _registry_path() -> Path:
 
 
 def _load_registry() -> dict:
-    path = _registry_path()
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return {"cases": {}}
+    with _REGISTRY_LOCK:
+        path = _registry_path()
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return {"cases": {}}
 
 
 def _save_registry(data: dict) -> None:
-    path = _registry_path()
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    with _REGISTRY_LOCK:
+        path = _registry_path()
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        os.replace(temp, path)
 
 
 def _remove_readonly(func, path, _exc_info) -> None:
@@ -81,19 +87,20 @@ def create_case(name: str, description: str = "") -> dict:
 
     init_db(str(case_db_path(case_id)))
 
-    registry = _load_registry()
-    registry["cases"][case_id] = {
-        "id": case_id,
-        "name": name,
-        "description": description,
-        "status": "created",
-        "created_at": now,
-        "updated_at": now,
-        "has_memory_dump": False,
-        "ai_summary": None,
-    }
-    _save_registry(registry)
-    return registry["cases"][case_id]
+    with _REGISTRY_LOCK:
+        registry = _load_registry()
+        registry["cases"][case_id] = {
+            "id": case_id,
+            "name": name,
+            "description": description,
+            "status": "created",
+            "created_at": now,
+            "updated_at": now,
+            "has_memory_dump": False,
+            "ai_summary": None,
+        }
+        _save_registry(registry)
+        return registry["cases"][case_id]
 
 
 def list_cases() -> list[dict]:
@@ -115,30 +122,33 @@ def get_case(case_id: str) -> dict | None:
 
 
 def update_case_meta(case_id: str, *, include_stats: bool = True, **kwargs) -> dict | None:
-    registry = _load_registry()
-    if case_id not in registry.get("cases", {}):
-        return None
-    registry["cases"][case_id].update(kwargs)
-    registry["cases"][case_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _save_registry(registry)
+    with _REGISTRY_LOCK:
+        registry = _load_registry()
+        if case_id not in registry.get("cases", {}):
+            return None
+        registry["cases"][case_id].update(kwargs)
+        registry["cases"][case_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _save_registry(registry)
+        meta = dict(registry["cases"][case_id])
     if not include_stats:
-        return registry["cases"][case_id]
-    return {**registry["cases"][case_id], **get_case_stats(case_id)}
+        return meta
+    return {**meta, **get_case_stats(case_id)}
 
 
 def delete_case(case_id: str) -> bool:
-    registry = _load_registry()
-    if case_id not in registry.get("cases", {}):
-        return False
+    with _REGISTRY_LOCK:
+        registry = _load_registry()
+        if case_id not in registry.get("cases", {}):
+            return False
 
-    case_dir = get_cases_dir() / case_id
-    dispose_db(case_db_path(case_id))
-    if case_dir.exists():
-        _rmtree_with_retries(case_dir)
+        case_dir = get_cases_dir() / case_id
+        dispose_db(case_db_path(case_id))
+        if case_dir.exists():
+            _rmtree_with_retries(case_dir)
 
-    del registry["cases"][case_id]
-    _save_registry(registry)
-    return True
+        del registry["cases"][case_id]
+        _save_registry(registry)
+        return True
 
 
 def get_session(case_id: str) -> Session:

@@ -34,7 +34,8 @@ export function EntityDossierPanel({
   const [tab, setTab] = useState<"trace" | "relations" | "memory" | "ai">("trace");
   const { data, isLoading } = useQuery({
     queryKey: ["entity-dossier", caseId, entityId],
-    queryFn: () => api.getEntityDossier(caseId, entityId),
+    queryFn: ({ signal }) => api.getEntityDossier(caseId, entityId, signal),
+    staleTime: 30_000,
   });
   const hasMemoryProcesses = Boolean(data?.memory_processes?.length);
   const tabs: Array<"trace" | "relations" | "memory" | "ai"> = [

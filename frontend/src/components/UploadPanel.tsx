@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Upload, HardDrive, FileArchive, Loader2, X } from "lucide-react";
-import { api, uploadFile, wsUrl } from "../lib/api";
-import type { Progress } from "../lib/types";
+import { uploadFile, wsUrl } from "../lib/api";
+import type { CaseStatus, Progress } from "../lib/types";
 
-export function UploadPanel({ caseId }: { caseId: string }) {
+export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseStatus }) {
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
@@ -15,6 +15,7 @@ export function UploadPanel({ caseId }: { caseId: string }) {
   });
   const [progress, setProgress] = useState<Progress | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [error, setError] = useState("");
   const wsRef = useRef<WebSocket | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -36,7 +37,9 @@ export function UploadPanel({ caseId }: { caseId: string }) {
   }, [caseId, qc]);
 
   async function handleFiles(files: FileList | null) {
-    if (!files || files.length === 0) return;
+    if (!files || files.length === 0 || status === "ingesting" || status === "analyzing") return;
+    setError("");
+    let succeeded = true;
     for (const file of Array.from(files)) {
       const isMemory =
         fileType === "memory" ||
@@ -50,21 +53,31 @@ export function UploadPanel({ caseId }: { caseId: string }) {
           (pct) => setUploadPct(pct),
           isMemory ? memoryOptions : {},
         );
+      } catch (err) {
+        succeeded = false;
+        setError(err instanceof Error ? err.message : "Upload failed");
+        break;
       } finally {
         setUploadPct(null);
       }
     }
-    setOpen(false);
+    if (succeeded) setOpen(false);
     qc.invalidateQueries({ queryKey: ["case", caseId] });
   }
 
   const busy =
     uploadPct !== null ||
     (progress && !progress.done && progress.phase !== "idle");
+  const blocked = status === "ingesting" || status === "analyzing";
 
   return (
     <>
-      <button className="btn-primary" onClick={() => setOpen(true)}>
+      <button
+        className="btn-primary"
+        onClick={() => setOpen(true)}
+        disabled={blocked || Boolean(busy)}
+        title={blocked ? "Wait for the current case operation to finish" : "Upload evidence"}
+      >
         <Upload size={16} /> Upload evidence
       </button>
 
@@ -205,6 +218,11 @@ export function UploadPanel({ caseId }: { caseId: string }) {
                 <div className="h-1.5 bg-base-900 rounded-full overflow-hidden">
                   <div className="h-full bg-accent-cyan transition-all" style={{ width: `${uploadPct}%` }} />
                 </div>
+              </div>
+            )}
+            {error && (
+              <div className="mt-4 rounded-xl border border-sev-high/30 bg-sev-high/10 px-3 py-2 text-xs text-sev-high" role="alert">
+                {error}
               </div>
             )}
           </div>

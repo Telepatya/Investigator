@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import type { ReactNode } from "react";
 import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -71,7 +71,7 @@ const SEVERITY_RANK: Record<Severity, number> = {
   critical: 4,
 };
 
-function EntityNodeCard({ data }: { data: any }) {
+const EntityNodeCard = memo(function EntityNodeCard({ data }: { data: any }) {
   const sev = data.severity as Severity;
   const active = sev !== "info";
   const color = SEVERITY_COLORS[sev];
@@ -138,7 +138,7 @@ function EntityNodeCard({ data }: { data: any }) {
       </div>
     </div>
   );
-}
+});
 
 const nodeTypes = { entity: EntityNodeCard };
 
@@ -159,15 +159,17 @@ export default function EntityMapPage() {
   // instant instead of waiting on a slow graph rebuild for each threshold.
   const maxNodes = focusActive ? 600 : 250;
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isFetching } = useQuery({
     queryKey: ["entities", caseId, maxNodes],
-    queryFn: () => api.getEntities(caseId!, { min_severity: "info", max_nodes: maxNodes }),
+    queryFn: ({ signal }) => api.getEntities(caseId!, { min_severity: "info", max_nodes: maxNodes }, signal),
     enabled: !!caseId,
     placeholderData: (prev) => prev,
   });
 
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [mapReady, setMapReady] = useState(false);
+  const [, startLayoutTransition] = useTransition();
   const rfRef = useRef<ReactFlowInstance | null>(null);
 
   const deadCount = useMemo(
@@ -227,18 +229,39 @@ export default function EntityMapPage() {
     const keepEdges = data.edges.filter((e) => keep.has(e.source) && keep.has(e.target));
     return { nodes: keepNodes, edges: keepEdges };
   }, [data, activeTypes, showTerminated, focusView, minSeverity]);
+  const layoutInput = useMemo(
+    () => filtered ? { graph: filtered, focusId, hiddenNeighbors: focusView?.hiddenNeighbors } : null,
+    [filtered, focusId, focusView],
+  );
+  const deferredLayoutInput = useDeferredValue(layoutInput);
 
   useEffect(() => {
-    if (!filtered) return;
-    const { nodes: n, edges: e } = layoutGraph(filtered.nodes, filtered.edges, {
-      focusId,
-      hiddenNeighbors: focusView?.hiddenNeighbors,
+    if (!deferredLayoutInput) return;
+    setMapReady(false);
+    let fitFrame = 0;
+    const layoutFrame = requestAnimationFrame(() => {
+      const { nodes: nextNodes, edges: nextEdges } = layoutGraph(
+        deferredLayoutInput.graph.nodes,
+        deferredLayoutInput.graph.edges,
+        {
+          focusId: deferredLayoutInput.focusId,
+          hiddenNeighbors: deferredLayoutInput.hiddenNeighbors,
+        },
+      );
+      startLayoutTransition(() => {
+        setNodes(nextNodes);
+        setEdges(nextEdges);
+        setMapReady(true);
+      });
+      fitFrame = requestAnimationFrame(() =>
+        rfRef.current?.fitView({ padding: 0.2, duration: nextNodes.length === 0 ? 0 : 180 }),
+      );
     });
-    setNodes(n);
-    setEdges(e);
-    // Reframe after positions apply so the focused subgraph re-centers.
-    requestAnimationFrame(() => rfRef.current?.fitView({ padding: 0.2, duration: 300 }));
-  }, [filtered, focusId, focusView, setNodes, setEdges]);
+    return () => {
+      cancelAnimationFrame(layoutFrame);
+      cancelAnimationFrame(fitFrame);
+    };
+  }, [deferredLayoutInput, setNodes, setEdges, startLayoutTransition]);
 
   const clearFocus = useCallback(() => {
     setFocusId(null);
@@ -361,7 +384,13 @@ export default function EntityMapPage() {
         </div>
       )}
 
-      <div className="card overflow-hidden p-0" style={{ height: 680 }}>
+      <div className="card relative overflow-hidden p-0" style={{ height: 680 }} aria-busy={!mapReady || isFetching}>
+        {(!mapReady || isFetching) && (
+          <div className="pointer-events-none absolute right-4 top-4 z-10 inline-flex items-center gap-2 rounded-full border border-[rgb(var(--border)/0.7)] bg-[rgb(var(--panel-strong)/0.88)] px-3 py-2 text-xs text-ink-300 shadow-sm backdrop-blur-xl">
+            <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent-blue/25 border-t-accent-blue" />
+            {mapReady ? "Updating map..." : "Arranging entities..."}
+          </div>
+        )}
         <ReactFlow
           nodes={nodes}
           edges={edges}
@@ -374,6 +403,7 @@ export default function EntityMapPage() {
           fitView
           minZoom={0.1}
           defaultEdgeOptions={{ type: "smoothstep" }}
+          onlyRenderVisibleElements
           proOptions={{ hideAttribution: true }}
         >
           <Background color="rgb(var(--graph-grid))" gap={22} />
@@ -461,7 +491,8 @@ function layoutGraph(
     for (const id of nb) sum += rowOf.get(id) ?? 0;
     return sum / nb.length;
   };
-  for (let pass = 0; pass < 6; pass++) {
+  const orderingPasses = nodes.length > 400 ? 3 : 4;
+  for (let pass = 0; pass < orderingPasses; pass++) {
     const sweep = pass % 2 === 0 ? colKeys : [...colKeys].reverse();
     for (const key of sweep) {
       const col = layers[key];
@@ -501,6 +532,8 @@ function layoutGraph(
     });
   });
 
+  const animateRiskEdges = edges.length <= 120;
+  const showEdgeLabels = edges.length <= 180;
   const flowEdges: Edge[] = edges.map((e, i) => {
     const active = e.severity !== "info";
     const color = SEVERITY_COLORS[e.severity];
@@ -510,9 +543,9 @@ function layoutGraph(
       target: e.target,
       sourceHandle: "right",
       targetHandle: "left",
-      label: e.count > 1 ? `${e.verb} (${e.count})` : e.verb,
+      label: showEdgeLabels ? (e.count > 1 ? `${e.verb} (${e.count})` : e.verb) : undefined,
       type: "smoothstep",
-      animated: e.severity === "critical" || e.severity === "high",
+      animated: animateRiskEdges && (e.severity === "critical" || e.severity === "high"),
       labelStyle: { fill: "rgb(var(--ink-300))", fontSize: 10, fontWeight: 600 },
       labelBgStyle: { fill: "rgb(var(--panel-strong))", fillOpacity: 0.88 },
       labelBgPadding: [8, 4],

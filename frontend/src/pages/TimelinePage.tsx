@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { Timeline } from "vis-timeline/standalone";
@@ -23,7 +23,8 @@ export default function TimelinePage() {
   const { caseId } = useParams();
   const containerRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<Timeline | null>(null);
-  const [selected, setSelected] = useState<TimelineEvt | null>(null);
+  const eventsRef = useRef<TimelineEvt[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
   const [minSeverity, setMinSeverity] = useState<Severity>("info");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -54,7 +55,7 @@ export default function TimelinePage() {
       Array.from(disabledSources).sort().join("|"),
       Array.from(disabledCategories).sort().join("|"),
     ],
-    queryFn: () =>
+    queryFn: ({ signal }) =>
       api.getTimeline(caseId!, {
         ...(debouncedSearch ? { q: debouncedSearch } : {}),
         ...(minSeverity !== "info" ? { min_severity: minSeverity } : {}),
@@ -74,18 +75,19 @@ export default function TimelinePage() {
                 .join(","),
             }
           : {}),
-      }),
+        include_facets: sourcesRef.current.length === 0 || categoriesRef.current.length === 0,
+      }, signal),
     placeholderData: keepPreviousData,
   });
 
   useEffect(() => {
-    if (data?.sources) sourcesRef.current = data.sources;
-    if (data?.categories) categoriesRef.current = data.categories;
+    if (data?.sources?.length) sourcesRef.current = data.sources;
+    if (data?.categories?.length) categoriesRef.current = data.categories;
   }, [data]);
 
   const events = useMemo(() => data?.events ?? [], [data]);
-  const sources = data?.sources ?? [];
-  const categories = data?.categories ?? [];
+  const sources = data?.sources?.length ? data.sources : sourcesRef.current;
+  const categories = data?.categories?.length ? data.categories : categoriesRef.current;
   const total = data?.total ?? 0;
   const totalMatching = data?.total_matching ?? 0;
   const hasFilters =
@@ -112,66 +114,96 @@ export default function TimelinePage() {
     });
   };
 
+  const selectedSummary = useMemo(
+    () => events.find((event) => event.id === selectedId) ?? null,
+    [events, selectedId],
+  );
+  const { data: selectedEvent, isFetching: selectedEventLoading } = useQuery({
+    queryKey: ["event-detail", caseId, selectedId],
+    queryFn: ({ signal }) => api.getEvent(caseId!, selectedId!, signal),
+    enabled: !!caseId && selectedId !== null,
+    staleTime: 60_000,
+  });
+  const selected: TimelineEvt | null = selectedEvent
+    ? {
+        id: selectedEvent.id,
+        start: selectedEvent.timestamp,
+        content: selectedEvent.summary,
+        group: selectedEvent.category,
+        severity: selectedEvent.severity,
+        severity_reason: selectedEvent.severity_reason,
+        source: selectedEvent.source,
+        raw: selectedEvent.raw,
+      }
+    : selectedSummary;
+
   useEffect(() => {
-    setTimelineReady(false);
-    if (!containerRef.current || events.length === 0) {
-      setTimelineReady(true);
-      return;
-    }
+    eventsRef.current = events;
+  }, [events]);
 
-    const groups = new DataSet(
-      Array.from(new Set(events.map((e) => e.group))).map((g) => ({
-        id: g,
-        content: g,
-      })),
-    );
-
-    const items = new DataSet(
-      events
-        .filter((e) => e.start)
-        .map((e) => ({
-          id: e.id,
-          content: itemHtml(e),
-          start: e.start as string,
-          group: e.group,
-          type: "box",
-          style: `background-color: rgb(var(--panel-strong)); color: rgb(var(--ink-50)); border-color:${SEVERITY_COLORS[e.severity]}66;`,
-        })),
-    );
-
-    const timeline = new Timeline(containerRef.current, items, groups, {
+  useEffect(() => {
+    if (isLoading || !containerRef.current || timelineRef.current) return;
+    const timeline = new Timeline(containerRef.current, new DataSet([]), new DataSet([]), {
       stack: true,
+      cluster: { maxItems: 8, fitOnDoubleClick: true },
       maxHeight: 460,
       minHeight: 460,
-      margin: { item: { horizontal: 14, vertical: 12 } },
+      margin: { item: { horizontal: 12, vertical: 10 } },
       zoomKey: "ctrlKey",
       orientation: "top",
+      showTooltips: false,
     });
-
-    let cancelled = false;
-    const revealTimeline = () => {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (!cancelled) setTimelineReady(true);
-        });
-      });
+    const onDoubleClick = (props: { item?: string | number | null }) => {
+      if (typeof props.item !== "number") return;
+      if (eventsRef.current.some((event) => event.id === props.item)) {
+        setSelectedId(props.item);
+      }
     };
-    const fallback = window.setTimeout(revealTimeline, 180);
-    timeline.on("changed", revealTimeline);
-
-    timeline.on("doubleClick", (props) => {
-      const id = props.item;
-      const evt = events.find((e) => e.id === id);
-      if (evt) setSelected(evt);
-    });
-
+    timeline.on("doubleClick", onDoubleClick);
     timelineRef.current = timeline;
     return () => {
-      cancelled = true;
-      window.clearTimeout(fallback);
-      timeline.off("changed", revealTimeline);
+      timeline.off("doubleClick", onDoubleClick);
       timeline.destroy();
       timelineRef.current = null;
+    };
+  }, [isLoading]);
+
+  useEffect(() => {
+    const timeline = timelineRef.current;
+    if (!timeline) return;
+    setTimelineReady(events.length === 0);
+    let cancelled = false;
+    let fallback = 0;
+    const frame = requestAnimationFrame(() => {
+      if (cancelled) return;
+      const groups = new DataSet(
+        Array.from(new Set(events.map((event) => event.group))).map((group) => ({
+          id: group,
+          content: laneLabel(group),
+        })),
+      );
+      const items = new DataSet(
+        events.filter((event) => event.start).map((event) => ({
+          id: event.id,
+          content: itemHtml(event),
+          start: event.start as string,
+          group: event.group,
+          type: "box",
+          style: `background-color: rgb(var(--panel-strong)); color: rgb(var(--ink-50)); border-color:${SEVERITY_COLORS[event.severity]}66;`,
+        })),
+      );
+      const reveal = () => {
+        if (!cancelled) setTimelineReady(true);
+        timeline.off("changed", reveal);
+      };
+      timeline.on("changed", reveal);
+      fallback = window.setTimeout(reveal, 220);
+      timeline.setData({ groups, items });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+      window.clearTimeout(fallback);
     };
   }, [events]);
 
@@ -384,8 +416,14 @@ export default function TimelinePage() {
       </section>
 
       {selected && (
-        <DetailDrawer eyebrow="Event detail" title={selected.group} onClose={() => setSelected(null)} ariaLabel="Event detail">
+        <DetailDrawer eyebrow="Event detail" title={selected.group} onClose={() => setSelectedId(null)} ariaLabel="Event detail">
           <div className="space-y-3 text-sm">
+            {selectedEventLoading && !selectedEvent && (
+              <div className="flex items-center gap-2 text-xs text-ink-400">
+                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent-blue/25 border-t-accent-blue" />
+                Loading full event details...
+              </div>
+            )}
             <div className="flex items-center gap-2">
               <SeverityBadge severity={selected.severity} />
               <span className="text-ink-400">{fmtTime(selected.start)}</span>
@@ -409,7 +447,7 @@ export default function TimelinePage() {
             </div>
             <div>
               <div className="label">Raw evidence</div>
-              <CodeBlock>{JSON.stringify(selected.raw, null, 2)}</CodeBlock>
+              <CodeBlock>{selected.raw ? JSON.stringify(selected.raw, null, 2) : "Loading..."}</CodeBlock>
             </div>
             {caseId && (
               <div className="border-t border-[rgb(var(--border)/0.5)] pt-3">
@@ -430,12 +468,12 @@ export default function TimelinePage() {
   );
 }
 
-function TimelineRail({
+const TimelineRail = memo(function TimelineRail({
   events,
 }: {
   events: TimelineEvt[];
 }) {
-  const years = buildTimelineBuckets(events);
+  const years = useMemo(() => buildTimelineBuckets(events), [events]);
 
   return (
     <aside className="hidden border-r border-[rgb(var(--border)/0.65)] bg-[rgb(var(--panel-muted)/0.35)] md:block">
@@ -478,7 +516,7 @@ function TimelineRail({
       </div>
     </aside>
   );
-}
+});
 
 function buildTimelineBuckets(events: TimelineEvt[]) {
   const yearMap = new Map<number, Map<number, Map<string, number>>>();

@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from threading import Event as ThreadEvent, Thread
 from unittest.mock import patch
 
 
@@ -85,6 +86,52 @@ class CaseStoreTests(unittest.TestCase):
 
         self.assertIn(db_path, database._ENGINE_CACHE)
         self.assertEqual(len(database._ENGINE_CACHE), 1)
+
+    def test_case_writes_are_serialized_until_commit(self) -> None:
+        case = cases.create_case("serialized writes")
+        first = cases.get_session(case["id"])
+        first.add(Event(
+            timestamp=None, host=None, source="first", category="test",
+            entity=None, severity="info", summary="first writer", raw={},
+        ))
+        first.flush()
+
+        started = ThreadEvent()
+        flushed = ThreadEvent()
+        errors: list[Exception] = []
+
+        def second_writer() -> None:
+            session = cases.get_session(case["id"])
+            try:
+                session.add(Event(
+                    timestamp=None, host=None, source="second", category="test",
+                    entity=None, severity="info", summary="second writer", raw={},
+                ))
+                started.set()
+                session.flush()
+                flushed.set()
+                session.commit()
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+            finally:
+                session.close()
+
+        worker = Thread(target=second_writer, daemon=True)
+        worker.start()
+        self.assertTrue(started.wait(1.0))
+        self.assertFalse(flushed.wait(0.1), "second writer should wait for the first transaction")
+        first.commit()
+        first.close()
+        self.assertTrue(flushed.wait(2.0))
+        worker.join(timeout=2.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+        session = cases.get_session(case["id"])
+        try:
+            self.assertEqual(session.query(Event).count(), 2)
+        finally:
+            session.close()
 
     def test_cleanup_orphan_case_dirs_removes_only_safe_orphans(self) -> None:
         registered = "a1b2c3d4"

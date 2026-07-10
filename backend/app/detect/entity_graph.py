@@ -9,6 +9,9 @@ web logs, process listings, network connections and memory analysis.
 from __future__ import annotations
 
 from datetime import datetime
+from functools import wraps
+from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from sqlalchemy import select
@@ -18,6 +21,31 @@ from app.store import cases as case_store
 from app.store.database import Event, Finding, Process
 
 SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+_GRAPH_CACHE: dict[tuple, tuple[tuple, dict[str, Any]]] = {}
+_GRAPH_CACHE_LOCK = Lock()
+_GRAPH_BUILD_LOCKS: dict[str, Lock] = {}
+
+
+def _serialize_graph_build(func):
+    @wraps(func)
+    def wrapped(case_id: str, *args, **kwargs):
+        with _GRAPH_CACHE_LOCK:
+            build_lock = _GRAPH_BUILD_LOCKS.setdefault(case_id, Lock())
+        with build_lock:
+            return func(case_id, *args, **kwargs)
+    return wrapped
+
+
+def _graph_fingerprint(case_id: str) -> tuple:
+    db_path = Path(case_store.case_db_path(case_id))
+    parts = []
+    for path in (db_path, Path(f"{db_path}-wal")):
+        try:
+            stat = path.stat()
+            parts.append((stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            parts.append((0, 0))
+    return tuple(parts)
 
 # Process flags that mean the process is no longer running.
 _DEAD_PROCESS_FLAGS = {"terminated", "exited"}
@@ -503,12 +531,20 @@ def _public_graph_node(node: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in node.items() if not k.startswith("_")}
 
 
+@_serialize_graph_build
 def build_entity_graph(
     case_id: str,
     entity_types: list[str] | None = None,
     min_severity: str = "info",
     max_nodes: int = 300,
 ) -> dict[str, Any]:
+    cache_key = (case_id, tuple(sorted(entity_types or ())), min_severity, max_nodes)
+    fingerprint = _graph_fingerprint(case_id)
+    with _GRAPH_CACHE_LOCK:
+        cached = _GRAPH_CACHE.get(cache_key)
+        if cached and cached[0] == fingerprint:
+            return cached[1]
+
     session = case_store.get_session(case_id)
     try:
         g = _Graph()
@@ -544,7 +580,7 @@ def build_entity_graph(
         for n in g.nodes.values():
             type_counts[n["type"]] = type_counts.get(n["type"], 0) + 1
 
-        return {
+        result = {
             "case_id": case_id,
             "nodes": nodes,
             "edges": edges,
@@ -552,10 +588,16 @@ def build_entity_graph(
             "total_edges": len(g.edges),
             "type_counts": type_counts,
         }
+        with _GRAPH_CACHE_LOCK:
+            _GRAPH_CACHE[cache_key] = (fingerprint, result)
+            if len(_GRAPH_CACHE) > 32:
+                _GRAPH_CACHE.pop(next(iter(_GRAPH_CACHE)))
+        return result
     finally:
         session.close()
 
 
+@_serialize_graph_build
 def entity_dossier(case_id: str, entity_id: str, action_limit: int = 500) -> dict[str, Any]:
     """Dynamic investigation of one entity: its chronological action trace, the
     entities it interacted with, and the findings that reference it."""

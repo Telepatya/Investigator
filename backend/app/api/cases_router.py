@@ -29,22 +29,23 @@ from app.memory.explorer import (
 from app.models.schemas import CaseCreate
 from app.store import cases as case_store
 from app.store.database import Event, Finding, MemoryResult
+from app.store.operations import coordinator
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
 
 
 @router.get("")
-async def get_cases() -> list[dict]:
+def get_cases() -> list[dict]:
     return case_store.list_cases()
 
 
 @router.post("")
-async def create_case(body: CaseCreate) -> dict:
+def create_case(body: CaseCreate) -> dict:
     return case_store.create_case(body.name, body.description)
 
 
 @router.get("/{case_id}")
-async def get_case(case_id: str) -> dict:
+def get_case(case_id: str) -> dict:
     case = case_store.get_case(case_id)
     if not case:
         raise HTTPException(404, "Case not found")
@@ -52,7 +53,7 @@ async def get_case(case_id: str) -> dict:
 
 
 @router.delete("/{case_id}")
-async def delete_case(case_id: str) -> dict:
+def delete_case(case_id: str) -> dict:
     if not case_store.delete_case(case_id):
         raise HTTPException(404, "Case not found")
     return {"ok": True}
@@ -66,7 +67,7 @@ async def upload_file(
     mem_forensic_timeline: bool = False,
     mem_eventlogs: bool = False,
 ) -> dict:
-    case = case_store.get_case(case_id)
+    case = await asyncio.to_thread(case_store.get_case, case_id)
     if not case:
         raise HTTPException(404, "Case not found")
 
@@ -100,7 +101,7 @@ async def upload_chunk(
     mem_eventlogs: bool = False,
 ) -> dict:
     """Chunked upload for multi-GB memory dumps."""
-    case = case_store.get_case(case_id)
+    case = await asyncio.to_thread(case_store.get_case, case_id)
     if not case:
         raise HTTPException(404, "Case not found")
 
@@ -125,7 +126,7 @@ async def upload_chunk(
 
 
 @router.get("/{case_id}/evidence")
-async def list_evidence(case_id: str) -> dict:
+def list_evidence(case_id: str) -> dict:
     if not case_store.get_case(case_id):
         raise HTTPException(404, "Case not found")
     return {"files": evidence_store.list_evidence(case_id)}
@@ -133,10 +134,11 @@ async def list_evidence(case_id: str) -> dict:
 
 @router.delete("/{case_id}/evidence/{name}")
 async def delete_evidence(case_id: str, name: str) -> dict:
-    if not case_store.get_case(case_id):
+    if not await asyncio.to_thread(case_store.get_case, case_id):
         raise HTTPException(404, "Case not found")
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, evidence_store.delete_evidence, case_id, name)
+    async with coordinator.run(case_id, "evidence deletion"):
+        result = await loop.run_in_executor(None, evidence_store.delete_evidence, case_id, name)
     if result is None:
         raise HTTPException(404, "Evidence file not found")
     return result
@@ -144,10 +146,11 @@ async def delete_evidence(case_id: str, name: str) -> dict:
 
 @router.post("/{case_id}/evidence/{name}/reingest")
 async def reingest_evidence(case_id: str, name: str, file_type: str = "artifact") -> dict:
-    if not case_store.get_case(case_id):
+    if not await asyncio.to_thread(case_store.get_case, case_id):
         raise HTTPException(404, "Case not found")
     loop = asyncio.get_running_loop()
-    path = await loop.run_in_executor(None, evidence_store.prepare_reingest, case_id, name)
+    async with coordinator.run(case_id, "evidence preparation"):
+        path = await loop.run_in_executor(None, evidence_store.prepare_reingest, case_id, name)
     if path is None:
         raise HTTPException(404, "Evidence file not found")
     asyncio.create_task(manager.run_ingestion(case_id, path, file_type))
@@ -184,7 +187,7 @@ async def ingestion_ws(websocket: WebSocket, case_id: str) -> None:
 # --- Data queries ---
 
 @router.get("/{case_id}/events")
-async def get_events(
+def get_events(
     case_id: str,
     q: str | None = None,
     category: str | None = None,
@@ -238,59 +241,96 @@ async def get_events(
         session.close()
 
 
+@router.get("/{case_id}/events/{event_id}")
+def get_event(case_id: str, event_id: int) -> dict:
+    session = case_store.get_session(case_id)
+    try:
+        event = session.get(Event, event_id)
+        if event is None:
+            raise HTTPException(404, "Event not found")
+        return {
+            "id": event.id,
+            "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+            "host": event.host,
+            "source": event.source,
+            "category": event.category,
+            "entity": event.entity,
+            "severity": event.severity,
+            "severity_reason": event.severity_reason,
+            "summary": event.summary,
+            "raw": event.raw,
+        }
+    finally:
+        session.close()
+
+
 _SEVERITY_LADDER = ["info", "low", "medium", "high", "critical"]
 
 
 @router.get("/{case_id}/timeline")
-async def get_timeline(
+def get_timeline(
     case_id: str,
     limit: int = 2000,
     sources: str | None = None,
     categories: str | None = None,
     q: str | None = None,
     min_severity: str = "info",
+    include_facets: bool = True,
 ) -> dict:
     session = case_store.get_session(case_id)
     try:
-        stmt = select(Event).where(Event.timestamp.isnot(None))
+        filters = [Event.timestamp.isnot(None)]
         if sources is not None:
             wanted = [s for s in sources.split(",") if s]
-            stmt = stmt.where(Event.source.in_(wanted))
+            filters.append(Event.source.in_(wanted))
         if categories is not None:
             wanted_cats = [c for c in categories.split(",") if c]
-            stmt = stmt.where(Event.category.in_(wanted_cats))
+            filters.append(Event.category.in_(wanted_cats))
         if min_severity in _SEVERITY_LADDER and min_severity != "info":
             allowed = _SEVERITY_LADDER[_SEVERITY_LADDER.index(min_severity):]
-            stmt = stmt.where(Event.severity.in_(allowed))
+            filters.append(Event.severity.in_(allowed))
         if q and q.strip():
             like = f"%{q.strip()}%"
-            stmt = stmt.where(
+            filters.append(
                 Event.summary.ilike(like)
                 | Event.entity.ilike(like)
                 | Event.source.ilike(like)
                 | Event.category.ilike(like)
                 | Event.severity_reason.ilike(like)
             )
-        total_matching = session.scalar(
-            select(func.count()).select_from(stmt.subquery())
-        ) or 0
-        events = list(session.scalars(stmt.order_by(Event.timestamp).limit(limit)))
-        # Aggregate over ALL timestamped events so the source filter always lists
-        # every evidence source, not just those inside the returned page.
-        source_rows = session.execute(
-            select(Event.source, func.count())
-            .where(Event.timestamp.isnot(None))
-            .group_by(Event.source)
-            .order_by(func.count().desc())
-        ).all()
-        # Category (type) counts drive a second filter alongside evidence sources.
-        category_rows = session.execute(
-            select(Event.category, func.count())
-            .where(Event.timestamp.isnot(None))
-            .group_by(Event.category)
-            .order_by(func.count().desc())
-        ).all()
-        total = sum(r[1] for r in source_rows)
+        stmt = select(
+            Event.id,
+            Event.timestamp,
+            Event.summary,
+            Event.category,
+            Event.severity,
+            Event.severity_reason,
+            Event.source,
+        ).where(*filters)
+        total_matching = session.scalar(select(func.count()).select_from(Event).where(*filters)) or 0
+        events = list(session.execute(stmt.order_by(Event.timestamp).limit(limit)))
+        source_rows = []
+        category_rows = []
+        if include_facets:
+            # These case-wide facets are stable across filter changes. The client
+            # requests them once, then omits them from rapid search/filter refreshes.
+            source_rows = session.execute(
+                select(Event.source, func.count())
+                .where(Event.timestamp.isnot(None))
+                .group_by(Event.source)
+                .order_by(func.count().desc())
+            ).all()
+            category_rows = session.execute(
+                select(Event.category, func.count())
+                .where(Event.timestamp.isnot(None))
+                .group_by(Event.category)
+                .order_by(func.count().desc())
+            ).all()
+            total = sum(r[1] for r in source_rows)
+        else:
+            total = session.scalar(
+                select(func.count()).select_from(Event).where(Event.timestamp.isnot(None))
+            ) or 0
         return {
             "total": total,
             "total_matching": total_matching,
@@ -305,7 +345,6 @@ async def get_timeline(
                     "severity": e.severity,
                     "severity_reason": e.severity_reason,
                     "source": e.source,
-                    "raw": e.raw,
                 }
                 for e in events
             ],
@@ -315,7 +354,7 @@ async def get_timeline(
 
 
 @router.get("/{case_id}/categories")
-async def get_categories(case_id: str) -> dict:
+def get_categories(case_id: str) -> dict:
     session = case_store.get_session(case_id)
     try:
         rows = session.execute(
@@ -327,7 +366,7 @@ async def get_categories(case_id: str) -> dict:
 
 
 @router.get("/{case_id}/findings")
-async def get_findings(case_id: str) -> dict:
+def get_findings(case_id: str) -> dict:
     session = case_store.get_session(case_id)
     try:
         findings = list(session.scalars(select(Finding)))
@@ -359,7 +398,7 @@ async def get_findings(case_id: str) -> dict:
 
 
 @router.post("/{case_id}/findings/{finding_id}/benign")
-async def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
+def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
     """Mark a single finding benign (severity -> info) or restore it."""
     benign = bool(body.get("benign", True))
     session = case_store.get_session(case_id)
@@ -376,7 +415,7 @@ async def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
 
 
 @router.post("/{case_id}/rules/disable")
-async def set_rule_disabled(case_id: str, body: dict) -> dict:
+def set_rule_disabled(case_id: str, body: dict) -> dict:
     """Disable a detection rule (all its findings -> info) or re-enable it."""
     rule_id = str(body.get("rule_id") or "").strip()
     if not rule_id:
@@ -393,7 +432,7 @@ async def set_rule_disabled(case_id: str, body: dict) -> dict:
 
 
 @router.post("/{case_id}/findings/manual")
-async def add_manual_finding(case_id: str, body: dict) -> dict:
+def add_manual_finding(case_id: str, body: dict) -> dict:
     """Analyst-created finding for an event or entity, tagged manual and
     persisted so it survives detection rebuilds."""
     from app.detect import manual
@@ -444,7 +483,7 @@ async def add_manual_finding(case_id: str, body: dict) -> dict:
 
 
 @router.delete("/{case_id}/findings/manual/{manual_id}")
-async def delete_manual_finding(case_id: str, manual_id: str) -> dict:
+def delete_manual_finding(case_id: str, manual_id: str) -> dict:
     """Remove an analyst-created finding (does not touch detector findings)."""
     from app.detect import manual
     session = case_store.get_session(case_id)
@@ -460,7 +499,7 @@ async def delete_manual_finding(case_id: str, manual_id: str) -> dict:
 
 @router.post("/{case_id}/detections/run")
 async def run_detections(case_id: str, rebuild: bool = True) -> dict:
-    if not case_store.get_case(case_id):
+    if not await asyncio.to_thread(case_store.get_case, case_id):
         raise HTTPException(404, "Case not found")
     loop = asyncio.get_running_loop()
     from app.detect.engine import run_detections_sync
@@ -484,12 +523,13 @@ async def run_detections(case_id: str, rebuild: bool = True) -> dict:
                 session.close()
         return run_detections_sync(case_id)
 
-    added = await loop.run_in_executor(None, _run)
+    async with coordinator.run(case_id, "detection rebuild"):
+        added = await loop.run_in_executor(None, _run)
     return {"ok": True, "added": added, "rebuild": rebuild}
 
 
 @router.get("/{case_id}/attack-matrix")
-async def get_attack_matrix(case_id: str) -> dict:
+def get_attack_matrix(case_id: str) -> dict:
     from app.detect.rules import MITRE_TECHNIQUE_NAMES
     session = case_store.get_session(case_id)
     try:
@@ -513,17 +553,17 @@ async def get_attack_matrix(case_id: str) -> dict:
 
 
 @router.get("/{case_id}/processes/sessions")
-async def get_process_sessions(case_id: str) -> dict:
+def get_process_sessions(case_id: str) -> dict:
     return {"sessions": list_sessions(case_id)}
 
 
 @router.get("/{case_id}/processes/tree")
-async def get_process_tree(case_id: str, session_id: str | None = None) -> dict:
+def get_process_tree(case_id: str, session_id: str | None = None) -> dict:
     return build_tree(case_id, session_id)
 
 
 @router.get("/{case_id}/processes/{session_id}/{pid}")
-async def get_process_dossier(case_id: str, session_id: str, pid: int) -> dict:
+def get_process_dossier(case_id: str, session_id: str, pid: int) -> dict:
     dossier = process_dossier(case_id, session_id, pid)
     if not dossier:
         raise HTTPException(404, "Process not found")
@@ -531,7 +571,7 @@ async def get_process_dossier(case_id: str, session_id: str, pid: int) -> dict:
 
 
 @router.get("/{case_id}/entities")
-async def get_entities(
+def get_entities(
     case_id: str,
     types: str | None = None,
     min_severity: str = "info",
@@ -542,7 +582,7 @@ async def get_entities(
 
 
 @router.get("/{case_id}/entity-dossier")
-async def get_entity_dossier(case_id: str, entity_id: str) -> dict:
+def get_entity_dossier(case_id: str, entity_id: str) -> dict:
     dossier = entity_dossier(case_id, entity_id)
     if not dossier:
         raise HTTPException(404, "Entity not found")
@@ -550,7 +590,7 @@ async def get_entity_dossier(case_id: str, entity_id: str) -> dict:
 
 
 @router.get("/{case_id}/memory")
-async def get_memory_results(case_id: str, plugin: str | None = None) -> dict:
+def get_memory_results(case_id: str, plugin: str | None = None) -> dict:
     session = case_store.get_session(case_id)
     try:
         stmt = select(MemoryResult)
@@ -576,14 +616,14 @@ async def get_memory_results(case_id: str, plugin: str | None = None) -> dict:
 
 
 @router.get("/{case_id}/memory/dumps")
-async def get_memory_dumps(case_id: str) -> dict:
+def get_memory_dumps(case_id: str) -> dict:
     if not case_store.get_case(case_id):
         raise HTTPException(404, "Case not found")
     return {"dumps": list_memory_dumps(case_id)}
 
 
 @router.get("/{case_id}/memory/{session_id}/vfs")
-async def get_memory_vfs(case_id: str, session_id: str, path: str = "/") -> dict:
+def get_memory_vfs(case_id: str, session_id: str, path: str = "/") -> dict:
     if not case_store.get_case(case_id):
         raise HTTPException(404, "Case not found")
     try:
@@ -593,7 +633,7 @@ async def get_memory_vfs(case_id: str, session_id: str, path: str = "/") -> dict
 
 
 @router.get("/{case_id}/memory/{session_id}/vfs/download")
-async def download_memory_vfs_file(case_id: str, session_id: str, path: str) -> FileResponse:
+def download_memory_vfs_file(case_id: str, session_id: str, path: str) -> FileResponse:
     if not case_store.get_case(case_id):
         raise HTTPException(404, "Case not found")
     try:
@@ -604,7 +644,7 @@ async def download_memory_vfs_file(case_id: str, session_id: str, path: str) -> 
 
 
 @router.post("/{case_id}/memory/{session_id}/vfs/archive")
-async def archive_memory_vfs(case_id: str, session_id: str, body: dict) -> FileResponse:
+def archive_memory_vfs(case_id: str, session_id: str, body: dict) -> FileResponse:
     if not case_store.get_case(case_id):
         raise HTTPException(404, "Case not found")
     paths = body.get("paths") if isinstance(body, dict) else None
@@ -618,7 +658,7 @@ async def archive_memory_vfs(case_id: str, session_id: str, body: dict) -> FileR
 
 
 @router.get("/{case_id}/memory/{session_id}/processes/{pid}/modules")
-async def get_memory_process_modules(case_id: str, session_id: str, pid: int) -> dict:
+def get_memory_process_modules(case_id: str, session_id: str, pid: int) -> dict:
     if not case_store.get_case(case_id):
         raise HTTPException(404, "Case not found")
     try:
@@ -628,7 +668,7 @@ async def get_memory_process_modules(case_id: str, session_id: str, pid: int) ->
 
 
 @router.get("/{case_id}/memory/{session_id}/processes/{pid}/handles")
-async def get_memory_process_handles(
+def get_memory_process_handles(
     case_id: str,
     session_id: str,
     pid: int,
@@ -645,7 +685,7 @@ async def get_memory_process_handles(
 
 
 @router.get("/{case_id}/memory/{session_id}/processes/{pid}/download")
-async def download_memory_process(case_id: str, session_id: str, pid: int, kind: str = "image") -> FileResponse:
+def download_memory_process(case_id: str, session_id: str, pid: int, kind: str = "image") -> FileResponse:
     if not case_store.get_case(case_id):
         raise HTTPException(404, "Case not found")
     try:
@@ -656,7 +696,7 @@ async def download_memory_process(case_id: str, session_id: str, pid: int, kind:
 
 
 @router.get("/{case_id}/memory/{session_id}/processes/{pid}/modules/download")
-async def download_memory_process_module(
+def download_memory_process_module(
     case_id: str,
     session_id: str,
     pid: int,

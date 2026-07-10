@@ -60,7 +60,7 @@ export interface TimelineEvt {
   severity: Severity;
   severity_reason: string | null;
   source: string;
-  raw: Record<string, unknown>;
+  raw?: Record<string, unknown>;
 }
 
 export interface Finding {
