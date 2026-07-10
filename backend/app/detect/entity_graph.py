@@ -948,7 +948,6 @@ def _public(node: dict[str, Any]) -> dict[str, Any]:
 
 def _event_mentions(node: dict[str, Any], ev: Event) -> bool:
     val = node["value"].lower()
-    base = _basename(node["value"]).lower()
     raw = ev.raw or {}
     if node["type"] == "ip":
         for k in ("client_ip", "IpAddress", "SourceIp", "Raddr", "ForeignAddr", "DestinationIp"):
