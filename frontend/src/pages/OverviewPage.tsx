@@ -2,17 +2,20 @@ import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
-  AlertTriangle,
   Cpu,
-  ShieldAlert,
-  Sparkles,
+  FileText,
+  FolderOpen,
   HardDrive,
+  NotebookPen,
+  Radar,
+  ShieldCheck,
+  Zap,
 } from "lucide-react";
 import { api } from "../lib/api";
-import { StatCard, Section, Spinner } from "../components/common";
+import { MetricCard, PageShell, Section, SeverityBadge, Spinner } from "../components/common";
 import { AttackMatrix } from "../components/AttackMatrix";
-import { SEVERITY_ORDER } from "../lib/ui";
-import type { Finding, Severity } from "../lib/types";
+import { SEVERITY_COLORS, SEVERITY_ORDER, fmtRelative, fmtTime } from "../lib/ui";
+import type { EvidenceFile, Finding, Severity, TimelineEvt } from "../lib/types";
 
 export default function OverviewPage() {
   const { caseId } = useParams();
@@ -28,162 +31,186 @@ export default function OverviewPage() {
     queryKey: ["report", caseId],
     queryFn: () => api.getReport(caseId!),
   });
+  const { data: evidenceData } = useQuery({
+    queryKey: ["evidence", caseId],
+    queryFn: () => api.listEvidence(caseId!),
+  });
+  const { data: timelineData } = useQuery({
+    queryKey: ["timeline", caseId, "overview"],
+    queryFn: () => api.getTimeline(caseId!, { limit: 6 }),
+  });
 
-  const findings = findingsData?.findings ?? [];
+  const findings = findingsData?.findings.filter((f) => !f.suppressed) ?? [];
+  const evidence = evidenceData?.files ?? [];
   const counts = countSeverities(findings);
-  const worst = worstSeverity(findings);
 
   return (
-    <div className="space-y-5">
-      <VerdictBanner worst={worst} counts={counts} summary={report?.summary} />
-
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard
+    <PageShell>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-5">
+        <MetricCard
           label="Events"
           value={(c?.event_count ?? 0).toLocaleString()}
-          icon={<Activity size={20} />}
-          accent="#22d3ee"
-        />
-        <StatCard
-          label="Findings"
-          value={c?.finding_count ?? 0}
-          icon={<AlertTriangle size={20} />}
-          accent="#f97316"
-        />
-        <StatCard
-          label="Processes"
-          value={c?.process_count ?? 0}
-          icon={<Cpu size={20} />}
-          accent="#8b5cf6"
-        />
-        <StatCard
-          label="Memory dump"
-          value={c?.has_memory_dump ? "Yes" : "No"}
-          icon={<HardDrive size={20} />}
+          icon={<Activity size={23} />}
           accent="#3b82f6"
+          trend={c ? `updated ${fmtRelative(c.updated_at)}` : "loading…"}
         />
+        <MetricCard
+          label="Findings"
+          value={c?.active_finding_count ?? findings.length}
+          icon={<FileText size={23} />}
+          accent="#a855f7"
+          trend={findings.length ? `${counts.high ?? 0} high priority` : "none active"}
+        />
+        <MetricCard label="Processes" value={(c?.process_count ?? 0).toLocaleString()} icon={<Cpu size={23} />} accent="#22c55e" trend="from process inventory" />
+        <MetricCard label="Evidence Sources" value={evidence.length} icon={<FolderOpen size={23} />} accent="#38bdf8" trend={`${sumEvents(evidence).toLocaleString()} parsed events`} />
+        <MetricCard label="Memory Artifacts" value={c?.has_memory_dump ? "Yes" : "No"} icon={<HardDrive size={23} />} accent="#a855f7" trend={c?.has_memory_dump ? "retained for review" : "not uploaded"} />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-5 gap-5">
-        <div className="lg:col-span-2 space-y-5">
-          <Section title="Severity breakdown">
-            <div className="space-y-2.5">
-              {(["critical", "high", "medium", "low", "info"] as Severity[]).map((sev) => (
-                <SeverityBar key={sev} sev={sev} count={counts[sev] ?? 0} total={findings.length} />
-              ))}
+      <div className="grid gap-5 xl:grid-cols-[1fr_1fr_1fr]">
+        <Section title="ATT&CK Coverage" className="xl:col-span-1" right={<CoverageScore findings={findings} />}>
+          <AttackMatrix caseId={caseId!} />
+        </Section>
+
+        <Section title="Recent Activity">
+          <ActivityList events={timelineData?.events ?? []} evidence={evidence} />
+        </Section>
+
+        <Section title="Top Findings" right={<span className="chip text-ink-300">{findings.length}</span>}>
+          <TopFindings findings={findings} />
+        </Section>
+      </div>
+
+      <div className="grid gap-5 xl:grid-cols-[0.9fr_1.8fr_1fr]">
+        <Section title="Analyst Notes">
+          <div className="flex gap-4">
+            <div className="grid h-12 w-12 shrink-0 place-items-center rounded-2xl bg-accent-violet/10 text-accent-violet">
+              <NotebookPen size={22} />
             </div>
-          </Section>
-        </div>
-        <div className="lg:col-span-3">
-          <Section title="MITRE ATT&CK coverage">
-            <AttackMatrix caseId={caseId!} />
-          </Section>
-        </div>
+            <div className="text-sm leading-relaxed text-ink-200">
+              {report?.summary
+                ? truncate(report.summary, 260)
+                : "Initial triage is waiting for AI analysis. Upload evidence and run analysis to generate a concise analyst summary."}
+              <div className="mt-4 text-xs text-ink-400">
+                AI-generated summary · {c ? fmtTime(c.updated_at) : "not available"}
+              </div>
+            </div>
+          </div>
+        </Section>
+
+        <Section title="Case Timeline">
+          <CompactTimeline events={timelineData?.events ?? []} />
+        </Section>
+
+        <Section title={`Evidence (${evidence.length})`}>
+          <EvidenceList files={evidence} />
+        </Section>
       </div>
 
-      {isLoading && <Spinner label="Loading findings…" />}
-    </div>
+      {isLoading && <Spinner label="Loading findings..." />}
+    </PageShell>
   );
 }
 
-function VerdictBanner({
-  worst,
-  counts,
-  summary,
-}: {
-  worst: Severity | null;
-  counts: Record<string, number>;
-  summary?: string;
-}) {
-  const compromised = worst === "critical" || worst === "high";
-  const label = !worst
-    ? "No findings yet"
-    : compromised
-      ? "Likely compromised"
-      : worst === "medium"
-        ? "Suspicious activity"
-        : "No strong indicators";
-  const color = !worst
-    ? "#64748b"
-    : compromised
-      ? "#ef4444"
-      : worst === "medium"
-        ? "#eab308"
-        : "#10b981";
+function CoverageScore({ findings }: { findings: Finding[] }) {
+  const techniques = new Set(findings.flatMap((f) => f.mitre_techniques));
+  return (
+    <span className="chip text-accent-blue">
+      {techniques.size} technique{techniques.size === 1 ? "" : "s"}
+    </span>
+  );
+}
+
+function ActivityList({ events, evidence }: { events: TimelineEvt[]; evidence: EvidenceFile[] }) {
+  const rows = [
+    ...evidence.slice(0, 2).map((f) => ({
+      icon: <FolderOpen size={15} />,
+      title: `Evidence uploaded: ${f.name}`,
+      sub: `${f.kind} - ${fmtRelative(f.uploaded_at)}`,
+      sev: "info" as Severity,
+    })),
+    ...events.slice(0, 3).map((e) => ({
+      icon: <Radar size={15} />,
+      title: e.content,
+      sub: `${e.group} - ${fmtRelative(e.start)}`,
+      sev: e.severity,
+    })),
+  ].slice(0, 5);
+
+  if (!rows.length) return <div className="py-8 text-center text-sm text-ink-300">No recent activity yet.</div>;
 
   return (
-    <div
-      className="card p-6 relative overflow-hidden"
-      style={{ borderColor: `${color}40` }}
-    >
-      <div
-        className="absolute inset-0 opacity-[0.07]"
-        style={{ background: `radial-gradient(600px 200px at 0% 0%, ${color}, transparent)` }}
-      />
-      <div className="relative flex items-start gap-4">
-        <div
-          className="grid place-items-center w-12 h-12 rounded-xl shrink-0"
-          style={{ background: `${color}20`, color }}
-        >
-          <ShieldAlert size={24} />
-        </div>
-        <div className="flex-1">
-          <div className="text-xs uppercase tracking-widest text-ink-400">Verdict</div>
-          <div className="text-2xl font-bold mt-0.5" style={{ color }}>
-            {label}
+    <div className="space-y-3">
+      {rows.map((row, i) => (
+        <div key={i} className="flex items-start gap-3">
+          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-2xl bg-[rgb(var(--panel-muted)/0.9)] text-accent-blue">
+            {row.icon}
           </div>
-          {summary ? (
-            <p className="text-sm text-ink-200 mt-3 leading-relaxed whitespace-pre-wrap">
-              {summary.length > 600 ? summary.slice(0, 600) + "…" : summary}
-            </p>
-          ) : (
-            <p className="text-sm text-ink-400 mt-3 flex items-center gap-2">
-              <Sparkles size={14} /> Run AI analysis to generate an executive summary.
-            </p>
-          )}
-          <div className="flex gap-2 mt-4 flex-wrap">
-            {(["critical", "high", "medium"] as Severity[]).map(
-              (s) =>
-                (counts[s] ?? 0) > 0 && (
-                  <span
-                    key={s}
-                    className="chip"
-                    style={{
-                      background: `${sevColor(s)}20`,
-                      color: sevColor(s),
-                    }}
-                  >
-                    {counts[s]} {s}
-                  </span>
-                ),
-            )}
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-semibold text-ink-100" title={row.title}>{row.title}</div>
+            <div className="text-xs text-ink-300">{row.sub}</div>
           </div>
+          <span className="mt-3 h-2 w-2 rounded-full" style={{ background: SEVERITY_COLORS[row.sev] }} />
         </div>
-      </div>
+      ))}
     </div>
   );
 }
 
-function SeverityBar({ sev, count, total }: { sev: Severity; count: number; total: number }) {
-  const pct = total > 0 ? (count / total) * 100 : 0;
+function TopFindings({ findings }: { findings: Finding[] }) {
+  const top = [...findings].sort((a, b) => SEVERITY_ORDER[b.severity] - SEVERITY_ORDER[a.severity]).slice(0, 5);
+  if (!top.length) return <div className="py-8 text-center text-sm text-ink-300">No findings detected.</div>;
   return (
-    <div>
-      <div className="flex items-center justify-between text-xs mb-1">
-        <span className="capitalize text-ink-200">{sev}</span>
-        <span className="text-ink-400">{count}</span>
-      </div>
-      <div className="h-2 bg-base-900 rounded-full overflow-hidden">
-        <div
-          className="h-full rounded-full transition-all"
-          style={{ width: `${pct}%`, background: sevColor(sev) }}
-        />
-      </div>
+    <div className="space-y-3">
+      {top.map((f) => (
+        <div key={f.id} className="grid grid-cols-[1fr_auto] items-center gap-3">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-ink-100" title={f.title}>{f.title}</div>
+            <div className="text-xs text-ink-300">{f.mitre_techniques.slice(0, 2).join(", ") || f.source}</div>
+          </div>
+          <SeverityBadge severity={f.severity} />
+        </div>
+      ))}
     </div>
   );
 }
 
-function sevColor(s: Severity): string {
-  return { critical: "#ef4444", high: "#f97316", medium: "#eab308", low: "#3b82f6", info: "#64748b" }[s];
+function CompactTimeline({ events }: { events: TimelineEvt[] }) {
+  const rows = events.slice(0, 6);
+  if (!rows.length) return <div className="py-8 text-center text-sm text-ink-300">Timeline appears after timestamped events are parsed.</div>;
+  return (
+    <div className="grid grid-cols-2 gap-4 md:grid-cols-3 xl:grid-cols-6">
+      {rows.map((event, i) => (
+        <div key={event.id} className="relative text-center">
+          {i < rows.length - 1 && <div className="absolute left-1/2 top-6 hidden h-px w-full bg-[rgb(var(--border)/0.85)] md:block" />}
+          <div className="relative mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-[rgb(var(--panel-strong))] text-accent-blue shadow-sm ring-1 ring-[rgb(var(--border)/0.7)]">
+            {event.severity === "info" ? <ShieldCheck size={20} /> : <Zap size={20} />}
+          </div>
+          <div className="mt-3 text-xs text-ink-300">{event.start ? new Date(event.start).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "No date"}</div>
+          <div className="mt-1 line-clamp-2 text-sm font-semibold text-ink-100">{event.content}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function EvidenceList({ files }: { files: EvidenceFile[] }) {
+  if (!files.length) return <div className="py-8 text-center text-sm text-ink-300">No evidence uploaded.</div>;
+  return (
+    <div className="space-y-3">
+      {files.slice(0, 5).map((f) => (
+        <div key={f.name} className="flex items-center gap-3">
+          <div className="grid h-9 w-9 shrink-0 place-items-center rounded-2xl bg-accent-blue/10 text-accent-blue">
+            <FolderOpen size={16} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-semibold text-ink-100" title={f.name}>{f.name}</div>
+            <div className="text-xs text-ink-300">{f.kind} - {fmtBytes(f.size)}</div>
+          </div>
+          <div className="text-xs text-ink-300">{fmtRelative(f.uploaded_at)}</div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function countSeverities(findings: Finding[]): Record<string, number> {
@@ -192,10 +219,22 @@ function countSeverities(findings: Finding[]): Record<string, number> {
   return c;
 }
 
-function worstSeverity(findings: Finding[]): Severity | null {
-  let worst: Severity | null = null;
-  for (const f of findings) {
-    if (!worst || SEVERITY_ORDER[f.severity] > SEVERITY_ORDER[worst]) worst = f.severity;
+function sumEvents(files: EvidenceFile[]) {
+  return files.reduce((sum, file) => sum + file.event_count, 0);
+}
+
+function truncate(text: string, max: number) {
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+function fmtBytes(n: number) {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = n;
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) {
+    value /= 1024;
+    i += 1;
   }
-  return worst;
+  return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }

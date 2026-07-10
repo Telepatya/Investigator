@@ -9,6 +9,9 @@ web logs, process listings, network connections and memory analysis.
 from __future__ import annotations
 
 from datetime import datetime
+from functools import wraps
+from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from sqlalchemy import select
@@ -18,6 +21,31 @@ from app.store import cases as case_store
 from app.store.database import Event, Finding, Process
 
 SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+_GRAPH_CACHE: dict[tuple, tuple[tuple, dict[str, Any]]] = {}
+_GRAPH_CACHE_LOCK = Lock()
+_GRAPH_BUILD_LOCKS: dict[str, Lock] = {}
+
+
+def _serialize_graph_build(func):
+    @wraps(func)
+    def wrapped(case_id: str, *args, **kwargs):
+        with _GRAPH_CACHE_LOCK:
+            build_lock = _GRAPH_BUILD_LOCKS.setdefault(case_id, Lock())
+        with build_lock:
+            return func(case_id, *args, **kwargs)
+    return wrapped
+
+
+def _graph_fingerprint(case_id: str) -> tuple:
+    db_path = Path(case_store.case_db_path(case_id))
+    parts = []
+    for path in (db_path, Path(f"{db_path}-wal")):
+        try:
+            stat = path.stat()
+            parts.append((stat.st_mtime_ns, stat.st_size))
+        except FileNotFoundError:
+            parts.append((0, 0))
+    return tuple(parts)
 
 # Process flags that mean the process is no longer running.
 _DEAD_PROCESS_FLAGS = {"terminated", "exited"}
@@ -61,6 +89,22 @@ EVENTID_VERB = {
 }
 
 
+# Raw-event keys that can carry a file path, across EVTX/Sysmon/USN/Defender/
+# memory sources. Superset of the keys the detection engine reads; used to match
+# a file-type node against every event that touched it.
+_FILE_PATH_KEYS = (
+    "DownloadedFilePath", "TargetFilename", "Target Filename", "Path", "FilePath", "FullPath",
+    "OSPath", "TargetPath", "FileName", "Filename", "ServiceFileName",
+    "ImagePath", "PathName", "Image", "NewProcessName",
+)
+
+# Max evidence-backed neighbours drawn for one manually flagged node, so a
+# flagged common value (a host, svchost.exe) cannot flood the map. Same number
+# as the stored-links cap in detect.manual.
+_MANUAL_CORRELATION_CAP = 12
+_INDEXED_MANUAL_TYPES = {"process", "file", "user", "account", "ip", "service", "host"}
+
+
 def _norm(v: Any) -> str | None:
     if v is None:
         return None
@@ -74,6 +118,44 @@ def _basename(path: str) -> str:
     p = path.replace("\\", "/").rstrip("/")
     base = p.split("/")[-1]
     return base or path
+
+
+def _normalized_path(value: str) -> str:
+    path = (value or "").strip().strip('"')
+    path = path.split("; Mtime=", 1)[0].split("; _ZoneIdentifier", 1)[0]
+    for prefix in ("\\\\?\\", "\\\\.\\", "\\??\\"):
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+            break
+    return path.replace("/", "\\").rstrip("\\").lower()
+
+
+def _has_path(value: str) -> bool:
+    return "\\" in value or "/" in value
+
+
+def _matches_pathish(target: str, candidate: Any) -> bool:
+    raw = str(candidate or "").strip()
+    if not raw:
+        return False
+    if _has_path(target):
+        return _normalized_path(raw) == _normalized_path(target)
+    return _basename(raw).lower() == _basename(target).lower()
+
+
+def _unique_basename_node(g: "_Graph", entity_type: str, value: str) -> str | None:
+    base = _basename(value).lower()
+    matches: list[str] = []
+    for node_id, candidate in g.nodes.items():
+        candidate_value = str(candidate["value"])
+        if candidate["type"] != entity_type or _basename(candidate_value).lower() != base:
+            continue
+        if _has_path(value) and _has_path(candidate_value):
+            if _normalized_path(value) == _normalized_path(candidate_value):
+                matches.append(node_id)
+            continue
+        matches.append(node_id)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _looks_like_ip(v: str) -> bool:
@@ -171,6 +253,23 @@ class _Graph:
             e["samples"].append(summary[:200])
 
 
+def _event_actors(ev: Event, raw: dict) -> dict[str, str | None]:
+    """Co-occurring actor fields of one Windows/process event. Shared by the
+    graph extractor and manual-finding correlation so the key lists cannot
+    drift apart."""
+    ip = _norm(raw.get("IpAddress") or raw.get("SourceIp") or raw.get("Raddr") or raw.get("DestinationIp"))
+    if ip and not _looks_like_ip(ip):
+        ip = None
+    return {
+        "host": _norm(raw.get("Computer") or raw.get("Hostname") or ev.host),
+        "actor": _norm(raw.get("SubjectUserName") or raw.get("User") or raw.get("AccountName")),
+        "target_user": _norm(raw.get("TargetUserName")),
+        "proc": _norm(raw.get("NewProcessName") or raw.get("Image") or raw.get("ProcessName")),
+        "parent": _norm(raw.get("ParentProcessName") or raw.get("ParentImage")),
+        "ip": ip,
+    }
+
+
 def _extract_from_event(
     g: _Graph,
     ev: Event,
@@ -210,11 +309,12 @@ def _extract_from_event(
     # Windows event log & process telemetry
     eid = str(raw.get("EventID") or "")
     verb = EVENTID_VERB.get(eid, None)
-    host = _norm(raw.get("Computer") or raw.get("Hostname") or ev.host)
-    actor = _norm(raw.get("SubjectUserName") or raw.get("User") or raw.get("AccountName"))
-    target_user = _norm(raw.get("TargetUserName"))
-    proc = _norm(raw.get("NewProcessName") or raw.get("Image") or raw.get("ProcessName"))
-    parent = _norm(raw.get("ParentProcessName") or raw.get("ParentImage"))
+    actors = _event_actors(ev, raw)
+    host = actors["host"]
+    actor = actors["actor"]
+    target_user = actors["target_user"]
+    proc = actors["proc"]
+    parent = actors["parent"]
     # EVTX 7045/4697/7036 service events (CamelCase keys) create a service node
     # just as before. Memory svcscan rows (lowercase "service" key) list *every*
     # service on the host -- surfacing all of them floods the map, so only bring
@@ -226,9 +326,7 @@ def _extract_from_event(
         service = svcscan_service
     service_state = _norm(raw.get("state") or raw.get("State")) if svcscan_service else None
     service_binary = _norm(raw.get("binary") or raw.get("Binary")) if svcscan_service else None
-    ip = _norm(raw.get("IpAddress") or raw.get("SourceIp") or raw.get("Raddr") or raw.get("DestinationIp"))
-    if ip and not _looks_like_ip(ip):
-        ip = None
+    ip = actors["ip"]
 
     host_node = g.node("host", host) if host else None
     actor_node = g.node("user", actor) if actor else None
@@ -353,6 +451,11 @@ def _attach_findings(g: _Graph, findings: list[Finding]) -> None:
 
     for f in findings:
         ev = f.evidence or {}
+        # Manual findings materialise their own node via _attach_manual_nodes so
+        # they can create one that does not exist yet; skip them here to avoid
+        # double-attaching the finding to a same-named node.
+        if ev.get("manual"):
+            continue
         candidates: set[str] = set()
         for key in ("entity", "client_ip", "parent", "process", "path", "name", "service"):
             val = ev.get(key)
@@ -391,6 +494,252 @@ def _attach_chain_edges(g: _Graph, findings: list[Finding]) -> None:
             g.bump(dst, f.severity, None, source="finding")
             g.edge(src, dst, str(edge.get("verb") or "correlated with"),
                    f.severity, None, f.title)
+
+
+def _manual_index_values(ev: Event, entity_type: str) -> set[str]:
+    raw = ev.raw or {}
+    keys: tuple[str, ...]
+    if entity_type == "process":
+        keys = ("NewProcessName", "Image", "ProcessName", "ParentProcessName", "ParentImage", "Owner", "Process")
+    elif entity_type == "file":
+        keys = _FILE_PATH_KEYS
+    elif entity_type in {"user", "account"}:
+        keys = ("user", "SubjectUserName", "TargetUserName", "User", "AccountName")
+    elif entity_type == "ip":
+        keys = ("client_ip", "IpAddress", "SourceIp", "Raddr", "ForeignAddr", "DestinationIp")
+    elif entity_type == "service":
+        keys = ("ServiceName", "Service Name", "ServiceFileName")
+    elif entity_type == "host":
+        keys = ("Computer", "Hostname")
+    else:
+        return set()
+    values = {str(raw.get(key) or "").strip() for key in keys}
+    if entity_type == "host" and ev.host:
+        values.add(ev.host.strip())
+    return {value for value in values if value}
+
+
+def _manual_event_candidates(
+    findings: list[Finding], events: list[Event]
+) -> dict[tuple[str, str], list[Event]]:
+    """Index event candidates for all manual nodes in one pass."""
+    exact: dict[str, dict[str, set[tuple[str, str]]]] = {}
+    basenames: dict[str, dict[str, set[tuple[str, str]]]] = {}
+    candidates: dict[tuple[str, str], list[Event]] = {}
+
+    for finding in findings:
+        evidence = finding.evidence or {}
+        if not evidence.get("manual"):
+            continue
+        entity_type = str(evidence.get("node_type") or "")
+        value = str(evidence.get("node_value") or "")
+        if entity_type not in _INDEXED_MANUAL_TYPES or not value:
+            continue
+        key = (entity_type, value)
+        candidates.setdefault(key, [])
+        if entity_type in {"process", "file"}:
+            if _has_path(value):
+                lookup = _normalized_path(value)
+                exact.setdefault(entity_type, {}).setdefault(lookup, set()).add(key)
+            else:
+                lookup = _basename(value).lower()
+                basenames.setdefault(entity_type, {}).setdefault(lookup, set()).add(key)
+        else:
+            exact.setdefault(entity_type, {}).setdefault(value.lower(), set()).add(key)
+
+    if not candidates:
+        return candidates
+
+    target_types = set(exact) | set(basenames)
+    for event in events:
+        matched: set[tuple[str, str]] = set()
+        for entity_type in target_types:
+            for value in _manual_index_values(event, entity_type):
+                exact_value = _normalized_path(value) if entity_type in {"process", "file"} else value.lower()
+                matched.update(exact.get(entity_type, {}).get(exact_value, ()))
+                if entity_type in {"process", "file"}:
+                    matched.update(
+                        basenames.get(entity_type, {}).get(_basename(value).lower(), ())
+                    )
+        for key in matched:
+            candidates[key].append(event)
+    return candidates
+
+
+def _correlate_manual_node(
+    g: _Graph,
+    nid: str,
+    node: dict[str, Any],
+    events: list[Event],
+    finding: Finding,
+    suppressed_event_ids: set[int],
+) -> int:
+    """Draw evidence-backed edges for a manually flagged node.
+
+    Scans every event that mentions the node's value and connects the
+    co-occurring actors: each process, user, host and remote IP that
+    demonstrably touched the flagged value. Neighbours are ranked by event
+    severity, occurrence count and recency, then capped so a flagged common
+    value cannot flood the map. Returns the number of edges drawn."""
+    val = node["value"].lower()
+    base = _basename(node["value"]).lower()
+    # (etype, value) -> {rank, count, ts, edges: {(verb, outgoing) -> (ts, summary)}}
+    neighbors: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for ev in events:
+        if not _event_mentions(node, ev):
+            continue
+        raw = ev.raw or {}
+        sev = "info" if (suppressed_event_ids and ev.id in suppressed_event_ids) else ev.severity
+        event_verb = EVENTID_VERB.get(str(raw.get("EventID") or ""))
+        actors = _event_actors(ev, raw)
+
+        image = str(raw.get("Image") or raw.get("NewProcessName") or raw.get("ProcessName") or "")
+        node_is_image = _matches_pathish(node["value"], image)
+
+        related: list[tuple[str, str | None, str, bool]] = []  # (etype, value, verb, outgoing)
+        if node_is_image and event_verb == "executed":
+            # The flagged value *is* the process being launched here: its parent
+            # and the account executed it, rather than merely touching it.
+            if actors["parent"]:
+                related.append(("process", _basename(actors["parent"]), "executed", False))
+            if actors["actor"]:
+                related.append(("user", actors["actor"], "executed", False))
+        else:
+            if actors["proc"]:
+                verb = event_verb or ("executed" if node_is_image else "touched")
+                related.append(("process", _basename(actors["proc"]), verb, False))
+            if actors["actor"]:
+                related.append(("user", actors["actor"], event_verb or "accessed", False))
+        if actors["host"]:
+            related.append(("host", actors["host"], "seen on", True))
+        if actors["ip"] and ev.category == "network":
+            related.append(("ip", actors["ip"], "connected to", True))
+
+        iso = ev.timestamp.isoformat() if ev.timestamp else ""
+        for etype, value, verb, outgoing in related:
+            if not value:
+                continue
+            # Never link the node to itself (the flagged process/file showing up
+            # under its own path or basename in the raw fields).
+            if etype == node["type"] and value.lower() in (val, base):
+                continue
+            if f"{etype}::{value}".lower() == nid.lower():
+                continue
+            nb = neighbors.setdefault((etype, value), {
+                "rank": 0, "count": 0, "iso": "", "ts": None, "edges": {},
+            })
+            nb["rank"] = max(nb["rank"], SEVERITY_RANK.get(sev, 0))
+            nb["count"] += 1
+            if iso and iso > nb["iso"]:
+                nb["iso"], nb["ts"] = iso, ev.timestamp
+            edge_key = (verb, outgoing)
+            if edge_key not in nb["edges"] or (iso and iso > nb["edges"][edge_key][0]):
+                nb["edges"][edge_key] = (iso, ev.timestamp, ev.summary or "")
+
+    ranked = sorted(
+        neighbors.items(),
+        key=lambda kv: (kv[1]["rank"], kv[1]["count"], kv[1]["iso"]),
+        reverse=True,
+    )
+
+    def _resolve(etype: str, value: str) -> str | None:
+        # Prefer an existing node (the main extraction may hold the same
+        # process/file under its full path) over creating a duplicate.
+        existing = f"{etype}::{value}"
+        if existing in g.nodes:
+            return existing
+        if etype in ("process", "file"):
+            unique = _unique_basename_node(g, etype, value)
+            if unique:
+                return unique
+        return g.node(etype, value)
+
+    drawn = 0
+    for (etype, value), nb in ranked[:_MANUAL_CORRELATION_CAP]:
+        lid = _resolve(etype, value)
+        if not lid or lid == nid:
+            continue
+        # Keep the neighbour visible without recolouring it: the edge, not the
+        # neighbour, carries the manual finding's severity.
+        g.bump(lid, "info", nb["ts"])
+        for (verb, outgoing), (_iso, ts, summary) in nb["edges"].items():
+            src, dst = (nid, lid) if outgoing else (lid, nid)
+            g.edge(src, dst, verb, finding.severity, ts, summary or finding.title)
+            drawn += 1
+    if drawn:
+        node["meta"]["correlated"] = min(len(ranked), _MANUAL_CORRELATION_CAP)
+    return drawn
+
+
+def _attach_manual_nodes(
+    g: _Graph,
+    findings: list[Finding],
+    events: list[Event],
+    suppressed_event_ids: set[int] | None = None,
+) -> None:
+    """Materialize analyst-created findings onto the map.
+
+    Unlike detector findings (which only colour entities already present), a
+    manual finding creates its node when it does not exist yet, then correlates
+    it against all ingested events so every process, user and host that
+    demonstrably touched the flagged value gets an evidence-backed edge. When no
+    event supports the node, the links captured when the finding was raised are
+    drawn as a fallback so it is not left floating.
+    """
+    event_candidates = _manual_event_candidates(findings, events)
+    for f in findings:
+        ev = f.evidence or {}
+        if not ev.get("manual"):
+            continue
+        ntype = str(ev.get("node_type") or "")
+        nval = str(ev.get("node_value") or "")
+        if ntype not in ENTITY_TYPES or not nval:
+            continue
+        # Merge with an existing same-type node before creating a duplicate:
+        # a flagged full path should attach to the basename node the main
+        # extraction already built (and thereby inherit its edges).
+        nid = f"{ntype}::{nval}"
+        if nid not in g.nodes and ntype in ("file", "process"):
+            unique = _unique_basename_node(g, ntype, nval)
+            if unique:
+                nid = unique
+        if nid not in g.nodes:
+            nid = g.node(ntype, nval)
+        if not nid:
+            continue
+        node = g.nodes[nid]
+        node["meta"]["manual"] = True
+        g.bump(nid, f.severity, None, source="finding")
+        g.mark_severity(nid, f.severity, source="finding")
+        if not any(x.get("id") == f.id for x in node["findings"]):
+            node["findings"].append({
+                "id": f.id, "title": f.title, "severity": f.severity,
+                "techniques": f.mitre_techniques,
+            })
+        correlation_events = event_candidates.get(
+            (ntype, nval), events if ntype not in _INDEXED_MANUAL_TYPES else []
+        )
+        if _correlate_manual_node(
+            g, nid, node, correlation_events, f, suppressed_event_ids or set()
+        ):
+            continue
+        # No event-backed edges found: fall back to the snapshot links captured
+        # when the finding was raised.
+        for link in ev.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            lt = str(link.get("type") or "")
+            lv = str(link.get("value") or "")
+            if lt not in ENTITY_TYPES or not lv:
+                continue
+            lid = g.node(lt, lv)
+            if not lid:
+                continue
+            # Keep the linked node visible without recolouring it: the edge, not
+            # the neighbour, carries the manual finding's severity.
+            g.bump(lid, "info", None)
+            g.edge(nid, lid, str(link.get("verb") or "connected to"), f.severity, None, f.title)
 
 
 def _suppression_tokens(evidence: dict) -> set[str]:
@@ -454,12 +803,27 @@ def _public_graph_node(node: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in node.items() if not k.startswith("_")}
 
 
+@_serialize_graph_build
 def build_entity_graph(
     case_id: str,
     entity_types: list[str] | None = None,
     min_severity: str = "info",
     max_nodes: int = 300,
 ) -> dict[str, Any]:
+    from app.detect import manual
+    sync_session = case_store.get_session(case_id)
+    try:
+        if manual.ensure_manual_findings_applied(sync_session):
+            sync_session.commit()
+    finally:
+        sync_session.close()
+    cache_key = (case_id, tuple(sorted(entity_types or ())), min_severity, max_nodes)
+    fingerprint = _graph_fingerprint(case_id)
+    with _GRAPH_CACHE_LOCK:
+        cached = _GRAPH_CACHE.get(cache_key)
+        if cached and cached[0] == fingerprint:
+            return cached[1]
+
     session = case_store.get_session(case_id)
     try:
         g = _Graph()
@@ -468,11 +832,13 @@ def build_entity_graph(
         suppressed_event_ids, suppressed_entities = _suppressed_graph_signals(findings)
         _extract_from_processes(g, procs)
 
-        for ev in session.scalars(select(Event)):
+        all_events = list(session.scalars(select(Event)))
+        for ev in all_events:
             _extract_from_event(g, ev, suppressed_event_ids, suppressed_entities)
 
         _attach_chain_edges(g, findings)
         _attach_findings(g, findings)
+        _attach_manual_nodes(g, findings, all_events, suppressed_event_ids)
         _finalize_node_severities(g)
 
         min_rank = SEVERITY_RANK.get(min_severity, 0)
@@ -494,7 +860,7 @@ def build_entity_graph(
         for n in g.nodes.values():
             type_counts[n["type"]] = type_counts.get(n["type"], 0) + 1
 
-        return {
+        result = {
             "case_id": case_id,
             "nodes": nodes,
             "edges": edges,
@@ -502,15 +868,24 @@ def build_entity_graph(
             "total_edges": len(g.edges),
             "type_counts": type_counts,
         }
+        with _GRAPH_CACHE_LOCK:
+            _GRAPH_CACHE[cache_key] = (fingerprint, result)
+            if len(_GRAPH_CACHE) > 32:
+                _GRAPH_CACHE.pop(next(iter(_GRAPH_CACHE)))
+        return result
     finally:
         session.close()
 
 
+@_serialize_graph_build
 def entity_dossier(case_id: str, entity_id: str, action_limit: int = 500) -> dict[str, Any]:
     """Dynamic investigation of one entity: its chronological action trace, the
     entities it interacted with, and the findings that reference it."""
+    from app.detect import manual
     session = case_store.get_session(case_id)
     try:
+        if manual.ensure_manual_findings_applied(session):
+            session.commit()
         g = _Graph()
         procs = list(session.scalars(select(Process)))
         findings = list(session.scalars(select(Finding)))
@@ -521,6 +896,7 @@ def entity_dossier(case_id: str, entity_id: str, action_limit: int = 500) -> dic
             _extract_from_event(g, ev, suppressed_event_ids, suppressed_entities)
         _attach_chain_edges(g, findings)
         _attach_findings(g, findings)
+        _attach_manual_nodes(g, findings, all_events, suppressed_event_ids)
         _finalize_node_severities(g)
 
         node = g.nodes.get(entity_id)
@@ -572,7 +948,6 @@ def _public(node: dict[str, Any]) -> dict[str, Any]:
 
 def _event_mentions(node: dict[str, Any], ev: Event) -> bool:
     val = node["value"].lower()
-    base = _basename(node["value"]).lower()
     raw = ev.raw or {}
     if node["type"] == "ip":
         for k in ("client_ip", "IpAddress", "SourceIp", "Raddr", "ForeignAddr", "DestinationIp"):
@@ -586,8 +961,16 @@ def _event_mentions(node: dict[str, Any], ev: Event) -> bool:
         return False
     if node["type"] == "process":
         for k in ("NewProcessName", "Image", "ProcessName", "ParentProcessName", "ParentImage", "Owner", "Process"):
-            rv = str(raw.get(k, "")).lower()
-            if rv and (rv == val or _basename(rv).lower() == base):
+            rv = raw.get(k, "")
+            if _matches_pathish(node["value"], rv):
+                return True
+        return False
+    if node["type"] == "file":
+        # Match any path-carrying key by full path or basename; no summary
+        # fallback for files, which would produce false hits on generic names.
+        for k in _FILE_PATH_KEYS:
+            rv = raw.get(k, "")
+            if _matches_pathish(node["value"], rv):
                 return True
         return False
     if node["type"] == "service":

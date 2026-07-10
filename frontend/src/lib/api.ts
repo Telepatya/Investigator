@@ -38,18 +38,20 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
 export const api = {
   // Cases
   listCases: () => req<Case[]>("/cases"),
-  getCase: (id: string) => req<Case>(`/cases/${id}`),
+  getCase: (id: string, signal?: AbortSignal) => req<Case>(`/cases/${id}`, { signal }),
   createCase: (name: string, description: string) =>
     req<Case>("/cases", { method: "POST", body: JSON.stringify({ name, description }) }),
   deleteCase: (id: string) => req<{ ok: boolean }>(`/cases/${id}`, { method: "DELETE" }),
 
   // Data
-  getEvents: (id: string, params: Record<string, string | number> = {}) => {
+  getEvents: (id: string, params: Record<string, string | number> = {}, signal?: AbortSignal) => {
     const qs = new URLSearchParams(
       Object.entries(params).map(([k, v]) => [k, String(v)]),
     ).toString();
-    return req<{ total: number; events: EventRow[] }>(`/cases/${id}/events?${qs}`);
+    return req<{ total: number; events: EventRow[] }>(`/cases/${id}/events?${qs}`, { signal });
   },
+  getEvent: (id: string, eventId: number, signal?: AbortSignal) =>
+    req<EventRow>(`/cases/${id}/events/${eventId}`, { signal }),
   getTimeline: (
     id: string,
     params: {
@@ -58,7 +60,9 @@ export const api = {
       sources?: string;
       categories?: string;
       limit?: number;
+      include_facets?: boolean;
     } = {},
+    signal?: AbortSignal,
   ) => {
     const qs = new URLSearchParams(
       Object.entries(params)
@@ -71,7 +75,7 @@ export const api = {
       sources: { name: string; count: number }[];
       categories: { name: string; count: number }[];
       events: TimelineEvt[];
-    }>(`/cases/${id}/timeline${qs ? `?${qs}` : ""}`);
+    }>(`/cases/${id}/timeline${qs ? `?${qs}` : ""}`, { signal });
   },
   getCategories: (id: string) =>
     req<{ categories: { name: string; count: number }[] }>(`/cases/${id}/categories`),
@@ -85,6 +89,28 @@ export const api = {
     req<{ ok: boolean; disabled_rules: string[] }>(`/cases/${id}/rules/disable`, {
       method: "POST",
       body: JSON.stringify({ rule_id: ruleId, disabled }),
+    }),
+  createManualFinding: (
+    id: string,
+    payload: {
+      title: string;
+      severity: string;
+      description?: string;
+      mitre_techniques?: string[];
+      ref_type: "event" | "entity";
+      ref_id: string;
+      ref_label: string;
+      ref_entity?: string;
+      entity_type?: string;
+    },
+  ) =>
+    req<{ ok: boolean; manual_id: string }>(`/cases/${id}/findings/manual`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteManualFinding: (id: string, manualId: string) =>
+    req<{ ok: boolean; removed: boolean }>(`/cases/${id}/findings/manual/${manualId}`, {
+      method: "DELETE",
     }),
   getAttackMatrix: (id: string) =>
     req<{ techniques: AttackTechnique[] }>(`/cases/${id}/attack-matrix`),
@@ -105,14 +131,15 @@ export const api = {
   getEntities: (
     id: string,
     params: { types?: string; min_severity?: string; max_nodes?: number } = {},
+    signal?: AbortSignal,
   ) => {
     const qs = new URLSearchParams(
       Object.entries(params).map(([k, v]) => [k, String(v)]),
     ).toString();
-    return req<EntityGraph>(`/cases/${id}/entities${qs ? `?${qs}` : ""}`);
+    return req<EntityGraph>(`/cases/${id}/entities${qs ? `?${qs}` : ""}`, { signal });
   },
-  getEntityDossier: (id: string, entityId: string) =>
-    req<EntityDossier>(`/cases/${id}/entity-dossier?entity_id=${encodeURIComponent(entityId)}`),
+  getEntityDossier: (id: string, entityId: string, signal?: AbortSignal) =>
+    req<EntityDossier>(`/cases/${id}/entity-dossier?entity_id=${encodeURIComponent(entityId)}`, { signal }),
 
   // Evidence
   listEvidence: (id: string) => req<{ files: EvidenceFile[] }>(`/cases/${id}/evidence`),

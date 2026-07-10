@@ -26,6 +26,7 @@ class CaseResponse(BaseModel):
     updated_at: datetime
     event_count: int = 0
     finding_count: int = 0
+    active_finding_count: int = 0
     process_count: int = 0
     has_memory_dump: bool = False
     ai_summary: str | None = None

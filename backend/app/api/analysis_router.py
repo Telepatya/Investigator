@@ -10,6 +10,7 @@ from sqlalchemy import select
 from app.llm.orchestrator import analyze_case, chat_stream, investigate_entity_stream
 from app.store import cases as case_store
 from app.store.database import Report
+from app.store.operations import coordinator
 
 router = APIRouter(prefix="/api/cases", tags=["analysis"])
 
@@ -28,23 +29,29 @@ def _broadcast_analysis(case_id: str, payload: dict) -> None:
 
 @router.post("/{case_id}/analyze")
 async def start_analysis(case_id: str) -> dict:
-    case = case_store.get_case(case_id)
+    case = await asyncio.to_thread(case_store.get_case, case_id)
     if not case:
         raise HTTPException(404, "Case not found")
     if case_id in _analysis_running:
         return {"ok": True, "already_running": True}
+    _analysis_running.add(case_id)
 
     async def _run() -> None:
-        _analysis_running.add(case_id)
-
         async def emit(phase: str, message: str, percent: float) -> None:
             _broadcast_analysis(case_id, {
                 "case_id": case_id, "phase": phase, "message": message,
-                "percent": percent, "done": phase == "done",
+                "percent": percent, "done": phase in {"done", "error"},
             })
 
+        active = coordinator.snapshot(case_id).get("active")
+        if active:
+            await emit("queued", f"Waiting for {active} to finish", 0)
         try:
-            await analyze_case(case_id, emit=emit)
+            async with coordinator.run(case_id, "AI analysis"):
+                if not await asyncio.to_thread(case_store.case_exists, case_id):
+                    await emit("error", "Analysis cancelled because the case no longer exists", 100)
+                    return
+                await analyze_case(case_id, emit=emit)
         except Exception as e:
             _broadcast_analysis(case_id, {
                 "case_id": case_id, "phase": "error", "message": str(e),
@@ -79,7 +86,7 @@ async def analyze_ws(websocket: WebSocket, case_id: str) -> None:
 
 
 @router.get("/{case_id}/report")
-async def get_report(case_id: str) -> dict:
+def get_report(case_id: str) -> dict:
     session = case_store.get_session(case_id)
     try:
         report = session.scalars(
@@ -145,7 +152,7 @@ async def investigate_entity_ws(websocket: WebSocket, case_id: str) -> None:
 
 
 @router.get("/{case_id}/chat-history")
-async def get_chat_history(case_id: str) -> dict:
+def get_chat_history(case_id: str) -> dict:
     session = case_store.get_session(case_id)
     try:
         history = case_store.get_chat_history(session, limit=50)

@@ -50,6 +50,47 @@ should still review `git status` and staged diffs before every push.
 API keys configured in the application are stored in the operating system
 credential vault, not in the repository.
 
+## Case Isolation And Concurrency
+
+Investigator is designed as a single local backend process with one SQLite
+database per case. Case IDs received from API routes must be validated against
+the case registry before a database session is created; otherwise a stale or
+crafted ID could create an orphan database directory.
+
+Two independent synchronization layers protect case integrity:
+
+- The per-case operation coordinator serializes ingestion, memory analysis, AI
+  analysis, detection rebuilds, and deletion. A queued operation rechecks that
+  the case still exists after it acquires the operation slot.
+- The per-database writer gate serializes SQLite write transactions. Code that
+  performs a metadata read-modify-write must acquire the gate before reading,
+  not only when flushing, to prevent lost JSON metadata updates.
+
+SQLite WAL keeps case reads available while a writer is active. Running multiple
+independent backend processes against the same `~/.investigator/cases` directory
+is not supported because the operation coordinator and writer gate are
+process-local.
+
+## Evidence Integrity And Analyst Overrides
+
+Raw evidence remains inspectable and analyst actions must retain provenance.
+Manual findings are persisted separately from detector output and materialized
+into the findings table. When a manual event finding raises timeline severity,
+the previous event severity and reason are preserved as a reversible baseline.
+Marking the finding benign or deleting it restores that baseline; detection
+rebuilds restore baselines before recalculation and reapply active analyst intent
+afterward.
+
+File and process correlation must use normalized exact full paths when a full
+path is available, including normalization of Windows device prefixes such as
+`\\.\C:\...`. A same basename in a different directory is not sufficient
+evidence of identity. Basename fallback is allowed only for basename-only,
+unambiguous entities.
+
+Frontend caches and transient state are also case-scoped. Search results,
+drawers, timeline filters, and Entity Map focus state must be cleared when the
+case route changes to prevent accidental cross-case display.
+
 ## Repository Protection
 
 The project is intended to use:

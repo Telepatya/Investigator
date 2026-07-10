@@ -2,7 +2,7 @@ import { useState, type ReactNode } from "react";
 import { useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { EmptyState, Spinner, SeverityBadge, CodeBlock } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
 import {
   ChevronDown,
   ChevronRight,
@@ -11,13 +11,16 @@ import {
   EyeOff,
   Eye,
   Ban,
+  Flag,
   RotateCcw,
+  Trash2,
 } from "lucide-react";
 import type { Finding, Severity } from "../lib/types";
 import { SEVERITY_ORDER } from "../lib/ui";
 
 type BenignFn = (findingId: number, benign: boolean) => void;
 type RuleFn = (ruleId: string, disabled: boolean) => void;
+type DeleteManualFn = (manualId: string) => void;
 
 export default function FindingsPage() {
   const { caseId } = useParams();
@@ -35,7 +38,10 @@ export default function FindingsPage() {
       "entity-dossier",
       "attack-matrix",
       "timeline",
+      "timeline-facets",
       "events",
+      "event-detail",
+      "global-event-search",
       "categories",
     ]) {
       qc.invalidateQueries({ queryKey: [key, caseId] });
@@ -52,8 +58,16 @@ export default function FindingsPage() {
       api.setRuleDisabled(caseId!, ruleId, disabled),
     onSuccess: invalidateCaseViews,
   });
+  const deleteManualMut = useMutation({
+    mutationFn: (manualId: string) => api.deleteManualFinding(caseId!, manualId),
+    onSuccess: () => {
+      invalidateCaseViews();
+      qc.invalidateQueries({ queryKey: ["case", caseId] });
+    },
+  });
   const setBenign: BenignFn = (id, benign) => benignMut.mutate({ id, benign });
   const setRule: RuleFn = (ruleId, disabled) => ruleMut.mutate({ ruleId, disabled });
+  const deleteManual: DeleteManualFn = (manualId) => deleteManualMut.mutate(manualId);
 
   if (isLoading) return <Spinner label="Loading findings…" />;
   const findings = data?.findings ?? [];
@@ -80,7 +94,12 @@ export default function FindingsPage() {
   const suppressedCount = findings.filter((f) => f.suppressed).length;
 
   return (
-    <div className="space-y-4">
+    <PageShell>
+      <PageTitle
+        icon={<Shield size={22} />}
+        title="Findings"
+        subtitle="Detections, analyst overrides, AI verdicts, and mapped evidence."
+      />
       {disabledRules.length > 0 && (
         <div className="card p-3">
           <div className="flex items-center gap-2 mb-2 text-xs font-semibold uppercase tracking-wider text-ink-400">
@@ -139,10 +158,10 @@ export default function FindingsPage() {
         {filtered
           .sort((a, b) => SEVERITY_ORDER[b.severity] - SEVERITY_ORDER[a.severity])
           .map((f) => (
-            <FindingRow key={f.id} f={f} setBenign={setBenign} setRule={setRule} />
+            <FindingRow key={f.id} f={f} setBenign={setBenign} setRule={setRule} deleteManual={deleteManual} />
           ))}
       </div>
-    </div>
+    </PageShell>
   );
 }
 
@@ -150,10 +169,12 @@ function FindingRow({
   f,
   setBenign,
   setRule,
+  deleteManual,
 }: {
   f: Finding;
   setBenign: BenignFn;
   setRule: RuleFn;
+  deleteManual: DeleteManualFn;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -173,6 +194,11 @@ function FindingRow({
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-1 flex-wrap">
               <SeverityBadge severity={f.severity} />
+              {f.manual && (
+                <span className="chip bg-accent-cyan/15 text-accent-cyan">
+                  <Flag size={11} /> Manual
+                </span>
+              )}
               {f.suppressed && (
                 <span className="chip bg-white/10 text-ink-400">{f.suppressed_reason}</span>
               )}
@@ -201,17 +227,27 @@ function FindingRow({
           >
             {f.benign ? <Eye size={15} /> : <EyeOff size={15} />}
           </IconBtn>
-          <IconBtn
-            active={f.rule_disabled}
-            onClick={() => setRule(f.rule_id, !f.rule_disabled)}
-            title={
-              f.rule_disabled
-                ? `Enable rule "${f.rule_id}"`
-                : `Disable rule "${f.rule_id}" (all its findings become informational)`
-            }
-          >
-            {f.rule_disabled ? <RotateCcw size={15} /> : <Ban size={15} />}
-          </IconBtn>
+          {f.manual && f.manual_id ? (
+            <IconBtn
+              active={false}
+              onClick={() => deleteManual(f.manual_id!)}
+              title="Delete this manual finding"
+            >
+              <Trash2 size={15} />
+            </IconBtn>
+          ) : (
+            <IconBtn
+              active={f.rule_disabled}
+              onClick={() => setRule(f.rule_id, !f.rule_disabled)}
+              title={
+                f.rule_disabled
+                  ? `Enable rule "${f.rule_id}"`
+                  : `Disable rule "${f.rule_id}" (all its findings become informational)`
+              }
+            >
+              {f.rule_disabled ? <RotateCcw size={15} /> : <Ban size={15} />}
+            </IconBtn>
+          )}
         </div>
       </div>
       {open && (

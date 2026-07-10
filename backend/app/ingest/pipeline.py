@@ -13,6 +13,7 @@ from sqlalchemy import select
 from app.ingest.normalize import parse_timestamp
 from app.ingest.parsers import PARSABLE_EXTENSIONS, _basename, iter_zip_members, parse_file
 from app.store import cases as case_store
+from app.store.operations import coordinator
 from app.store.database import Process
 
 MEMORY_EXTENSIONS = {".raw", ".dmp", ".mem", ".vmem", ".bin", ".img", ".lime", ".dd"}
@@ -345,6 +346,36 @@ class IngestionManager:
         return self.jobs.get(case_id)
 
     async def run_ingestion(
+        self,
+        case_id: str,
+        file_path: Path,
+        file_type: str,
+        memory_options: dict[str, Any] | None = None,
+    ) -> None:
+        active = coordinator.snapshot(case_id).get("active")
+        if active:
+            self._broadcast(case_id, {
+                "case_id": case_id,
+                "phase": "queued",
+                "percent": 0,
+                "message": f"Waiting for {active} to finish",
+                "done": False,
+                "error": None,
+            })
+        async with coordinator.run(case_id, "evidence ingestion"):
+            if not await asyncio.to_thread(case_store.case_exists, case_id):
+                self._broadcast(case_id, {
+                    "case_id": case_id,
+                    "phase": "error",
+                    "percent": 100,
+                    "message": "Ingestion cancelled because the case no longer exists",
+                    "done": True,
+                    "error": "Case not found",
+                })
+                return
+            await self._run_ingestion_locked(case_id, file_path, file_type, memory_options)
+
+    async def _run_ingestion_locked(
         self,
         case_id: str,
         file_path: Path,

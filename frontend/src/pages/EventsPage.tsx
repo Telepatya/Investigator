@@ -1,19 +1,37 @@
-import { useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import { api } from "../lib/api";
-import { Spinner, SeverityBadge, CodeBlock, EmptyState } from "../components/common";
+import { DetailDrawer, EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
+import { FlagAsFinding } from "../components/FlagAsFinding";
 import { fmtTime } from "../lib/ui";
-import { List, Search, X } from "lucide-react";
+import { List, Search } from "lucide-react";
 import type { EventRow, Severity } from "../lib/types";
 
 export default function EventsPage() {
   const { caseId } = useParams();
-  const [search, setSearch] = useState("");
-  const [query, setQuery] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialQuery = searchParams.get("q") ?? "";
+  const [search, setSearch] = useState(initialQuery);
+  const [query, setQuery] = useState(initialQuery);
   const [category, setCategory] = useState<string>("");
   const [severity, setSeverity] = useState<string>("");
   const [selected, setSelected] = useState<EventRow | null>(null);
+
+  useEffect(() => {
+    const q = searchParams.get("q") ?? "";
+    setSearch(q);
+    setQuery(q);
+  }, [searchParams]);
+
+  function submitSearch() {
+    const q = search.trim();
+    setQuery(q);
+    const next = new URLSearchParams(searchParams);
+    if (q) next.set("q", q);
+    else next.delete("q");
+    setSearchParams(next, { replace: true });
+  }
 
   const { data: cats } = useQuery({
     queryKey: ["categories", caseId],
@@ -35,7 +53,12 @@ export default function EventsPage() {
   const events = data?.events ?? [];
 
   return (
-    <div className="space-y-4">
+    <PageShell>
+      <PageTitle
+        icon={<List size={22} />}
+        title="Events"
+        subtitle="Search raw evidence rows and inspect normalized records."
+      />
       <div className="card p-3 flex items-center gap-2 flex-wrap">
         <div className="relative flex-1 min-w-[220px]">
           <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-400" />
@@ -44,10 +67,10 @@ export default function EventsPage() {
             placeholder="Full-text search events…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && setQuery(search)}
+            onKeyDown={(e) => e.key === "Enter" && submitSearch()}
           />
         </div>
-        <button className="btn-ghost" onClick={() => setQuery(search)}>
+        <button className="btn-ghost" onClick={submitSearch}>
           Search
         </button>
         <select className="input w-auto py-2" value={category} onChange={(e) => setCategory(e.target.value)}>
@@ -102,13 +125,7 @@ export default function EventsPage() {
       )}
 
       {selected && (
-        <div className="fixed inset-y-0 right-0 z-50 w-full max-w-md glass border-l border-white/10 p-5 overflow-y-auto shadow-2xl">
-          <div className="flex items-start justify-between mb-4">
-            <div className="text-xs uppercase tracking-wider text-ink-400">Event detail</div>
-            <button className="text-ink-400 hover:text-ink-100" onClick={() => setSelected(null)}>
-              <X size={18} />
-            </button>
-          </div>
+        <DetailDrawer eyebrow="Event detail" title={selected.category} onClose={() => setSelected(null)} ariaLabel="Event detail">
           <div className="space-y-3 text-sm">
             <div className="flex items-center gap-2">
               <SeverityBadge severity={selected.severity} />
@@ -132,10 +149,23 @@ export default function EventsPage() {
               <div className="label">Raw</div>
               <CodeBlock>{JSON.stringify(selected.raw, null, 2)}</CodeBlock>
             </div>
+            {caseId && (
+              <div className="border-t border-[rgb(var(--border)/0.5)] pt-3">
+                <FlagAsFinding
+                  caseId={caseId}
+                  refType="event"
+                  refId={String(selected.id)}
+                  refLabel={selected.summary}
+                  entityHint={selected.entity ?? undefined}
+                  defaultTitle={`Analyst-flagged event: ${selected.summary.slice(0, 140)}`}
+                  defaultSeverity={selected.severity === "info" ? "medium" : selected.severity}
+                />
+              </div>
+            )}
           </div>
-        </div>
+        </DetailDrawer>
       )}
-    </div>
+    </PageShell>
   );
 }
 

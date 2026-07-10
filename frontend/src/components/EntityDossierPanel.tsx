@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  X,
   Sparkles,
   ArrowRight,
   ArrowLeft,
@@ -12,9 +11,11 @@ import {
   Cpu,
   Database,
   Crosshair,
+  Share2,
 } from "lucide-react";
 import { api, memoryModuleDownloadUrl, memoryProcessDownloadUrl, wsUrl } from "../lib/api";
-import { SeverityBadge, Spinner, CodeBlock } from "./common";
+import { DetailDrawer, SeverityBadge, Spinner, CodeBlock } from "./common";
+import { FlagAsFinding } from "./FlagAsFinding";
 import { fmtTime, SEVERITY_COLORS } from "../lib/ui";
 import type { EntityDossier, MemoryModule, MemoryProcessCandidate, MemoryProcessHandle, Severity } from "../lib/types";
 
@@ -34,7 +35,8 @@ export function EntityDossierPanel({
   const [tab, setTab] = useState<"trace" | "relations" | "memory" | "ai">("trace");
   const { data, isLoading } = useQuery({
     queryKey: ["entity-dossier", caseId, entityId],
-    queryFn: () => api.getEntityDossier(caseId, entityId),
+    queryFn: ({ signal }) => api.getEntityDossier(caseId, entityId, signal),
+    staleTime: 30_000,
   });
   const hasMemoryProcesses = Boolean(data?.memory_processes?.length);
   const tabs: Array<"trace" | "relations" | "memory" | "ai"> = [
@@ -48,37 +50,14 @@ export function EntityDossierPanel({
   }, [entityId, tab, hasMemoryProcesses]);
 
   return (
-    <div className="fixed inset-y-0 right-0 z-50 w-full max-w-lg glass border-l border-white/10 flex flex-col shadow-2xl">
-      <div className="p-5 border-b border-white/5">
-        <div className="flex items-start justify-between">
-          <div className="min-w-0">
-            <div className="text-xs uppercase tracking-wider text-ink-400">
-              {data?.entity.type ?? "entity"} investigation
-            </div>
-            <div className="text-lg font-semibold text-ink-50 mt-1 truncate" title={data?.entity.value}>
-              {data?.entity.value ?? "…"}
-            </div>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            {onFocus && (
-              <button
-                className={`btn text-xs ${
-                  focused
-                    ? "bg-accent-cyan/15 text-accent-cyan"
-                    : "text-ink-300 hover:bg-white/5"
-                }`}
-                onClick={() => onFocus(entityId)}
-                title="Show only this entity and everything connected to it on the map"
-              >
-                <Crosshair size={13} /> {focused ? "Focused" : "Focus on map"}
-              </button>
-            )}
-            <button className="text-ink-400 hover:text-ink-100" onClick={onClose}>
-              <X size={18} />
-            </button>
-          </div>
-        </div>
-        {data && (
+    <DetailDrawer
+      eyebrow={`${data?.entity.type ?? "entity"} investigation`}
+      title={data?.entity.value ?? "..."}
+      onClose={onClose}
+      ariaLabel="Entity investigation details"
+      dismissOnOutsideClick={false}
+    >
+      {data && (
           <div className="flex items-center gap-2 mt-3 flex-wrap">
             <SeverityBadge severity={data.entity.severity} />
             <span className="chip bg-white/5 text-ink-300">
@@ -89,11 +68,46 @@ export function EntityDossierPanel({
                 <AlertTriangle size={11} /> {data.entity.finding_count} findings
               </span>
             )}
+            {Boolean(data.entity.meta.manual) && typeof data.entity.meta.correlated === "number" && (
+              <span
+                className="chip bg-accent-cyan/10 text-accent-cyan"
+                title="Related entities linked from event evidence for this flagged item"
+              >
+                <Share2 size={11} /> correlated with {data.entity.meta.correlated} entities
+              </span>
+            )}
             {data.entity.first_seen && (
               <span className="text-[11px] text-ink-500">
                 {fmtTime(data.entity.first_seen)} → {fmtTime(data.entity.last_seen)}
               </span>
             )}
+          </div>
+        )}
+        {data && onFocus && (
+          <button
+            type="button"
+            className={`btn-ghost mt-4 w-full justify-center text-xs ${
+              focused ? "bg-accent-blue/10 text-accent-blue" : ""
+            }`}
+            onClick={() => onFocus(entityId)}
+            title="Show only this entity and everything connected to it on the map"
+          >
+            <Crosshair size={14} />
+            {focused ? "Focused on map" : "Focus on map"}
+          </button>
+        )}
+        {data && (
+          <div className="mt-3">
+            <FlagAsFinding
+              caseId={caseId}
+              refType="entity"
+              refId={entityId}
+              refLabel={data.entity.value}
+              entityHint={data.entity.value}
+              entityType={data.entity.type}
+              defaultTitle={`Analyst-flagged ${data.entity.type}: ${data.entity.value}`}
+              defaultSeverity={data.entity.severity === "info" ? "medium" : data.entity.severity}
+            />
           </div>
         )}
         <div className="flex items-center gap-1 mt-4 flex-wrap">
@@ -102,7 +116,9 @@ export function EntityDossierPanel({
               key={t}
               onClick={() => setTab(t)}
               className={`btn text-xs ${
-                tab === t ? "bg-accent-cyan/15 text-accent-cyan" : "text-ink-300 hover:bg-white/5"
+                tab === t
+                  ? "bg-accent-blue/10 text-accent-blue"
+                  : "text-ink-300 hover:bg-[rgb(var(--panel-muted)/0.8)]"
               }`}
             >
               {t === "trace"
@@ -115,9 +131,8 @@ export function EntityDossierPanel({
             </button>
           ))}
         </div>
-      </div>
 
-      <div className="flex-1 overflow-y-auto p-5">
+      <div className="mt-4">
         {isLoading ? (
           <Spinner label="Loading entity…" />
         ) : !data ? (
@@ -132,7 +147,7 @@ export function EntityDossierPanel({
           <AiInvestigate caseId={caseId} entityId={entityId} />
         )}
       </div>
-    </div>
+    </DetailDrawer>
   );
 }
 

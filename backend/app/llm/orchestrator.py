@@ -460,7 +460,7 @@ async def investigate_entity_stream(case_id: str, entity_id: str) -> AsyncIterat
     """Stream an AI investigation of a single entity built from its action trace."""
     from app.detect.entity_graph import entity_dossier
 
-    dossier = entity_dossier(case_id, entity_id)
+    dossier = await asyncio.to_thread(entity_dossier, case_id, entity_id)
     if not dossier:
         yield "Entity not found in this case."
         return

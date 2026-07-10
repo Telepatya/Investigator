@@ -42,13 +42,24 @@ export function AnalyzeButton({ caseId, status }: { caseId: string; status?: str
     setRunning(true);
     setPhase("Starting…");
     setPercent(0);
-    await api.startAnalysis(caseId);
+    try {
+      await api.startAnalysis(caseId);
+    } catch (error) {
+      setRunning(false);
+      setPhase(error instanceof Error ? error.message : "Analysis could not start");
+    }
   }
 
   const isAnalyzing = running || status === "analyzing";
+  const blocked = status === "ingesting";
 
   return (
-    <button className="btn-primary relative overflow-hidden" onClick={start} disabled={isAnalyzing}>
+    <button
+      className="btn-primary relative overflow-hidden"
+      onClick={start}
+      disabled={isAnalyzing || blocked}
+      title={blocked ? "Wait for evidence processing to finish" : "Run AI analysis"}
+    >
       {isAnalyzing ? (
         <>
           <Loader2 size={16} className="animate-spin" />

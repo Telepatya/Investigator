@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { wsUrl, api } from "../lib/api";
 import { Send, Sparkles, MessageSquare } from "lucide-react";
+import { PageShell, PageTitle } from "../components/common";
 
 interface Msg {
   role: "user" | "assistant" | "tool";
@@ -69,7 +70,13 @@ export default function ChatPage() {
   }
 
   return (
-    <div className="card flex flex-col" style={{ height: "calc(100vh - 220px)" }}>
+    <PageShell>
+      <PageTitle
+        icon={<MessageSquare size={22} />}
+        title="AI"
+        subtitle="Ask case-aware questions grounded in events, findings, processes, and memory results."
+      />
+    <div className="card flex flex-col" style={{ height: "calc(100vh - 300px)", minHeight: 560 }}>
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-5 space-y-4">
         {messages.length === 0 && (
           <div className="h-full flex flex-col items-center justify-center text-center gap-4">
@@ -152,5 +159,6 @@ export default function ChatPage() {
         </div>
       </div>
     </div>
+    </PageShell>
   );
 }

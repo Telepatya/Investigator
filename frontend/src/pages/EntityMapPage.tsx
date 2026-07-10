@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import type { ReactNode } from "react";
 import { useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import ReactFlow, {
   Background,
   Controls,
+  MiniMap,
   MarkerType,
   Handle,
   Position,
@@ -13,6 +15,7 @@ import ReactFlow, {
   useEdgesState,
   useNodesState,
 } from "reactflow";
+import "reactflow/dist/style.css";
 import {
   User,
   Users,
@@ -29,12 +32,12 @@ import {
   X,
 } from "lucide-react";
 import { api } from "../lib/api";
-import { EmptyState, Spinner } from "../components/common";
+import { EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
 import { SEVERITY_COLORS } from "../lib/ui";
 import type { EntityGraph, EntityNode, EntityType, Severity } from "../lib/types";
 import { EntityDossierPanel } from "../components/EntityDossierPanel";
 
-const TYPE_ICON: Record<EntityType, React.ReactNode> = {
+const TYPE_ICON: Record<EntityType, ReactNode> = {
   user: <User size={14} />,
   account: <Users size={14} />,
   host: <Monitor size={14} />,
@@ -68,7 +71,7 @@ const SEVERITY_RANK: Record<Severity, number> = {
   critical: 4,
 };
 
-function EntityNodeCard({ data }: { data: any }) {
+const EntityNodeCard = memo(function EntityNodeCard({ data }: { data: any }) {
   const sev = data.severity as Severity;
   const active = sev !== "info";
   const color = SEVERITY_COLORS[sev];
@@ -76,25 +79,36 @@ function EntityNodeCard({ data }: { data: any }) {
   const hidden = (data.hiddenNeighbors as number) ?? 0;
   return (
     <div
-      className="rounded-lg px-3 py-2 border min-w-[150px] max-w-[220px]"
+      className="min-w-[172px] max-w-[238px] rounded-2xl border px-4 py-3 shadow-sm transition-all duration-200 hover:-translate-y-0.5"
       style={{
-        background: active ? `${color}18` : "#141821",
-        borderColor: isFocusRoot ? "#22d3ee" : active ? `${color}80` : "rgba(255,255,255,0.08)",
+        background: active
+          ? `linear-gradient(145deg, ${color}16, rgb(var(--panel-strong) / 0.92))`
+          : "rgb(var(--panel-strong) / 0.92)",
+        borderColor: isFocusRoot ? "rgb(var(--accent-blue))" : active ? `${color}70` : "rgb(var(--border) / 0.72)",
         boxShadow: isFocusRoot
-          ? "0 0 0 2px #22d3ee, 0 0 20px -4px #22d3ee"
+          ? "0 0 0 2px rgb(var(--accent-blue) / 0.42), 0 20px 38px -26px rgb(var(--accent-blue) / 0.9)"
           : sev === "critical" || sev === "high"
-            ? `0 0 16px -4px ${color}`
-            : "none",
+            ? `0 20px 36px -28px ${color}`
+            : "0 16px 32px -28px rgb(var(--shadow) / 0.65)",
       }}
     >
-      <Handle type="target" position={Position.Top} className="!bg-ink-500" />
+      <Handle id="left" type="target" position={Position.Left} className="!h-2 !w-2 !border-0 !bg-ink-500" />
+      <Handle id="right" type="source" position={Position.Right} className="!h-2 !w-2 !border-0 !bg-ink-500" />
       <div className="flex items-center gap-1.5">
-        <span style={{ color: active ? color : "#8b96b0" }}>{TYPE_ICON[data.type as EntityType]}</span>
-        <span className="text-[9px] uppercase tracking-wider text-ink-400">{data.type}</span>
+        <span style={{ color: active ? color : "rgb(var(--ink-300))" }}>{TYPE_ICON[data.type as EntityType]}</span>
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-300">{data.type}</span>
+        {data.manual && (
+          <span
+            className="text-[9px] px-1 rounded bg-accent-cyan/20 text-accent-cyan uppercase tracking-wider"
+            title="Created from a manual finding"
+          >
+            manual
+          </span>
+        )}
         {hidden > 0 && (
           <span
             className="ml-auto text-[9px] px-1 rounded bg-accent-cyan/20 text-accent-cyan"
-            title={`${hidden} more connected ${hidden === 1 ? "entity" : "entities"} — click to reveal`}
+            title={`${hidden} more connected ${hidden === 1 ? "entity" : "entities"} - double-click to reveal`}
           >
             +{hidden}
           </span>
@@ -122,10 +136,9 @@ function EntityNodeCard({ data }: { data: any }) {
           </span>
         )}
       </div>
-      <Handle type="source" position={Position.Bottom} className="!bg-ink-500" />
     </div>
   );
-}
+});
 
 const nodeTypes = { entity: EntityNodeCard };
 
@@ -138,7 +151,7 @@ export default function EntityMapPage() {
   // Focus mode: collapse the map to one entity and everything connected to it.
   const [focusId, setFocusId] = useState<string | null>(null);
   // "Hub" nodes whose direct neighbors are also shown; lets focus expand outward
-  // one hop at a time as the analyst clicks connected nodes.
+  // one hop at a time as the analyst double-clicks connected nodes.
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const focusActive = focusId !== null;
 
@@ -146,16 +159,31 @@ export default function EntityMapPage() {
   // instant instead of waiting on a slow graph rebuild for each threshold.
   const maxNodes = focusActive ? 600 : 250;
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isFetching } = useQuery({
     queryKey: ["entities", caseId, maxNodes],
-    queryFn: () => api.getEntities(caseId!, { min_severity: "info", max_nodes: maxNodes }),
+    queryFn: ({ signal }) => api.getEntities(caseId!, { min_severity: "info", max_nodes: maxNodes }, signal),
     enabled: !!caseId,
-    placeholderData: (prev) => prev,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[1] === caseId ? previousData : undefined,
   });
 
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [mapReady, setMapReady] = useState(false);
+  const [, startLayoutTransition] = useTransition();
   const rfRef = useRef<ReactFlowInstance | null>(null);
+
+  useEffect(() => {
+    setMinSeverity("info");
+    setActiveTypes(new Set(ALL_TYPES));
+    setShowTerminated(false);
+    setSelected(null);
+    setFocusId(null);
+    setExpanded(new Set());
+    setNodes([]);
+    setEdges([]);
+    setMapReady(false);
+  }, [caseId, setNodes, setEdges]);
 
   const deadCount = useMemo(
     () => (data ? data.nodes.filter((n) => n.meta?.dead).length : 0),
@@ -214,18 +242,39 @@ export default function EntityMapPage() {
     const keepEdges = data.edges.filter((e) => keep.has(e.source) && keep.has(e.target));
     return { nodes: keepNodes, edges: keepEdges };
   }, [data, activeTypes, showTerminated, focusView, minSeverity]);
+  const layoutInput = useMemo(
+    () => filtered ? { graph: filtered, focusId, hiddenNeighbors: focusView?.hiddenNeighbors } : null,
+    [filtered, focusId, focusView],
+  );
+  const deferredLayoutInput = useDeferredValue(layoutInput);
 
   useEffect(() => {
-    if (!filtered) return;
-    const { nodes: n, edges: e } = layoutGraph(filtered.nodes, filtered.edges, {
-      focusId,
-      hiddenNeighbors: focusView?.hiddenNeighbors,
+    if (!deferredLayoutInput) return;
+    setMapReady(false);
+    let fitFrame = 0;
+    const layoutFrame = requestAnimationFrame(() => {
+      const { nodes: nextNodes, edges: nextEdges } = layoutGraph(
+        deferredLayoutInput.graph.nodes,
+        deferredLayoutInput.graph.edges,
+        {
+          focusId: deferredLayoutInput.focusId,
+          hiddenNeighbors: deferredLayoutInput.hiddenNeighbors,
+        },
+      );
+      startLayoutTransition(() => {
+        setNodes(nextNodes);
+        setEdges(nextEdges);
+        setMapReady(true);
+      });
+      fitFrame = requestAnimationFrame(() =>
+        rfRef.current?.fitView({ padding: 0.2, duration: nextNodes.length === 0 ? 0 : 180 }),
+      );
     });
-    setNodes(n);
-    setEdges(e);
-    // Reframe after positions apply so the focused subgraph re-centers.
-    requestAnimationFrame(() => rfRef.current?.fitView({ padding: 0.2, duration: 300 }));
-  }, [filtered, focusId, focusView, setNodes, setEdges]);
+    return () => {
+      cancelAnimationFrame(layoutFrame);
+      cancelAnimationFrame(fitFrame);
+    };
+  }, [deferredLayoutInput, setNodes, setEdges, startLayoutTransition]);
 
   const clearFocus = useCallback(() => {
     setFocusId(null);
@@ -235,10 +284,21 @@ export default function EntityMapPage() {
   const onNodeClick = useCallback(
     (_: unknown, node: Node) => {
       setSelected(node.id);
-      // In focus mode, clicking a node expands its connections (reveals its neighbors).
-      if (focusActive) setExpanded((prev) => new Set(prev).add(node.id));
     },
-    [focusActive],
+    [],
+  );
+
+  const onNodeDoubleClick = useCallback(
+    (_: unknown, node: Node) => {
+      if (!focusActive || node.id === focusId) return;
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(node.id)) next.delete(node.id);
+        else next.add(node.id);
+        return next;
+      });
+    },
+    [focusActive, focusId],
   );
 
   function toggleType(t: EntityType) {
@@ -261,26 +321,31 @@ export default function EntityMapPage() {
     );
 
   return (
-    <div className="space-y-4">
+    <PageShell>
+      <PageTitle
+        icon={<Boxes size={22} />}
+        title="Entities"
+        subtitle="Reconstructed users, hosts, IPs, processes, and services, and the actions between them."
+      />
       {focusActive ? (
-        <div className="card p-3 flex items-center justify-between flex-wrap gap-3 border-accent-cyan/40">
+        <div className="card flex items-center justify-between gap-3 border-accent-blue/40 p-3 flex-wrap">
           <div className="flex items-center gap-2 flex-wrap min-w-0">
-            <Crosshair size={16} className="text-accent-cyan shrink-0" />
+            <Crosshair size={16} className="text-accent-blue shrink-0" />
             <span className="text-sm text-ink-200">
               Focused on <span className="font-semibold text-ink-50">{focusLabel}</span>
             </span>
             <span className="text-xs text-ink-500">
-              · showing {filtered?.nodes.length ?? 0} connected entities · click a node to reveal its connections
+              · showing {filtered?.nodes.length ?? 0} connected entities · double-click a node to expand or compact its links
             </span>
           </div>
-          <button className="chip bg-accent-cyan/15 text-accent-cyan transition" onClick={clearFocus}>
+          <button className="chip bg-accent-blue/10 text-accent-blue transition" onClick={clearFocus}>
             <X size={12} /> Clear focus
           </button>
         </div>
       ) : (
-        <div className="card p-3 flex items-center justify-between flex-wrap gap-3">
+        <div className="card flex items-center justify-between gap-3 p-3 flex-wrap">
           <div className="flex items-center gap-2 flex-wrap">
-            <Boxes size={16} className="text-accent-cyan" />
+            <Boxes size={16} className="text-accent-blue" />
             <span className="text-sm text-ink-300">
               {data.total_nodes} entities · {data.total_edges} actions
             </span>
@@ -292,7 +357,7 @@ export default function EntityMapPage() {
                 onClick={() => toggleType(t)}
                 className={`chip transition ${
                   activeTypes.has(t)
-                    ? "bg-accent-cyan/15 text-accent-cyan"
+                    ? "bg-accent-blue/10 text-accent-blue"
                     : "bg-white/5 text-ink-500"
                 }`}
               >
@@ -311,7 +376,7 @@ export default function EntityMapPage() {
                 deadCount === 0
                   ? "bg-white/5 text-ink-600 cursor-not-allowed opacity-60"
                   : showTerminated
-                    ? "bg-accent-cyan/15 text-accent-cyan"
+                    ? "bg-accent-blue/10 text-accent-blue"
                     : "bg-white/5 text-ink-500"
               }`}
             >
@@ -332,21 +397,37 @@ export default function EntityMapPage() {
         </div>
       )}
 
-      <div className="card p-0 overflow-hidden" style={{ height: 640 }}>
+      <div className="card relative overflow-hidden p-0" style={{ height: 680 }} aria-busy={!mapReady || isFetching}>
+        {(!mapReady || isFetching) && (
+          <div className="pointer-events-none absolute right-4 top-4 z-10 inline-flex items-center gap-2 rounded-full border border-[rgb(var(--border)/0.7)] bg-[rgb(var(--panel-strong)/0.88)] px-3 py-2 text-xs text-ink-300 shadow-sm backdrop-blur-xl">
+            <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-accent-blue/25 border-t-accent-blue" />
+            {mapReady ? "Updating map..." : "Arranging entities..."}
+          </div>
+        )}
         <ReactFlow
           nodes={nodes}
           edges={edges}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onNodeClick={onNodeClick}
+          onNodeDoubleClick={onNodeDoubleClick}
           onInit={(inst) => (rfRef.current = inst)}
           nodeTypes={nodeTypes}
           fitView
           minZoom={0.1}
+          defaultEdgeOptions={{ type: "smoothstep" }}
+          onlyRenderVisibleElements
           proOptions={{ hideAttribution: true }}
         >
-          <Background color="#232a38" gap={20} />
-          <Controls className="!bg-base-800 !border-white/10 [&_button]:!bg-base-700 [&_button]:!border-white/10 [&_button]:!fill-ink-200" />
+          <Background color="rgb(var(--graph-grid))" gap={22} />
+          <MiniMap
+            pannable
+            zoomable
+            className="!rounded-3xl !border !border-[rgb(var(--border)/0.7)] !bg-[rgb(var(--panel)/0.76)]"
+            nodeColor={(node) => node.data?.color ?? "rgb(var(--accent-blue))"}
+            maskColor="rgb(var(--base-900) / 0.35)"
+          />
+          <Controls />
         </ReactFlow>
       </div>
 
@@ -362,7 +443,7 @@ export default function EntityMapPage() {
           focused={focusId === selected}
         />
       )}
-    </div>
+    </PageShell>
   );
 }
 
@@ -371,23 +452,81 @@ function layoutGraph(
   edges: { source: string; target: string; verb: string; severity: Severity; count: number }[],
   focus?: { focusId: string | null; hiddenNeighbors?: Map<string, number> },
 ) {
-  // Group by type into columns; lay out vertically within each column.
-  const columns: EntityType[] = ["ip", "user", "account", "host", "process", "service", "file", "url", "registry", "domain"];
-  const byType: Record<string, EntityNode[]> = {};
-  for (const n of nodes) (byType[n.type] ??= []).push(n);
+  const layerFor: Record<EntityType, number> = {
+    ip: 0,
+    domain: 0,
+    url: 0,
+    file: 0,
+    user: 1,
+    account: 1,
+    host: 1,
+    process: 2,
+    service: 3,
+    registry: 3,
+  };
+  const layers: Record<number, EntityNode[]> = {};
+  for (const n of nodes) (layers[layerFor[n.type] ?? 2] ??= []).push(n);
 
-  const COL_W = 280;
-  const ROW_H = 96;
+  const COL_W = 340;
+  const ROW_H = 118;
+
+  // Columns are the semantic lanes (external -> identity -> process -> system),
+  // ordered left to right. Empty lanes are skipped so there are no blank gaps.
+  const colKeys = Object.keys(layers).map(Number).sort((a, b) => a - b);
+
+  // Undirected adjacency restricted to nodes actually in this (filtered) view.
+  const present = new Set(nodes.map((n) => n.id));
+  const adj = new Map<string, string[]>();
+  for (const e of edges) {
+    if (!present.has(e.source) || !present.has(e.target)) continue;
+    (adj.get(e.source) ?? adj.set(e.source, []).get(e.source)!).push(e.target);
+    (adj.get(e.target) ?? adj.set(e.target, []).get(e.target)!).push(e.source);
+  }
+
+  // Strongest signal first, so high-severity / findings-heavy hubs anchor the
+  // top of their lane and ties are broken deterministically.
+  const scoreOf = (n: EntityNode) =>
+    SEVERITY_RANK[n.severity] * 1000 + n.findings.length * 100 + n.action_count;
+  for (const key of colKeys) {
+    layers[key].sort((a, b) => scoreOf(b) - scoreOf(a) || a.label.localeCompare(b.label));
+  }
+
+  // Barycenter ordering (Sugiyama): repeatedly reorder each lane by the mean row
+  // of its connected neighbors so linked entities line up across columns and
+  // edge crossings drop sharply. A handful of alternating passes converge for
+  // graphs this size, replacing the old fixed stacking that let branches overlap.
+  const rowOf = new Map<string, number>();
+  for (const key of colKeys) layers[key].forEach((n, i) => rowOf.set(n.id, i));
+  const barycenter = (n: EntityNode) => {
+    const nb = adj.get(n.id);
+    if (!nb || nb.length === 0) return rowOf.get(n.id)!;
+    let sum = 0;
+    for (const id of nb) sum += rowOf.get(id) ?? 0;
+    return sum / nb.length;
+  };
+  const orderingPasses = nodes.length > 400 ? 3 : 4;
+  for (let pass = 0; pass < orderingPasses; pass++) {
+    const sweep = pass % 2 === 0 ? colKeys : [...colKeys].reverse();
+    for (const key of sweep) {
+      const col = layers[key];
+      const bc = new Map(col.map((n) => [n.id, barycenter(n)] as const));
+      col.sort((a, b) => bc.get(a.id)! - bc.get(b.id)! || scoreOf(b) - scoreOf(a));
+      col.forEach((n, i) => rowOf.set(n.id, i));
+    }
+  }
+
+  // Center each lane vertically around a shared axis so branches stay balanced.
+  const tallest = Math.max(1, ...colKeys.map((k) => layers[k].length));
   const flowNodes: Node[] = [];
-  let colIdx = 0;
-  for (const t of columns) {
-    const group = byType[t];
-    if (!group?.length) continue;
-    group.forEach((n, i) => {
+  colKeys.forEach((key, colIdx) => {
+    const col = layers[key];
+    const offset = ((tallest - col.length) * ROW_H) / 2;
+    col.forEach((n, i) => {
+      const color = SEVERITY_COLORS[n.severity];
       flowNodes.push({
         id: n.id,
         type: "entity",
-        position: { x: colIdx * COL_W, y: i * ROW_H },
+        position: { x: colIdx * COL_W, y: offset + i * ROW_H },
         data: {
           type: n.type,
           label: n.label,
@@ -397,14 +536,17 @@ function layoutGraph(
           finding_count: n.findings.length,
           dead: n.meta?.dead ?? false,
           state: n.meta?.state,
+          manual: n.meta?.manual ?? false,
           focused: focus?.focusId === n.id,
           hiddenNeighbors: focus?.hiddenNeighbors?.get(n.id) ?? 0,
+          color,
         },
       });
     });
-    colIdx++;
-  }
+  });
 
+  const animateRiskEdges = edges.length <= 120;
+  const showEdgeLabels = edges.length <= 180;
   const flowEdges: Edge[] = edges.map((e, i) => {
     const active = e.severity !== "info";
     const color = SEVERITY_COLORS[e.severity];
@@ -412,13 +554,18 @@ function layoutGraph(
       id: `${e.source}-${e.target}-${i}`,
       source: e.source,
       target: e.target,
-      label: e.count > 1 ? `${e.verb} (${e.count})` : e.verb,
+      sourceHandle: "right",
+      targetHandle: "left",
+      label: showEdgeLabels ? (e.count > 1 ? `${e.verb} (${e.count})` : e.verb) : undefined,
       type: "smoothstep",
-      animated: e.severity === "critical" || e.severity === "high",
-      labelStyle: { fill: "#8b96b0", fontSize: 10 },
-      labelBgStyle: { fill: "#0f1218" },
-      style: { stroke: active ? color : "#2e3646", strokeWidth: active ? 2 : 1 },
-      markerEnd: { type: MarkerType.ArrowClosed, color: active ? color : "#2e3646" },
+      animated: animateRiskEdges && (e.severity === "critical" || e.severity === "high"),
+      labelStyle: { fill: "rgb(var(--ink-300))", fontSize: 10, fontWeight: 600 },
+      labelBgStyle: { fill: "rgb(var(--panel-strong))", fillOpacity: 0.88 },
+      labelBgPadding: [8, 4],
+      labelBgBorderRadius: 8,
+      pathOptions: { borderRadius: 24, offset: 34 },
+      style: { stroke: active ? color : "rgb(var(--border-strong))", strokeWidth: active ? 2.25 : 1.4 },
+      markerEnd: { type: MarkerType.ArrowClosed, color: active ? color : "rgb(var(--border-strong))" },
     };
   });
 

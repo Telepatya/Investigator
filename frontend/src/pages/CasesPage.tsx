@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import type { Case } from "../lib/types";
-import { EmptyState, Spinner } from "../components/common";
+import { ConfirmDialog, EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
 import { fmtRelative } from "../lib/ui";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -29,6 +29,7 @@ export default function CasesPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<Case | null>(null);
 
   const { data: cases, isLoading } = useQuery({
     queryKey: ["cases"],
@@ -48,22 +49,24 @@ export default function CasesPage() {
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => api.deleteCase(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["cases"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["cases"] });
+      setPendingDelete(null);
+    },
   });
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-ink-50">Investigations</h1>
-          <p className="text-sm text-ink-400 mt-1">
-            Ingest Velociraptor collections and memory dumps, then let the AI map the machine.
-          </p>
-        </div>
+    <PageShell>
+      <PageTitle
+        icon={<FolderSearch size={22} />}
+        title="Investigations"
+        subtitle="Ingest Velociraptor collections and memory dumps, then map the machine."
+        right={
         <button className="btn-primary" onClick={() => setShowCreate(true)}>
           <Plus size={16} /> New Case
         </button>
-      </div>
+        }
+      />
 
       {isLoading ? (
         <Spinner label="Loading cases…" />
@@ -79,19 +82,37 @@ export default function CasesPage() {
           }
         />
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {cases.map((c) => (
-            <CaseCard key={c.id} c={c} onDelete={() => deleteMut.mutate(c.id)} />
+            <CaseCard key={c.id} c={c} onDelete={() => setPendingDelete(c)} />
           ))}
         </div>
       )}
 
+      {pendingDelete && (
+        <ConfirmDialog
+          title="Delete investigation?"
+          message={
+            <>
+              <span className="font-semibold text-ink-100">{pendingDelete.name}</span> and all of its
+              parsed events, findings, processes, and memory results will be permanently removed. This
+              cannot be undone.
+            </>
+          }
+          confirmLabel="Delete case"
+          danger
+          busy={deleteMut.isPending}
+          onConfirm={() => deleteMut.mutate(pendingDelete.id)}
+          onClose={() => !deleteMut.isPending && setPendingDelete(null)}
+        />
+      )}
+
       {showCreate && (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4">
-          <div className="card p-6 w-full max-w-md">
+        <div className="modal-backdrop fixed inset-0 z-50 grid place-items-center p-4">
+          <div className="modal-panel w-full max-w-md rounded-2xl p-6">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-ink-50">New investigation</h2>
-              <button className="text-ink-400 hover:text-ink-100" onClick={() => setShowCreate(false)}>
+              <button className="text-ink-400 transition hover:text-ink-100 active:scale-95" onClick={() => setShowCreate(false)}>
                 <X size={18} />
               </button>
             </div>
@@ -131,13 +152,14 @@ export default function CasesPage() {
           </div>
         </div>
       )}
-    </div>
+    </PageShell>
   );
 }
 
 function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
+  const operationActive = c.status === "ingesting" || c.status === "analyzing";
   return (
-    <div className="card p-5 hover:border-accent-cyan/30 transition group relative">
+    <div className="card interactive-lift group relative p-5 hover:border-accent-blue/30">
       <div className="flex items-start justify-between">
         <Link to={`/cases/${c.id}/overview`} className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
@@ -150,7 +172,7 @@ function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
               </span>
             )}
           </div>
-          <h3 className="text-lg font-semibold text-ink-50 mt-2 truncate group-hover:text-accent-cyan transition">
+          <h3 className="text-lg font-semibold text-ink-50 mt-2 truncate transition group-hover:text-accent-blue">
             {c.name}
           </h3>
           <p className="text-sm text-ink-400 line-clamp-2 mt-1 min-h-[2.5rem]">
@@ -158,16 +180,17 @@ function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
           </p>
         </Link>
         <button
-          className="text-ink-500 hover:text-sev-critical p-1 opacity-0 group-hover:opacity-100 transition"
+          className="text-ink-500 hover:text-sev-critical p-1 opacity-0 group-hover:opacity-100 transition disabled:cursor-not-allowed disabled:opacity-30"
           onClick={onDelete}
-          title="Delete case"
+          disabled={operationActive}
+          title={operationActive ? "Wait for the active case operation to finish" : "Delete case"}
         >
           <Trash2 size={16} />
         </button>
       </div>
       <div className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-white/5">
         <Stat icon={<Activity size={14} />} label="events" value={c.event_count} />
-        <Stat icon={<AlertTriangle size={14} />} label="findings" value={c.finding_count} />
+        <Stat icon={<AlertTriangle size={14} />} label="findings" value={c.active_finding_count ?? c.finding_count} />
         <Stat icon={<Cpu size={14} />} label="procs" value={c.process_count} />
       </div>
       <div className="text-[11px] text-ink-500 mt-3">Updated {fmtRelative(c.updated_at)}</div>
@@ -175,7 +198,7 @@ function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
   );
 }
 
-function Stat({ icon, label, value }: { icon: React.ReactNode; label: string; value: number }) {
+function Stat({ icon, label, value }: { icon: ReactNode; label: string; value: number }) {
   return (
     <div className="flex flex-col items-center">
       <div className="flex items-center gap-1 text-ink-200 font-semibold">

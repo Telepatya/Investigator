@@ -11,6 +11,7 @@ export interface Case {
   updated_at: string;
   event_count: number;
   finding_count: number;
+  active_finding_count: number;
   process_count: number;
   has_memory_dump: boolean;
   ai_summary: string | null;
@@ -59,7 +60,7 @@ export interface TimelineEvt {
   severity: Severity;
   severity_reason: string | null;
   source: string;
-  raw: Record<string, unknown>;
+  raw?: Record<string, unknown>;
 }
 
 export interface Finding {
@@ -77,6 +78,8 @@ export interface Finding {
   suppressed_reason: string | null;
   benign: boolean;
   rule_disabled: boolean;
+  manual: boolean;
+  manual_id: string | null;
 }
 
 export interface FindingsResponse {
@@ -154,6 +157,10 @@ export interface EntityNodeMeta extends Record<string, unknown> {
   flags?: string[];
   state?: string;
   pids?: number[];
+  // True when an analyst raised this node via a manual finding.
+  manual?: boolean;
+  // On manual nodes: number of related entities correlated from event evidence.
+  correlated?: number;
 }
 
 export interface EntityEdge {

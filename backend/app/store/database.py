@@ -5,11 +5,11 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 
 from sqlalchemy import JSON, DateTime, Integer, String, Text, create_engine, event
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
 def utcnow() -> datetime:
@@ -109,10 +109,97 @@ class ChatHistory(Base):
 _ENGINE_CACHE: dict[Path, tuple[Engine, sessionmaker]] = {}
 _ENGINE_LOCK = Lock()
 _INITIALIZED: set[Path] = set()
+_WRITE_LOCKS: dict[Path, RLock] = {}
+
+
+def _is_write_statement(statement) -> bool:
+    """Return whether an execute() statement can mutate the case database."""
+    if any(
+        bool(getattr(statement, flag, False))
+        for flag in ("is_insert", "is_update", "is_delete")
+    ):
+        return True
+    text_value = getattr(statement, "text", None)
+    if not isinstance(text_value, str):
+        return False
+    first = text_value.lstrip().split(None, 1)[0].lower() if text_value.strip() else ""
+    return first in {"insert", "update", "delete", "replace", "create", "alter", "drop", "vacuum"}
+
+
+class SerializedWriteSession(Session):
+    """A normal SQLAlchemy session with a per-database writer gate.
+
+    SQLite WAL permits concurrent readers but still has one writer. Holding this
+    lock from the first flush/DML statement through commit or rollback prevents
+    independent background jobs from interleaving write transactions and
+    surfacing transient ``database is locked`` errors.
+    """
+
+    def __init__(self, *args, write_lock: RLock, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._write_lock = write_lock
+        self._owns_write_lock = False
+
+    def _acquire_write_lock(self) -> None:
+        if not self._owns_write_lock:
+            self._write_lock.acquire()
+            self._owns_write_lock = True
+
+    def acquire_write_lock(self) -> None:
+        """Lock before a read-modify-write sequence begins."""
+        self._acquire_write_lock()
+
+    def _release_write_lock(self) -> None:
+        if self._owns_write_lock:
+            self._owns_write_lock = False
+            self._write_lock.release()
+
+    def flush(self, objects=None) -> None:
+        if self.new or self.dirty or self.deleted:
+            self._acquire_write_lock()
+        return super().flush(objects)
+
+    def execute(self, statement, params=None, *, execution_options=None, bind_arguments=None, **kw):
+        if _is_write_statement(statement):
+            self._acquire_write_lock()
+        return super().execute(
+            statement,
+            params,
+            execution_options=execution_options,
+            bind_arguments=bind_arguments,
+            **kw,
+        )
+
+    def commit(self) -> None:
+        if self.new or self.dirty or self.deleted:
+            self._acquire_write_lock()
+        try:
+            return super().commit()
+        finally:
+            self._release_write_lock()
+
+    def rollback(self) -> None:
+        try:
+            return super().rollback()
+        finally:
+            self._release_write_lock()
+
+    def close(self) -> None:
+        try:
+            return super().close()
+        finally:
+            self._release_write_lock()
 
 
 def _normalize_db_path(db_path: str | Path) -> Path:
     return Path(db_path).expanduser().resolve()
+
+
+def acquire_session_write_lock(session: Session) -> None:
+    """Acquire the case writer gate before reading state that will be changed."""
+    acquire = getattr(session, "acquire_write_lock", None)
+    if acquire is not None:
+        acquire()
 
 
 def get_engine(db_path: str | Path) -> Engine:
@@ -132,14 +219,22 @@ def init_db(db_path: str | Path) -> sessionmaker:
         engine = create_engine(
             f"sqlite:///{path}",
             connect_args={"check_same_thread": False, "timeout": 30.0},
+            pool_pre_ping=True,
         )
         event.listen(engine, "connect", _configure_sqlite_connection)
-        factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+        write_lock = _WRITE_LOCKS.setdefault(path, RLock())
+        factory = sessionmaker(
+            bind=engine,
+            class_=SerializedWriteSession,
+            write_lock=write_lock,
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
         _ENGINE_CACHE[path] = (engine, factory)
-
-    if path not in _INITIALIZED:
-        _initialize_schema(path, engine)
-    return factory
+        if path not in _INITIALIZED:
+            _initialize_schema(path, engine)
+        return factory
 
 
 def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
