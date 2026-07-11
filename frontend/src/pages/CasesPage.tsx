@@ -60,7 +60,7 @@ export default function CasesPage() {
       <PageTitle
         icon={<FolderSearch size={22} />}
         title="Investigations"
-        subtitle="Ingest Velociraptor collections and memory dumps, then map the machine."
+        subtitle="Ingest logs, artifacts, and memory dumps, then map the machine."
         right={
         <button className="btn-primary" onClick={() => setShowCreate(true)}>
           <Plus size={16} /> New Case
@@ -74,7 +74,7 @@ export default function CasesPage() {
         <EmptyState
           icon={<FolderSearch size={40} />}
           title="No investigations yet"
-          hint="Create a case to upload Velociraptor output or a memory dump and start the AI-driven analysis."
+          hint="Create a case to upload logs, artifacts, or a memory dump and start the AI-driven analysis."
           action={
             <button className="btn-primary mt-2" onClick={() => setShowCreate(true)}>
               <Plus size={16} /> Create your first case

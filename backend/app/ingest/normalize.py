@@ -53,7 +53,7 @@ HOST_KEYS = ["Hostname", "hostname", "Computer", "computer", "Fqdn", "host", "Ho
 
 
 def parse_timestamp(value: Any) -> datetime | None:
-    """Best-effort timestamp parsing for the many formats Velociraptor emits."""
+    """Best-effort timestamp parsing for the many formats logs and artifacts emit."""
     if value is None:
         return None
     if isinstance(value, datetime):

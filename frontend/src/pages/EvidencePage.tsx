@@ -82,7 +82,7 @@ export default function EvidencePage() {
       <EmptyState
         icon={<FolderOpen size={40} />}
         title="No evidence uploaded"
-        hint="Use the Upload evidence button to add Velociraptor collections, event logs, text logs, or memory dumps to this case."
+        hint="Use the Upload evidence button to add log/artifact collections, event logs, text logs, Defender/Azure exports, or memory dumps to this case."
       />
     );
 

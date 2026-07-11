@@ -1,5 +1,6 @@
-"""Parsers for endpoint evidence: Velociraptor JSONL/JSON/CSV/EVTX/ZIP collections
-and Microsoft Defender Advanced Hunting (Device* table) JSON/CSV exports."""
+"""Parsers for endpoint and log evidence: JSONL/JSON/CSV/EVTX/ZIP collections
+(including Velociraptor artifacts and event logs) and Microsoft Defender Advanced
+Hunting / Azure (Sentinel) (Device* table) JSON/CSV exports."""
 
 from __future__ import annotations
 
@@ -1154,7 +1155,7 @@ def parse_file(path: Path, source: str | None = None) -> Iterator[dict[str, Any]
 
 
 def iter_zip_members(zip_path: Path, extract_dir: Path) -> Iterator[tuple[Path, str]]:
-    """Extract parsable members of a Velociraptor collector ZIP; yield (path, source_name)."""
+    """Extract parsable members of a collector ZIP (e.g. Velociraptor); yield (path, source_name)."""
     with zipfile.ZipFile(zip_path) as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -1180,10 +1181,9 @@ def iter_zip_members(zip_path: Path, extract_dir: Path) -> Iterator[tuple[Path, 
 
 
 def _source_from_member(member: Path) -> str:
-    """Velociraptor collector zips store results under results/Artifact.Name.json."""
-    name = member.stem
-    # strip common prefixes
-    for part in member.parts:
-        if part.lower() in ("results", "uploads", "files"):
-            continue
-    return name
+    """Derive an event source name from a collector-zip member path.
+
+    Collector zips (e.g. Velociraptor) store results under
+    results/Artifact.Name.json, so the artifact name is carried by the file stem
+    rather than the directory layout."""
+    return member.stem

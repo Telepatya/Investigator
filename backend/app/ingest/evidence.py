@@ -19,6 +19,17 @@ from app.store.cases import _rmtree_with_retries
 from app.store.database import Event, Finding, MemoryResult, Process, compact_db
 
 
+def sanitize_upload_filename(filename: str | None) -> str | None:
+    """Reduce a client-supplied filename to a bare basename so an upload can
+    never escape the case uploads directory. Both separators are normalized so a
+    Windows-style traversal ("..\\..\\x") is neutralized on POSIX too. Returns
+    None for empty or dot-only names, which callers should reject."""
+    name = Path((filename or "").replace("\\", "/")).name
+    if not name or name in (".", ".."):
+        return None
+    return name
+
+
 def _kind(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in MEMORY_EXTENSIONS:

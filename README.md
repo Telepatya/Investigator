@@ -1,8 +1,8 @@
-# Investigator — Velociraptor & Memory Forensics GUI (with AI support)
+# Investigator — DFIR & Memory Forensics GUI (with AI support)
 
 **Made by Roei.f**
 
-A fully local DFIR workstation. Ingest Velociraptor collections (events & artifacts) and raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
+A fully local DFIR workstation. Ingest endpoint and log evidence — event logs, EVTX, forensic artifacts, DFIR collections (e.g. Velociraptor), and Microsoft Defender / Azure logs — plus raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
 
 Everything runs on your machine. API keys are stored in your OS credential vault, never on disk in plaintext.
 
@@ -13,6 +13,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 ## Table of contents
 
 - [Features](#features)
+- [Supported evidence](#supported-evidence)
 - [Quick start](#quick-start)
 - [Configure the AI](#configure-the-ai)
 - [Working a case](#working-a-case)
@@ -26,7 +27,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 ## Features
 
 - **Bring your own AI.** Ollama (on-device) with live model discovery, or OpenAI, Anthropic, and Google Gemini with per-provider model catalogs and a built-in connection tester.
-- **Velociraptor ingestion.** Offline-collector ZIPs, JSON/JSONL artifact results, CSV, and EVTX are parsed and normalized into a unified event model with full-text search. Events and logs can also be fed in manually.
+- **Broad evidence ingestion.** Offline-collector ZIPs (e.g. Velociraptor), JSON/JSONL artifact results, CSV, EVTX/event logs, and Microsoft Defender / Azure (Sentinel) log exports are parsed and normalized into a unified event model with full-text search. Events and logs can also be fed in manually.
 - **Memory forensics.** MemProcFS process, module, VAD, thread, handle, network, service, and driver maps feed deterministic injection, hollowing, suspicious-service, network, and driver heuristics. Executable private-memory candidates are checked against VAD shape, module load order, live thread start addresses, network context, and machine-wide prevalence before escalation.
 - **APT hunting.** YARA sweep of memory using a bundled C2 / offensive-tooling ruleset (Cobalt Strike, Meterpreter, Sliver/Covenant/Havoc, Mimikatz, Rubeus, reflective loaders, shellcode markers) plus your own rules directory.
 - **Deterministic detection engine.** LOLBins, suspicious parent/child chains, masquerading, execution from staging directories, persistence, log clearing, and C2 beaconing — every finding mapped to MITRE ATT&CK before the LLM ever runs.
@@ -38,6 +39,65 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 | Entity map | Timeline |
 | --- | --- |
 | <img src="entitymap.png" alt="Interactive entity map with process relationships" width="460"> | <img src="timeline.png" alt="Investigation timeline view" width="460"> |
+
+## Supported evidence
+
+Investigator ingests a wide range of endpoint and log evidence. Anything below is parsed and
+normalized into the unified event/process/entity model, so it shows up in search, the timeline,
+the entity map, and the detection engine. Sources with a dedicated mapping get rich, typed
+summaries; **any other JSON / JSONL / CSV artifact rows still ingest generically** (timestamp,
+host, entity, and summary are extracted from common field names), so uncommon collectors and
+artifacts populate the case even without a purpose-built parser.
+
+### File formats
+
+| Format | Extensions | Notes |
+| --- | --- | --- |
+| Collection archive | `.zip` | Offline-collector bundles (e.g. Velociraptor); parsable members are auto-extracted, and the artifact name becomes the event source. |
+| Structured data | `.json`, `.jsonl`, `.csv` | JSON is auto-sniffed for array vs. one-object-per-line (JSONL); UTF-8/BOM tolerant. |
+| Windows event logs | `.evtx` | Parsed natively, and also recognized when exported as JSON/JSONL (e.g. `Windows.EventLogs.*` rows with a nested `System` envelope). |
+| Text / web logs | `.txt`, `.log` | Web access logs are parsed field-by-field; other lines ingest one event per line. |
+| Memory dumps | `.raw`, `.dmp`, `.mem`, `.vmem`, `.bin`, `.img`, `.lime`, `.dd` | Also extensionless dumps named `PhysicalMemory` / `memory` / `ram`. Analyzed with MemProcFS + YARA (optional). |
+
+### Windows event logs (typed mapping)
+
+- **Sysmon (Operational):** 1 process create, 3 network connect, 5 process terminate, 7 image/DLL load, 8 CreateRemoteThread, 10 ProcessAccess, 11 file create, 12 / 13 / 14 registry add / set / rename, 22 DNS query.
+- **Security:** 4688 / 4689 process create / exit; 4624 / 4625 logon success / failure; 4634 / 4647 logoff; 4648 explicit-credential logon; 4672 special privileges; 4720 / 4722 / 4724 / 4725 / 4726 / 4728 / 4732 / 4756 account and group management; 4697 service install; 4698 / 4702 scheduled-task create / update; 1102 security log cleared.
+- **System:** 7045 service install.
+- **PowerShell (Operational):** 4104 script-block logging.
+- **Task Scheduler (Operational):** 106 task registered.
+- Logon types are decoded (interactive, network, service, batch, unlock, remote-interactive / RDP, cached, new-credentials). Event IDs are always gated by channel/provider so IDs are never confused across logs. Unmapped event IDs are still ingested as generic event-log entries.
+
+### Microsoft Defender / Azure (Sentinel) Advanced Hunting
+
+Advanced Hunting exports (from the Defender portal or Log Analytics / Sentinel, JSON or CSV) are
+normalized onto the same schema as Sysmon/EVTX, so all detection, correlation, process-tree, and
+timeline machinery works over them unchanged. Recognized tables:
+
+`DeviceProcessEvents`, `DeviceNetworkEvents`, `DeviceFileEvents`, `DeviceRegistryEvents`,
+`DeviceLogonEvents`, `DeviceImageLoadEvents`, `DeviceEvents`, `DeviceNetworkInfo`, `DeviceInfo`
+(plus generic `AdvancedHunting` results). Both portal and Log Analytics timestamp columns
+(`TimeGenerated`, `Timestamp [UTC]`, …) are recognized.
+
+### Forensic artifacts
+
+- **NTFS USN journal** (`$UsnJrnl:$J`) — reason bits decoded; old/new names correlated by MFT `FileReferenceNumber` into single rename leads.
+- **Process listings** (pslist / pstree / processes rows) — promoted to first-class process entities with parent/child links.
+- **Download evidence** (`Windows.Detection.EvidenceOfDownload`, `Zone.Identifier` / `HostUrl`) — correlated into download-source → file → process chains.
+- **Any other artifact rows** (MFT, prefetch, Amcache, registry, services, scheduled tasks, etc.) ingest generically via timestamp/host/entity extraction.
+
+### Web and application logs
+
+- Apache / Nginx access logs in **Common Log Format** and **Combined Log Format** — method, path, status, client IP, user, referer, and user-agent are extracted into a `weblog` category.
+- Any other line-based text log is ingested one event per line for search and timeline.
+
+### Memory analysis (MemProcFS + YARA, optional)
+
+Process list (`pslist`) and hidden/terminated candidates (`psscan`), VAD map, threads, handles,
+loaded modules and drivers, network endpoints (`netscan`), services (`svcscan`), injection
+candidates (`malfind`), module-linkage checks (`ldrmodules`), MemProcFS forensic CSVs (`findevil`,
+timeline), and YARA scan hits — all cross-correlated and, where possible, attached back to concrete
+processes, modules, files, services, or connections.
 
 ## Quick start
 
@@ -88,7 +148,7 @@ With Ollama, no case data ever leaves your machine. With a remote provider, only
 ## Working a case
 
 1. **Create a case.**
-2. **Upload evidence** — drop a Velociraptor collection (ZIP / JSON / JSONL / CSV / EVTX) or a memory dump (`.raw`, `.dmp`, `.mem`, `.vmem`, `.lime`, ...). Ingestion, detection, and memory analysis run automatically with live progress.
+2. **Upload evidence** — drop a log or artifact collection (ZIP / JSON / JSONL / CSV / EVTX, including Velociraptor collections and Defender/Azure log exports) or a memory dump (`.raw`, `.dmp`, `.mem`, `.vmem`, `.lime`, ...). Ingestion, detection, and memory analysis run automatically with live progress.
 3. **Run AI analysis** — correlates everything into a report, timeline narrative, and per-finding verdicts.
 4. **Explore** the **Overview**, **Timeline**, **Entity Map**, **Memory**, **Findings**, and **Events** tabs, export the **Report**, or interrogate the case in **AI Chat**.
 
@@ -120,7 +180,7 @@ Memory correlation combines MemProcFS process, module, VAD, thread, handle, serv
 
 - **Python 3.11+**
 - **Node.js 18+**
-- Optional but recommended: `memprocfs` and `yara-python` (installed via `backend/requirements-memory.lock`). Without them, Velociraptor artifact analysis still works; raw memory-dump parsing and YARA scanning are skipped and reported in the UI health status.
+- Optional but recommended: `memprocfs` and `yara-python` (installed via `backend/requirements-memory.lock`). Without them, log and artifact analysis still works; raw memory-dump parsing and YARA scanning are skipped and reported in the UI health status.
 
 ## Architecture
 
