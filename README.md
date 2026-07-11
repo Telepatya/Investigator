@@ -13,6 +13,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 ## Table of contents
 
 - [Features](#features)
+- [Supported evidence](#supported-evidence)
 - [Quick start](#quick-start)
 - [Configure the AI](#configure-the-ai)
 - [Working a case](#working-a-case)
@@ -38,6 +39,65 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 | Entity map | Timeline |
 | --- | --- |
 | <img src="entitymap.png" alt="Interactive entity map with process relationships" width="460"> | <img src="timeline.png" alt="Investigation timeline view" width="460"> |
+
+## Supported evidence
+
+Investigator ingests a wide range of endpoint and log evidence. Anything below is parsed and
+normalized into the unified event/process/entity model, so it shows up in search, the timeline,
+the entity map, and the detection engine. Sources with a dedicated mapping get rich, typed
+summaries; **any other JSON / JSONL / CSV artifact rows still ingest generically** (timestamp,
+host, entity, and summary are extracted from common field names), so uncommon collectors and
+artifacts populate the case even without a purpose-built parser.
+
+### File formats
+
+| Format | Extensions | Notes |
+| --- | --- | --- |
+| Collection archive | `.zip` | Offline-collector bundles (e.g. Velociraptor); parsable members are auto-extracted, and the artifact name becomes the event source. |
+| Structured data | `.json`, `.jsonl`, `.csv` | JSON is auto-sniffed for array vs. one-object-per-line (JSONL); UTF-8/BOM tolerant. |
+| Windows event logs | `.evtx` | Parsed natively, and also recognized when exported as JSON/JSONL (e.g. `Windows.EventLogs.*` rows with a nested `System` envelope). |
+| Text / web logs | `.txt`, `.log` | Web access logs are parsed field-by-field; other lines ingest one event per line. |
+| Memory dumps | `.raw`, `.dmp`, `.mem`, `.vmem`, `.bin`, `.img`, `.lime`, `.dd` | Also extensionless dumps named `PhysicalMemory` / `memory` / `ram`. Analyzed with MemProcFS + YARA (optional). |
+
+### Windows event logs (typed mapping)
+
+- **Sysmon (Operational):** 1 process create, 3 network connect, 5 process terminate, 7 image/DLL load, 8 CreateRemoteThread, 10 ProcessAccess, 11 file create, 12 / 13 / 14 registry add / set / rename, 22 DNS query.
+- **Security:** 4688 / 4689 process create / exit; 4624 / 4625 logon success / failure; 4634 / 4647 logoff; 4648 explicit-credential logon; 4672 special privileges; 4720 / 4722 / 4724 / 4725 / 4726 / 4728 / 4732 / 4756 account and group management; 4697 service install; 4698 / 4702 scheduled-task create / update; 1102 security log cleared.
+- **System:** 7045 service install.
+- **PowerShell (Operational):** 4104 script-block logging.
+- **Task Scheduler (Operational):** 106 task registered.
+- Logon types are decoded (interactive, network, service, batch, unlock, remote-interactive / RDP, cached, new-credentials). Event IDs are always gated by channel/provider so IDs are never confused across logs. Unmapped event IDs are still ingested as generic event-log entries.
+
+### Microsoft Defender / Azure (Sentinel) Advanced Hunting
+
+Advanced Hunting exports (from the Defender portal or Log Analytics / Sentinel, JSON or CSV) are
+normalized onto the same schema as Sysmon/EVTX, so all detection, correlation, process-tree, and
+timeline machinery works over them unchanged. Recognized tables:
+
+`DeviceProcessEvents`, `DeviceNetworkEvents`, `DeviceFileEvents`, `DeviceRegistryEvents`,
+`DeviceLogonEvents`, `DeviceImageLoadEvents`, `DeviceEvents`, `DeviceNetworkInfo`, `DeviceInfo`
+(plus generic `AdvancedHunting` results). Both portal and Log Analytics timestamp columns
+(`TimeGenerated`, `Timestamp [UTC]`, …) are recognized.
+
+### Forensic artifacts
+
+- **NTFS USN journal** (`$UsnJrnl:$J`) — reason bits decoded; old/new names correlated by MFT `FileReferenceNumber` into single rename leads.
+- **Process listings** (pslist / pstree / processes rows) — promoted to first-class process entities with parent/child links.
+- **Download evidence** (`Windows.Detection.EvidenceOfDownload`, `Zone.Identifier` / `HostUrl`) — correlated into download-source → file → process chains.
+- **Any other artifact rows** (MFT, prefetch, Amcache, registry, services, scheduled tasks, etc.) ingest generically via timestamp/host/entity extraction.
+
+### Web and application logs
+
+- Apache / Nginx access logs in **Common Log Format** and **Combined Log Format** — method, path, status, client IP, user, referer, and user-agent are extracted into a `weblog` category.
+- Any other line-based text log is ingested one event per line for search and timeline.
+
+### Memory analysis (MemProcFS + YARA, optional)
+
+Process list (`pslist`) and hidden/terminated candidates (`psscan`), VAD map, threads, handles,
+loaded modules and drivers, network endpoints (`netscan`), services (`svcscan`), injection
+candidates (`malfind`), module-linkage checks (`ldrmodules`), MemProcFS forensic CSVs (`findevil`,
+timeline), and YARA scan hits — all cross-correlated and, where possible, attached back to concrete
+processes, modules, files, services, or connections.
 
 ## Quick start
 
