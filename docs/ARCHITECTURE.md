@@ -82,7 +82,7 @@ case route paths and the per-case database model.
 
 ```mermaid
 flowchart LR
-    EVIDENCE["Velociraptor collections / logs"]
+    EVIDENCE["Logs / artifacts / EVTX / Defender / collections"]
     MEMORY["Memory dumps"]
     USER["Analyst actions"]
 
@@ -282,7 +282,8 @@ only one database transaction.
 
 ### Ingestion and memory analysis
 
-`app/ingest` accepts Velociraptor ZIP, JSON, JSONL, CSV, and EVTX sources.
+`app/ingest` accepts ZIP collections (e.g. Velociraptor), JSON, JSONL, CSV, EVTX/event
+logs, and Microsoft Defender / Azure (Sentinel) log exports.
 
 - `parsers.py` streams source rows without requiring complete archive extraction.
 - `normalize.py` maps source-specific fields into the shared `Event` schema.

@@ -1,8 +1,8 @@
-# Investigator — Velociraptor & Memory Forensics GUI (with AI support)
+# Investigator — DFIR & Memory Forensics GUI (with AI support)
 
 **Made by Roei.f**
 
-A fully local DFIR workstation. Ingest Velociraptor collections (events & artifacts) and raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
+A fully local DFIR workstation. Ingest endpoint and log evidence — event logs, EVTX, forensic artifacts, DFIR collections (e.g. Velociraptor), and Microsoft Defender / Azure logs — plus raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
 
 Everything runs on your machine. API keys are stored in your OS credential vault, never on disk in plaintext.
 
@@ -26,7 +26,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 ## Features
 
 - **Bring your own AI.** Ollama (on-device) with live model discovery, or OpenAI, Anthropic, and Google Gemini with per-provider model catalogs and a built-in connection tester.
-- **Velociraptor ingestion.** Offline-collector ZIPs, JSON/JSONL artifact results, CSV, and EVTX are parsed and normalized into a unified event model with full-text search. Events and logs can also be fed in manually.
+- **Broad evidence ingestion.** Offline-collector ZIPs (e.g. Velociraptor), JSON/JSONL artifact results, CSV, EVTX/event logs, and Microsoft Defender / Azure (Sentinel) log exports are parsed and normalized into a unified event model with full-text search. Events and logs can also be fed in manually.
 - **Memory forensics.** MemProcFS process, module, VAD, thread, handle, network, service, and driver maps feed deterministic injection, hollowing, suspicious-service, network, and driver heuristics. Executable private-memory candidates are checked against VAD shape, module load order, live thread start addresses, network context, and machine-wide prevalence before escalation.
 - **APT hunting.** YARA sweep of memory using a bundled C2 / offensive-tooling ruleset (Cobalt Strike, Meterpreter, Sliver/Covenant/Havoc, Mimikatz, Rubeus, reflective loaders, shellcode markers) plus your own rules directory.
 - **Deterministic detection engine.** LOLBins, suspicious parent/child chains, masquerading, execution from staging directories, persistence, log clearing, and C2 beaconing — every finding mapped to MITRE ATT&CK before the LLM ever runs.
@@ -88,7 +88,7 @@ With Ollama, no case data ever leaves your machine. With a remote provider, only
 ## Working a case
 
 1. **Create a case.**
-2. **Upload evidence** — drop a Velociraptor collection (ZIP / JSON / JSONL / CSV / EVTX) or a memory dump (`.raw`, `.dmp`, `.mem`, `.vmem`, `.lime`, ...). Ingestion, detection, and memory analysis run automatically with live progress.
+2. **Upload evidence** — drop a log or artifact collection (ZIP / JSON / JSONL / CSV / EVTX, including Velociraptor collections and Defender/Azure log exports) or a memory dump (`.raw`, `.dmp`, `.mem`, `.vmem`, `.lime`, ...). Ingestion, detection, and memory analysis run automatically with live progress.
 3. **Run AI analysis** — correlates everything into a report, timeline narrative, and per-finding verdicts.
 4. **Explore** the **Overview**, **Timeline**, **Entity Map**, **Memory**, **Findings**, and **Events** tabs, export the **Report**, or interrogate the case in **AI Chat**.
 
@@ -120,7 +120,7 @@ Memory correlation combines MemProcFS process, module, VAD, thread, handle, serv
 
 - **Python 3.11+**
 - **Node.js 18+**
-- Optional but recommended: `memprocfs` and `yara-python` (installed via `backend/requirements-memory.lock`). Without them, Velociraptor artifact analysis still works; raw memory-dump parsing and YARA scanning are skipped and reported in the UI health status.
+- Optional but recommended: `memprocfs` and `yara-python` (installed via `backend/requirements-memory.lock`). Without them, log and artifact analysis still works; raw memory-dump parsing and YARA scanning are skipped and reported in the UI health status.
 
 ## Architecture
 

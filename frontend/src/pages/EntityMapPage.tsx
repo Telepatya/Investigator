@@ -316,7 +316,7 @@ export default function EntityMapPage() {
       <EmptyState
         icon={<Boxes size={40} />}
         title="No entities yet"
-        hint="Upload Velociraptor artifacts, event logs, web logs, or a memory dump. The map reconstructs users, IPs, hosts, processes and services and the actions between them."
+        hint="Upload logs, artifacts, event logs, web logs, Defender/Azure exports, or a memory dump. The map reconstructs users, IPs, hosts, processes and services and the actions between them."
       />
     );
 

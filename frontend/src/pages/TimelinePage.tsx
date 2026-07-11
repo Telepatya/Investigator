@@ -229,7 +229,7 @@ export default function TimelinePage() {
       <EmptyState
         icon={<Clock size={40} />}
         title="No timestamped events"
-        hint="Upload Velociraptor artifacts with timestamps (event logs, MFT, prefetch, etc.) to populate the machine timeline."
+        hint="Upload timestamped logs or artifacts (event logs, MFT, prefetch, Defender/Azure logs, etc.) to populate the machine timeline."
       />
     );
 

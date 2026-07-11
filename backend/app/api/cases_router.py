@@ -34,6 +34,14 @@ from app.store.operations import coordinator
 router = APIRouter(prefix="/api/cases", tags=["cases"])
 
 
+def _safe_upload_name(filename: str | None) -> str:
+    """Validate/normalize a client filename to a safe basename or 400."""
+    name = evidence_store.sanitize_upload_filename(filename)
+    if name is None:
+        raise HTTPException(400, "Invalid filename")
+    return name
+
+
 @router.get("")
 def get_cases() -> list[dict]:
     return case_store.list_cases()
@@ -74,8 +82,9 @@ async def upload_file(
     if not case:
         raise HTTPException(404, "Case not found")
 
+    safe_name = _safe_upload_name(file.filename)
     uploads = case_uploads_path(case_id)
-    dest = uploads / file.filename
+    dest = uploads / safe_name
     async with aiofiles.open(dest, "wb") as out:
         while True:
             chunk = await file.read(4 * 1024 * 1024)
@@ -89,7 +98,7 @@ async def upload_file(
         "eventlogs": bool(mem_eventlogs),
     }
     asyncio.create_task(manager.run_ingestion(case_id, dest, file_type, memory_options))
-    return {"ok": True, "filename": file.filename, "path": str(dest)}
+    return {"ok": True, "filename": safe_name, "path": str(dest)}
 
 
 @router.post("/{case_id}/upload-chunk")
@@ -108,8 +117,9 @@ async def upload_chunk(
     if not case:
         raise HTTPException(404, "Case not found")
 
+    safe_name = _safe_upload_name(filename)
     uploads = case_uploads_path(case_id)
-    dest = uploads / filename
+    dest = uploads / safe_name
     mode = "wb" if chunk_index == 0 else "ab"
     async with aiofiles.open(dest, mode) as out:
         while True:
@@ -124,7 +134,7 @@ async def upload_chunk(
             "eventlogs": bool(mem_eventlogs),
         }
         asyncio.create_task(manager.run_ingestion(case_id, dest, file_type, memory_options))
-        return {"ok": True, "complete": True, "filename": filename}
+        return {"ok": True, "complete": True, "filename": safe_name}
     return {"ok": True, "complete": False, "chunk_index": chunk_index}
 
 

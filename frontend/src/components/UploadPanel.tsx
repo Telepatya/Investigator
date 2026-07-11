@@ -137,7 +137,7 @@ export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseS
                 }`}
               >
                 <FileArchive size={18} className="text-accent-blue" />
-                <div className="text-sm font-medium text-ink-100 mt-1.5">Velociraptor</div>
+                <div className="text-sm font-medium text-ink-100 mt-1.5">Logs &amp; artifacts</div>
                 <div className="text-[11px] text-ink-500">ZIP, JSON, JSONL, CSV, EVTX</div>
               </button>
               <button
