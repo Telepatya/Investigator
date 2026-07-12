@@ -41,9 +41,20 @@ ENTRA_SIGNIN_CODES = {
 
 def _sget(row: dict[str, Any], *names: str) -> str:
     """First non-empty value among names (case/space/underscore-insensitive)."""
-    from app.ingest.parsers import _row_get  # deferred: parsers imports this module
-    val = _row_get(row, *names)
-    return str(val).strip() if val not in (None, "") else ""
+    for name in names:
+        val = row.get(name)
+        if val not in (None, ""):
+            return str(val).strip()
+    wanted = {name.lower().replace(" ", "").replace("_", "") for name in names}
+    for key, val in row.items():
+        normalized = (
+            key.lower().replace(" ", "").replace("_", "")
+            if isinstance(key, str)
+            else ""
+        )
+        if normalized in wanted and val not in (None, ""):
+            return str(val).strip()
+    return ""
 
 
 def _table_from_source(source: str, row: dict[str, Any]) -> str:
@@ -55,7 +66,7 @@ def _table_from_source(source: str, row: dict[str, Any]) -> str:
     return ""
 
 
-def _sentinel_table(row: dict[str, Any], source: str) -> str:
+def sentinel_table(row: dict[str, Any], source: str) -> str:
     """Resolve the Sentinel table by name, then by column signature."""
     table = _table_from_source(source, row)
     if table:
@@ -79,7 +90,7 @@ def _sentinel_table(row: dict[str, Any], source: str) -> str:
 
 
 def is_sentinel_row(row: dict[str, Any], source: str) -> bool:
-    return bool(_sentinel_table(row, source))
+    return bool(sentinel_table(row, source))
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +131,10 @@ def _flatten_eventdata(flat: dict[str, Any]) -> None:
     flat["EventData"] = truncate(raw_xml, 500)
 
 
-def _map_securityevent(row: dict[str, Any], source: str) -> dict[str, Any]:
-    from app.ingest.parsers import _apply_windows_event_mapping, _json_safe
-
+def prepare_securityevent(row: dict[str, Any]) -> dict[str, Any]:
+    """Flatten and enrich a Sentinel SecurityEvent row for the shared Windows
+    EventID mapper. The mapper itself remains owned by parsers.py, avoiding an
+    import cycle between the generic parser and Sentinel recognition."""
     flat = dict(row)
     flat["EventID"] = str(_sget(row, "EventID") or "")
     if not flat.get("Channel"):
@@ -138,18 +150,7 @@ def _map_securityevent(row: dict[str, Any], source: str) -> dict[str, Any]:
         if user and not flat.get("TargetUserName"):
             flat["TargetUserName"] = user
 
-    event: dict[str, Any] = {
-        "timestamp": extract_timestamp(flat),
-        "host": _sget(flat, "Computer") or None,
-        "source": source,
-        "category": "eventlog",
-        "entity": None,
-        "severity": "info",
-        "summary": "",
-        "raw": _json_safe(flat),
-    }
-    _apply_windows_event_mapping(event, event["raw"])
-    return event
+    return flat
 
 
 # ---------------------------------------------------------------------------
@@ -285,17 +286,17 @@ def _map_auditlogs(row: dict[str, Any], source: str) -> dict[str, Any]:
 
 
 _SENTINEL_TABLE_MAPPERS = {
-    "securityevent": _map_securityevent,
     "syslog": _map_syslog_table,
     "signinlogs": _map_signinlogs,
     "auditlogs": _map_auditlogs,
 }
 
 
-def normalize_sentinel_row(row: dict[str, Any], source: str) -> dict[str, Any]:
-    table = _sentinel_table(row, source)
+def normalize_sentinel_row(
+    row: dict[str, Any], source: str, table: str | None = None
+) -> dict[str, Any]:
+    table = table or sentinel_table(row, source)
     mapper = _SENTINEL_TABLE_MAPPERS.get(table)
     if mapper:
         return mapper(row, source)
-    # Should not happen (is_sentinel_row gated), but stay best-effort.
-    return _map_securityevent(row, source)
+    raise ValueError(f"Sentinel table requires parser-owned mapping: {table or '<unknown>'}")

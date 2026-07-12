@@ -30,7 +30,7 @@ from app.ingest.normalize import (
     summarize_row,
     truncate,
 )
-from app.ingest.sentinel import is_sentinel_row, normalize_sentinel_row
+from app.ingest.sentinel import normalize_sentinel_row, prepare_securityevent, sentinel_table
 
 # Map artifact-name fragments to event categories
 CATEGORY_HINTS = [
@@ -94,8 +94,11 @@ def normalize_row(row: dict[str, Any], source: str) -> dict[str, Any]:
         return _normalize_defender_row(row, source)
     if is_journald_row(row):
         return normalize_journald_row(row, source)
-    if is_sentinel_row(row, source):
-        return normalize_sentinel_row(row, source)
+    table = sentinel_table(row, source)
+    if table == "securityevent":
+        return _normalize_sentinel_securityevent(row, source)
+    if table:
+        return normalize_sentinel_row(row, source, table)
     return {
         "timestamp": extract_timestamp(row),
         "host": extract_host(row),
@@ -1078,6 +1081,24 @@ def _apply_windows_event_mapping(event: dict[str, Any], flat: dict[str, Any]) ->
         event["entity"] = f"EventID {eid or '?'} ({channel})"
 
 
+def _normalize_sentinel_securityevent(row: dict[str, Any], source: str) -> dict[str, Any]:
+    """Prepare a Sentinel SecurityEvent row, then reuse the parser-owned Windows
+    EventID classifier without creating a parsers <-> sentinel import cycle."""
+    flat = prepare_securityevent(row)
+    event: dict[str, Any] = {
+        "timestamp": extract_timestamp(flat),
+        "host": _row_get(flat, "Computer"),
+        "source": source,
+        "category": "eventlog",
+        "entity": None,
+        "severity": "info",
+        "summary": "",
+        "raw": _json_safe(flat),
+    }
+    _apply_windows_event_mapping(event, event["raw"])
+    return event
+
+
 def _normalize_vr_evtx_row(row: dict[str, Any], source: str) -> dict[str, Any]:
     flat = _flatten_vr_evtx_row(row)
     event: dict[str, Any] = {
@@ -1318,6 +1339,8 @@ def iter_zip_members(zip_path: Path, extract_dir: Path) -> Iterator[tuple[Path, 
                 member_ts = datetime(*info.date_time, tzinfo=timezone.utc).timestamp()
                 os.utime(target, (member_ts, member_ts))
             except (OSError, OverflowError, ValueError):
+                # Best-effort metadata preservation only: continue parsing if the
+                # ZIP timestamp is invalid or the filesystem rejects os.utime().
                 pass
             # derive source name from the artifact path inside the zip
             source = _source_from_member(member_path)

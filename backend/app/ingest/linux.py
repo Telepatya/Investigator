@@ -123,9 +123,6 @@ _USERDEL_RE = re.compile(r"(?:delete|remove(?:d)?) user '?(?P<user>[^'\s]+)", re
 _CRON_CMD_RE = re.compile(r"^\((?P<user>[^)]+)\)\s+CMD\s+\((?P<cmd>.*)\)\s*$")
 _CRONTAB_RE = re.compile(r"^\((?P<user>[^)]+)\)\s+(?P<action>REPLACE|EDIT|DELETE|LIST)\b")
 
-_PRIV_GROUPS = {"sudo", "wheel", "root", "admin", "adm", "docker"}
-
-
 def classify_syslog_event(
     rec: dict[str, Any], source: str, extra: dict[str, Any] | None = None
 ) -> dict[str, Any]:
