@@ -135,6 +135,27 @@ def update_case_meta(case_id: str, *, include_stats: bool = True, **kwargs) -> d
     return {**meta, **get_case_stats(case_id)}
 
 
+def recover_interrupted_case_operations() -> list[str]:
+    """Release transient case states left behind by a stopped backend.
+
+    Ingestion and analysis jobs live only in the backend process. At startup no
+    such job can still be active, so persisted busy states are necessarily stale.
+    """
+    with _REGISTRY_LOCK:
+        registry = _load_registry()
+        recovered: list[str] = []
+        now = datetime.now(timezone.utc).isoformat()
+        for case_id, meta in registry.get("cases", {}).items():
+            if meta.get("status") not in {"ingesting", "analyzing"}:
+                continue
+            meta["status"] = "ready"
+            meta["updated_at"] = now
+            recovered.append(case_id)
+        if recovered:
+            _save_registry(registry)
+        return recovered
+
+
 def case_exists(case_id: str) -> bool:
     if not _CASE_ID_RE.fullmatch(case_id or ""):
         return False

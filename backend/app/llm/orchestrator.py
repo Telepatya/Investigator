@@ -23,6 +23,7 @@ MAX_EVIDENCE_ROWS_PER_BATCH = 40
 MAX_CATEGORIES = 12
 MEMO_THRESHOLD_CHARS = 6000  # un-summarized history beyond the raw tail triggers a memo update
 MEMO_KEEP_RAW = 6  # newest messages always sent raw, never folded into the memo
+MAX_CHAT_TOOL_CONTEXT_CHARS = 60000
 _SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 _FINDING_TOPIC_WORDS = {
     "beacon", "cobalt", "credential", "dkom", "execution", "handle", "hollowing",
@@ -76,6 +77,36 @@ async def _complete(messages: list[dict[str, str]]) -> str:
     async for c in result:
         chunks.append(c)
     return "".join(chunks)
+
+
+async def _retry_plain_text_answer(provider, messages: list[dict[str, str]]) -> str:
+    """Retry a provider response that contained no displayable text."""
+    retry_messages = [*messages, {
+        "role": "user",
+        "content": (
+            "Your previous response contained no displayable text. Answer the USER QUESTION now "
+            "using the supplied case context and gathered tool results. Return plain text or "
+            "Markdown only. Do not call functions, request more tools, or emit JSON tool calls."
+        ),
+    }]
+    result = await provider.complete(retry_messages, stream=False)
+    if isinstance(result, str):
+        return result.strip()
+    chunks: list[str] = []
+    async for chunk in result:
+        chunks.append(chunk)
+    return "".join(chunks).strip()
+
+
+def _chat_tool_context(gathered: list[dict]) -> str:
+    if not gathered:
+        return ""
+    context = "\n\nADDITIONAL DATA PULLED FROM THE CASE DATABASE:\n" + "\n\n".join(
+        f"[{item['tool']} {json.dumps(item['args'], default=str)}]\n"
+        f"{item.get('result', item['result_preview'])}"
+        for item in gathered
+    )
+    return context[:MAX_CHAT_TOOL_CONTEXT_CHARS]
 
 
 async def _complete_json(messages: list[dict[str, str]], parser, *, repair: bool = True):
@@ -690,13 +721,7 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
         except Exception:
             gathered = []
 
-        tool_context = ""
-        if gathered:
-            tool_context = "\n\nADDITIONAL DATA PULLED FROM THE CASE DATABASE:\n" + "\n\n".join(
-                f"[{t['tool']} {json.dumps(t['args'], default=str)}]\n{t.get('result', t['result_preview'])}"
-                for t in gathered
-            )
-            tool_context = tool_context[:12000]
+        tool_context = _chat_tool_context(gathered)
 
         # --- Phase 2: streamed final answer ---
         system_content = prompts.CHAT_SYSTEM
@@ -723,6 +748,16 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
             async for chunk in result:
                 full.append(chunk)
                 yield chunk
+
+        if not "".join(full).strip():
+            retry_text = await _retry_plain_text_answer(provider, messages)
+            if not retry_text:
+                retry_text = (
+                    "The model returned no text after gathering the evidence. "
+                    "Please retry the question; the retrieved case records were not modified."
+                )
+            full.append(retry_text)
+            yield retry_text
 
         case_store.save_chat(session, "assistant", "".join(full))
         session.commit()

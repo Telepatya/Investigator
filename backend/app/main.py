@@ -15,7 +15,11 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api import analysis_router, cases_router, settings_router
 from app.config import ensure_dirs
-from app.store.cases import cleanup_orphan_case_dirs, cleanup_stale_case_artifacts
+from app.store.cases import (
+    cleanup_orphan_case_dirs,
+    cleanup_stale_case_artifacts,
+    recover_interrupted_case_operations,
+)
 from app.store.database import dispose_all_db_engines
 
 logger = logging.getLogger(__name__)
@@ -28,6 +32,8 @@ APP_CREDIT = "Made by Roei.f"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_dirs()
+    for case_id in recover_interrupted_case_operations():
+        logger.warning("Recovered interrupted operation state for case %s", case_id)
     for result in cleanup_orphan_case_dirs():
         if result.get("status") == "failed":
             logger.warning(

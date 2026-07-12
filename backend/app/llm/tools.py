@@ -20,7 +20,7 @@ from app.store import cases as case_store
 from app.detect import overrides
 from app.store.database import Event, Finding, MemoryResult, Process
 
-MAX_RESULT_CHARS = 3000
+MAX_RESULT_CHARS = 8000
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
 
@@ -227,7 +227,7 @@ def get_event(session: Session, args: dict) -> str:
         "severity": event.severity, "category": event.category, "source": event.source,
         "host": event.host, "entity": event.entity, "summary": event.summary,
         "raw": event.raw,
-    }, default=str), 5000)
+    }, default=str), 20000)
 
 
 def filter_events(session: Session, args: dict) -> str:
@@ -502,6 +502,94 @@ def count_events(session: Session, args: dict) -> str:
     return _cap("\n".join(f"{k or '(none)'}: {n}" for k, n in rows[:40]) or "No events.")
 
 
+def list_downloads(session: Session, args: dict) -> str:
+    """List distinct download records from events and correlated findings."""
+    from app.detect.engine import _download_evidence
+
+    limit = _limit(args.get("limit"), 500)
+    path_filter = (_opt_str(args.get("path_substring")) or "").lower()
+    events = session.scalars(
+        select(Event)
+        .where(func.lower(Event.source).like("%evidenceofdownload%"))
+        .order_by(Event.timestamp, Event.id)
+    )
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add_download(
+        path: str, url: str | None, *, event_id: int | None = None,
+        finding_id: int | None = None, timestamp: str | None = None,
+    ) -> None:
+        if path_filter and path_filter not in path.lower():
+            return
+        key = (path.lower(), (url or "").lower())
+        existing = by_key.get(key)
+        if existing:
+            if finding_id is not None:
+                existing["finding_id"] = finding_id
+            if event_id is not None:
+                existing["event_id"] = event_id
+            return
+        by_key[key] = {
+            "event_id": event_id,
+            "finding_id": finding_id,
+            "timestamp": timestamp,
+            "path": path,
+            "url": url,
+        }
+
+    for event in events:
+        path, url = _download_evidence(event, event.raw or {})
+        if not path:
+            continue
+        add_download(
+            path, url, event_id=event.id,
+            timestamp=event.timestamp.isoformat() if event.timestamp else None,
+        )
+
+    # Correlation findings retain the chosen artifact event and origin URL. This
+    # is important when a large browser-artifact source crowds a notable binary
+    # out of a bounded event query or when provenance exists only in the finding.
+    for finding in session.scalars(select(Finding)):
+        evidence = finding.evidence or {}
+        if evidence.get("artifact_kind") != "download":
+            continue
+        path = str(evidence.get("artifact_path") or "").strip()
+        if not path:
+            continue
+        add_download(
+            path,
+            str(evidence.get("origin_url") or "").strip() or None,
+            event_id=_opt_int(evidence.get("artifact_event_id")),
+            finding_id=finding.id,
+        )
+
+    notable_re = re.compile(
+        r"\.(?:exe|msi|dll|sys|ps1|bat|cmd|vbs|scr|com|zip|7z|rar|gz|iso|cab)$",
+        re.IGNORECASE,
+    )
+    downloads = sorted(
+        by_key.values(),
+        key=lambda item: (
+            not bool(notable_re.search(str(item["path"]))),
+            not bool(item["url"]),
+            str(item["path"]).lower(),
+        ),
+    )
+    total = len(downloads)
+    selected = downloads[:limit]
+    while True:
+        payload = {
+            "total_count": total,
+            "returned_count": len(selected),
+            "truncated": len(selected) < total,
+            "downloads": selected,
+        }
+        text = json.dumps(payload, default=str)
+        if len(text) <= 40000 or not selected:
+            return text
+        selected.pop()
+
+
 _TOOLS: dict[str, Callable[[Session, dict], str]] = {
     "get_case_overview": get_case_overview,
     "get_event": get_event,
@@ -511,6 +599,7 @@ _TOOLS: dict[str, Callable[[Session, dict], str]] = {
     "get_memory_results": get_memory_results,
     "get_findings": get_findings,
     "get_finding": get_finding,
+    "list_downloads": list_downloads,
     "count_events": count_events,
 }
 
@@ -564,6 +653,8 @@ def describe_call(name: str, args: dict) -> str:
         return "checked memory analysis results"
     if name == "get_findings":
         return "reviewed recorded findings"
+    if name == "list_downloads":
+        return "listed downloaded files and origin URLs"
     if name == "count_events":
         return f"counted events by {args.get('group_by', 'category')}"
     return f"ran {name}"

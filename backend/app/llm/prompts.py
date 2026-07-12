@@ -201,6 +201,7 @@ TOOLS:
 - get_event: exact event including raw fields. args: {"event_id": 123}
 - search_events: full-text search over case events. args: {"query": "search terms", "limit": 25}
 - filter_events: filter events by fields. args (all optional): {"category": "...", "severity_min": "info|low|medium|high|critical", "entity_substring": "...", "source_substring": "...", "since": "ISO-8601 timestamp", "until": "ISO-8601 timestamp", "limit": 25}
+- list_downloads: list unique downloaded file paths with URLs plus event/finding IDs, prioritizing executables and archives. args: {"limit": 200, "path_substring": "optional filename"}. Use this instead of opening download events one by one when the analyst asks for downloaded files or URLs.
 - get_process: look up processes with their parent/children. args: {"pid": 1234} or {"name_substring": "svchost"}
 - get_memory_results: memory analysis results including correlation data (VAD shape, thread starts, network context, and corroborating artifacts). args (all optional): {"pid": 1234, "plugin": "malfind", "severity_min": "high", "limit": 20}
 - get_findings: recorded findings; suppressed are excluded by default. args (all optional): {"severity_min": "medium", "include_suppressed": false, "limit": 20}
@@ -231,7 +232,9 @@ underlying evidence. Then return the 2-3 sentence verdict via {"final": "..."}."
 CHAT_GATHER = """You are gathering evidence from a DFIR case database to answer the analyst's \
 question. Do NOT answer the question in this phase. Call tools to pull the specific events, \
 processes, memory results, or findings needed to answer well. When you have gathered enough - or \
-immediately, if the provided context already suffices - reply exactly {"final": "ready"}."""
+immediately, if the provided context already suffices - reply exactly {"final": "ready"}. \
+For questions asking for downloaded files or their URLs, call list_downloads first rather than \
+filtering and opening individual events."""
 
 CHAT_MEMO = """Update this running investigation memo for a DFIR case chat session.
 
@@ -249,7 +252,8 @@ CHAT_SYSTEM = """You are the Investigator DFIR assistant answering questions abo
 Use ONLY the provided case context (findings, events, processes, memory results) to answer. \
 Cite exact records using [[event:123]] and [[finding:5]] in addition to specific PIDs, paths, \
 timestamps, and titles. Never rely on a suppressed finding, even if an older conversation memo did. If the context does not \
-contain the answer, say what additional artifact would be needed. Be concise and technical."""
+contain the answer, say what additional artifact would be needed. Be concise and technical. \
+This is the final-answer phase: return plain text or Markdown only; never call functions or emit tool-call JSON."""
 
 CHAT_CONTEXT = """Case context relevant to the question:
 

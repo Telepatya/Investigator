@@ -6,6 +6,7 @@ from __future__ import annotations
 # as explicit nodes/edges: the downloaded file (and its origin URL when known)
 # linked to the process that later ran it -- not just a finding on the process.
 
+import json
 import sys
 import tempfile
 import types
@@ -41,9 +42,10 @@ sys.modules.setdefault("pydantic", types.SimpleNamespace(
 
 from app.detect import entity_graph
 from app.detect.engine import run_detections_sync
+from app.llm.tools import list_downloads
 from app.store import cases
 from app.store import database
-from app.store.database import Process
+from app.store.database import Finding, Process
 
 
 class DownloadCorrelationTests(unittest.TestCase):
@@ -113,6 +115,75 @@ class DownloadCorrelationTests(unittest.TestCase):
         # the process node is the flagged one (finding attached to the same node)
         proc = next(n for n in graph["nodes"] if n["id"] == "process::velociraptor.exe")
         self.assertTrue(any("later executed" in f["title"] for f in proc["findings"]))
+
+    def test_list_downloads_returns_file_url_and_event_id(self) -> None:
+        case = cases.create_case("download inventory")
+        session = cases.get_session(case["id"])
+        try:
+            event = cases.add_event(
+                session, timestamp=None, host="H",
+                source="Windows.Analysis.EvidenceOfDownload.json",
+                category="filesystem", entity=r"C:\Downloads\payload.exe",
+                severity="info", summary="Downloaded payload.exe",
+                raw={
+                    "FullPath": r"C:\Downloads\payload.exe",
+                    "Url": "https://downloads.example/payload.exe",
+                },
+            )
+            session.commit()
+
+            result = json.loads(list_downloads(session, {"limit": 200}))
+        finally:
+            session.close()
+
+        self.assertEqual(result["total_count"], 1)
+        self.assertEqual(result["downloads"][0]["event_id"], event.id)
+        self.assertEqual(
+            result["downloads"][0]["url"],
+            "https://downloads.example/payload.exe",
+        )
+
+    def test_list_downloads_includes_finding_provenance_and_prioritizes_binary(self) -> None:
+        case = cases.create_case("finding download inventory")
+        session = cases.get_session(case["id"])
+        binary = r"\\.\C:\Users\roeif\Downloads\Collector_velociraptor.exe"
+        internal_url = (
+            "https://127.0.0.1:8889/api/v1/DownloadVFSFile?"
+            "fs_components=Collector_velociraptor.exe"
+        )
+        try:
+            # A web asset would sort first alphabetically, but notable binaries
+            # must be prioritized before high-volume browser artifacts.
+            cases.add_event(
+                session, timestamp=None, host="H",
+                source="Windows.Analysis.EvidenceOfDownload.json",
+                category="filesystem", entity="a.js", severity="info",
+                summary="Downloaded web asset",
+                raw={"FullPath": "a.js", "Url": "https://static.example/a.js"},
+            )
+            finding = Finding(
+                title="File artifact later executed: Collector_velociraptor.exe",
+                description="download then execution", severity="medium",
+                mitre_techniques=["T1105"], source="correlation",
+                evidence={
+                    "artifact_kind": "download",
+                    "artifact_path": binary,
+                    "artifact_event_id": 9,
+                    "origin_url": internal_url,
+                },
+            )
+            session.add(finding)
+            session.commit()
+
+            result = json.loads(list_downloads(session, {"limit": 1}))
+        finally:
+            session.close()
+
+        self.assertEqual(result["returned_count"], 1)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["downloads"][0]["path"], binary)
+        self.assertEqual(result["downloads"][0]["finding_id"], finding.id)
+        self.assertEqual(result["downloads"][0]["url"], internal_url)
 
     def test_velociraptor_evidenceofdownload_fields(self) -> None:
         # Velociraptor Windows.Detection.EvidenceOfDownload emits FullPath + URL /

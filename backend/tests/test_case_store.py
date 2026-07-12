@@ -87,6 +87,22 @@ class CaseStoreTests(unittest.TestCase):
         self.assertIn(db_path, database._ENGINE_CACHE)
         self.assertEqual(len(database._ENGINE_CACHE), 1)
 
+    def test_startup_recovers_only_transient_case_statuses(self) -> None:
+        ingesting = cases.create_case("interrupted ingest")
+        analyzing = cases.create_case("interrupted analysis")
+        ready = cases.create_case("already ready")
+        cases.update_case_meta(ingesting["id"], include_stats=False, status="ingesting")
+        cases.update_case_meta(analyzing["id"], include_stats=False, status="analyzing")
+        cases.update_case_meta(ready["id"], include_stats=False, status="ready")
+
+        recovered = cases.recover_interrupted_case_operations()
+
+        self.assertCountEqual(recovered, [ingesting["id"], analyzing["id"]])
+        registry = json.loads((self.root / "registry.json").read_text(encoding="utf-8"))
+        self.assertEqual(registry["cases"][ingesting["id"]]["status"], "ready")
+        self.assertEqual(registry["cases"][analyzing["id"]]["status"], "ready")
+        self.assertEqual(registry["cases"][ready["id"]]["status"], "ready")
+
     def test_case_writes_are_serialized_until_commit(self) -> None:
         case = cases.create_case("serialized writes")
         first = cases.get_session(case["id"])
