@@ -53,10 +53,10 @@ artifacts populate the case even without a purpose-built parser.
 
 | Format | Extensions | Notes |
 | --- | --- | --- |
-| Collection archive | `.zip` | Offline-collector bundles (e.g. Velociraptor); parsable members are auto-extracted, and the artifact name becomes the event source. |
+| Collection archive | `.zip` | Offline-collector bundles (e.g. Velociraptor); parsable members are auto-extracted, the artifact name becomes the event source, and member timestamps are preserved for timestamp inference. |
 | Structured data | `.json`, `.jsonl`, `.csv` | JSON is auto-sniffed for array vs. one-object-per-line (JSONL); UTF-8/BOM tolerant. |
 | Windows event logs | `.evtx` | Parsed natively, and also recognized when exported as JSON/JSONL (e.g. `Windows.EventLogs.*` rows with a nested `System` envelope). |
-| Text / web logs | `.txt`, `.log` | Web access logs are parsed field-by-field; other lines ingest one event per line. |
+| Text / web logs | `.txt`, `.log` | Web access logs (CLF/Combined) and Linux syslog / auth.log / auditd lines are parsed field-by-field; other lines ingest one event per line. |
 | Memory dumps | `.raw`, `.dmp`, `.mem`, `.vmem`, `.bin`, `.img`, `.lime`, `.dd` | Also extensionless dumps named `PhysicalMemory` / `memory` / `ram`. Analyzed with MemProcFS + YARA (optional). |
 
 ### Windows event logs (typed mapping)
@@ -77,7 +77,44 @@ timeline machinery works over them unchanged. Recognized tables:
 `DeviceProcessEvents`, `DeviceNetworkEvents`, `DeviceFileEvents`, `DeviceRegistryEvents`,
 `DeviceLogonEvents`, `DeviceImageLoadEvents`, `DeviceEvents`, `DeviceNetworkInfo`, `DeviceInfo`
 (plus generic `AdvancedHunting` results). Both portal and Log Analytics timestamp columns
-(`TimeGenerated`, `Timestamp [UTC]`, …) are recognized.
+(`TimeGenerated`, `Timestamp [UTC]`, …) are recognized, including the locale 12-hour format
+(`7/8/2026, 11:57:31.123 AM`) used by portal-grid CSV exports. Log Analytics **"Export to JSON"**
+files (the columnar `{"tables":[{"columns":…,"rows":…}]}` envelope) are flattened automatically,
+even when metadata or statistics properties appear before `tables`.
+
+Additional Sentinel tables beyond Advanced Hunting are also mapped:
+
+- **`SecurityEvent`** (Windows events via AMA/MMA) — reuses the Windows EventID classifier, so the
+  same 4624/4625/4720/7045/1102/4698/4826 detections fire; the `EventData` XML column is flattened
+  and the channel is synthesized when absent.
+- **`Syslog`** (Linux logs forwarded to Sentinel) — shares the Linux classifier below, so a
+  `Failed password` line produces the same detection whether it arrived here or as `/var/log/auth.log`.
+- **`SigninLogs` / `AuditLogs`** (Entra ID) — sign-ins and directory changes land on the timeline;
+  repeated failed sign-ins raise brute-force findings and risky sign-ins (`RiskLevelDuringSignIn`) are flagged.
+
+### Linux logs
+
+Linux endpoint logs normalize onto the same schema and drive a Linux-specific detection set:
+
+- **syslog / auth.log / secure** (`.log`, `.txt`) — RFC3164 (year inferred from file mtime), RFC5424,
+  and ISO-prefixed rsyslog lines. ZIP ingestion preserves the member timestamp before RFC3164 year
+  inference. sshd, sudo, useradd/usermod/groupadd, and cron activity are typed.
+- **auditd `audit.log`** — records sharing an audit id are merged into one event; `EXECVE` argv is
+  reconstructed (numeric arg order, hex-encoded args decoded) so command-line detections apply, and
+  `PATH` records surface persistence-file writes. Native `ADD_USER`, `ADD_GROUP`, and group-management
+  records are promoted to the same account-action fields as syslog messages.
+- **journald** — `journalctl -o json` (JSONL) with `__REALTIME_TIMESTAMP`, `MESSAGE`, `_CMDLINE`, etc.
+  Journald field signatures take precedence over filename-based Sentinel table hints, so a journal
+  export named `syslog.jsonl` retains its message and microsecond timestamp.
+
+Detections cover SSH/pam brute force and brute-force-followed-by-success (the success must occur at
+or after the latest observed failure), root logins, account and privileged-group changes,
+cron/systemd/rc/ld.so.preload/authorized_keys persistence, and suspicious shell one-liners
+(download-piped-to-shell, `/dev/tcp` and netcat/socat reverse shells, base64-decoded payloads, and
+shell-history tampering), each mapped to ATT&CK.
+
+> Timestamps are computed at ingest, so fixing a parser does not retroactively repair a case ingested
+> earlier. Re-ingest the evidence file (Evidence page) to pick up the corrected timeline.
 
 ### Forensic artifacts
 

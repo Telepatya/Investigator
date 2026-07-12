@@ -82,7 +82,7 @@ case route paths and the per-case database model.
 
 ```mermaid
 flowchart LR
-    EVIDENCE["Logs / artifacts / EVTX / Defender / collections"]
+    EVIDENCE["Logs / artifacts / EVTX / Defender / Sentinel / Linux / collections"]
     MEMORY["Memory dumps"]
     USER["Analyst actions"]
 
@@ -290,14 +290,26 @@ only one database transaction.
 ### Ingestion and memory analysis
 
 `app/ingest` accepts ZIP collections (e.g. Velociraptor), JSON, JSONL, CSV, EVTX/event
-logs, and Microsoft Defender / Azure (Sentinel) log exports.
+logs, Linux syslog/auditd/journald evidence, and Microsoft Defender / Azure (Sentinel)
+log exports.
 
-- `parsers.py` streams source rows without requiring complete archive extraction.
+- `parsers.py` streams source rows, flattens Log Analytics columnar envelopes, and
+  preserves ZIP member timestamps used by year-less RFC3164 records.
 - `normalize.py` maps source-specific fields into the shared `Event` schema.
+- `linux.py` parses RFC3164/RFC5424/ISO syslog, merges auditd records by audit id,
+  reconstructs `EXECVE` command lines, and normalizes journald JSON rows.
+- `sentinel.py` maps `SecurityEvent`, `Syslog`, `SigninLogs`, and `AuditLogs`; Windows
+  SecurityEvent rows reuse the EVTX EventID classifier and Sentinel Syslog rows reuse
+  the Linux message classifier.
 - `pipeline.py` batches event inserts, synchronizes FTS rows, extracts process
   inventory where available, reports progress, coalesces queued artifact detection
   work, and skips redundant detection for zero-event uploads.
 - `evidence.py` owns uploaded-file listing, deletion, and re-ingestion semantics.
+
+Format routing follows content before filename hints. Journald field signatures are
+checked before Sentinel source-name inference, and pretty-printed JSON objects are
+distinguished from JSONL by whether the first physical line is a complete object.
+Log Analytics envelope recognition therefore does not depend on JSON property order.
 
 Memory images route through `app/memory`:
 
@@ -314,6 +326,12 @@ Memory images route through `app/memory`:
 provenance. Event severity is accompanied by `severity_reason`, allowing every
 timeline/detail surface to explain whether severity came from parsing, a detection,
 context, flagged-entity propagation, or analyst action.
+
+Linux/Entra authentication correlation is keyed by protocol, source address, and
+account. Failure trackers retain both the earliest and latest timestamp; a success is
+classified as post-brute-force only when it occurs at or after the latest observed
+failure. Linux account-management and persistence events share stable normalized raw
+fields regardless of whether they came from syslog, auditd, journald, or Sentinel.
 
 `app/detect/overrides.py` persists disabled rules and benign finding identities in
 `case_meta`. These overrides survive a findings-table rebuild and are applied after
@@ -603,13 +621,18 @@ Contributors must preserve these invariants:
 11. Route-derived filesystem values use allowlisted case/session identifiers,
     upload destinations resolve to direct children of the case upload directory,
     and generated downloads are served only after resolving inside the case root.
+12. Content signatures take precedence over filename/source hints during ingestion;
+    a source name must not cause a richer structured format to lose fields.
+13. Archive extraction preserves member timestamps when downstream parsing uses file
+    metadata to infer evidence time.
 
 ## Testing and change checklist
 
-Backend tests use `unittest` and cover parsing, bulk ingest, API reads, case
-lifecycle, concurrency, detections, severity propagation, manual findings,
-overrides, entity correlation, memory analysis, source-specific provenance, upload
-filename safety, interrupted-state recovery, and queued detection coalescing.
+Backend tests use `unittest` and cover parsing (including Linux and Sentinel format
+routing), bulk ingest, API reads, case lifecycle, concurrency, detections and ordered
+authentication correlation, severity propagation, manual findings, overrides, entity
+correlation, memory analysis, source-specific provenance, archive timestamp handling,
+upload filename safety, interrupted-state recovery, and queued detection coalescing.
 
 Frontend acceptance currently uses TypeScript compilation plus a production build;
 there is no dedicated frontend test runner yet.

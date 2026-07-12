@@ -363,6 +363,83 @@ WEB_USER_AGENT_PATTERNS: list[tuple[str, str, str, str]] = [
     ("zgrab", "T1595", "zgrab banner-grab user-agent", "low"),
 ]
 
+# Suspicious Linux/Unix command-line patterns -> (compiled regex, technique,
+# description, severity). Matched (case-insensitive) against the lowercased event
+# text, and ONLY against events stamped raw["linux_log"] so Windows telemetry
+# never runs these (and vice-versa). Every pattern must have a corresponding
+# literal in engine._LINUX_CMDLINE_PREFILTER_RE or it is unreachable.
+LINUX_SUSPICIOUS_CMDLINE_PATTERNS: list[tuple[re.Pattern[str], str, str, str]] = [
+    # Download cradles: fetch and pipe straight into a shell.
+    (re.compile(r"\b(?:curl|wget)\b[^|;&\n]{0,300}\|\s*(?:ba|z|da|a|c|k|t)?sh\b"),
+     "T1059.004", "Download piped directly to shell", "critical"),
+    (re.compile(r"\bwget\b.{0,200}-o\s*/(?:tmp|dev/shm|var/tmp)/"),
+     "T1105", "wget download into world-writable directory", "high"),
+    (re.compile(r"\bcurl\b.{0,200}(?:-o|--output)\s+/(?:tmp|dev/shm|var/tmp)/"),
+     "T1105", "curl download into world-writable directory", "high"),
+    (re.compile(r"\bchmod\s+(?:\+x|[0-7]*7[0-7]*)\s+/(?:tmp|dev/shm|var/tmp)/"),
+     "T1222.002", "chmod +x on a file in a world-writable directory", "medium"),
+    # Encoded payloads decoded and executed.
+    (re.compile(r"\bbase64\s+(?:-d|--decode)\b.{0,160}\|\s*(?:ba|z|da|a)?sh\b"),
+     "T1140", "base64-decoded payload piped to shell", "critical"),
+    (re.compile(r"\becho\s+[a-z0-9+/=]{40,}.{0,40}\|\s*base64\s+(?:-d|--decode)\b"),
+     "T1140", "Inline base64 blob decoded", "high"),
+    # Reverse shells.
+    (re.compile(r"\bbash\s+-i\b.{0,80}/dev/tcp/"),
+     "T1059.004", "Interactive bash reverse shell (/dev/tcp)", "critical"),
+    (re.compile(r"/dev/tcp/\d{1,3}(?:\.\d{1,3}){3}"),
+     "T1059.004", "Shell redirection to a raw TCP socket (/dev/tcp)", "critical"),
+    (re.compile(r"\bnc(?:at)?\b.{0,120}-e\s*/bin/(?:ba)?sh"),
+     "T1059.004", "Netcat -e reverse shell", "critical"),
+    (re.compile(r"\bmkfifo\b.{0,160}\|\s*(?:/bin/)?(?:ba)?sh\b.{0,160}\bnc(?:at)?\b"),
+     "T1059.004", "Named-pipe (mkfifo) reverse shell", "critical"),
+    (re.compile(r"\bpython[23]?\b.{0,12}-c\b.{0,220}socket\b.{0,220}(?:subprocess|pty|os\.dup2)"),
+     "T1059.004", "Python socket reverse shell", "critical"),
+    (re.compile(r"\bperl\b.{0,12}-e\b.{0,220}socket\b.{0,220}(?:exec|/bin/(?:ba)?sh)"),
+     "T1059.004", "Perl socket reverse shell", "critical"),
+    (re.compile(r"\bsocat\b.{0,160}(?:exec|system):"),
+     "T1059.004", "socat command-execution listener/connector", "high"),
+    # Defense evasion: history tampering.
+    (re.compile(r"\bhistory\s+-c\b"),
+     "T1070.003", "Shell history cleared (history -c)", "medium"),
+    (re.compile(r"\bunset\s+histfile\b|\bhistfilesize\s*=\s*0\b|\bhistsize\s*=\s*0\b"),
+     "T1070.003", "Shell history logging disabled", "medium"),
+    (re.compile(r"(?:>\s*|rm\s+(?:-f\s+)?)(?:~|/root|/home/[^/\s]+)/\.bash_history\b"),
+     "T1070.003", "Bash history file wiped", "high"),
+    # Persistence / privilege via shell redirection into sensitive files.
+    (re.compile(r">>?\s*/etc/(?:crontab|cron\.d/|sudoers)"),
+     "T1053.003", "Write into cron/sudoers configuration", "high"),
+    (re.compile(r">>?\s*(?:~|/root|/home/[^/\s]+)/\.ssh/authorized_keys\b"),
+     "T1098.004", "Write into SSH authorized_keys", "high"),
+    (re.compile(r">>?\s*/etc/ld\.so\.preload\b"),
+     "T1574.006", "Write into /etc/ld.so.preload (linker hijack)", "critical"),
+    # Account manipulation.
+    (re.compile(r"\b(?:useradd|adduser)\b.{0,80}(?:-o\b.{0,24}(?:-u|--uid)\s*0|(?:-u|--uid)\s*0\b.{0,24}-o)\b"),
+     "T1136.001", "Creation of a second UID-0 (root-equivalent) account", "high"),
+    (re.compile(r"\busermod\b.{0,40}-a?g\s+(?:sudo|wheel|root|admin|adm|docker)\b"),
+     "T1098", "User added to a privileged group", "high"),
+    # Persistence via systemd (noisy: legitimate admin action too, so low).
+    (re.compile(r"\bsystemctl\s+enable\s+(?!.*(?:ssh|sshd|network|cron|getty|systemd-)\b)\S+"),
+     "T1543.002", "systemd service enabled for persistence", "low"),
+]
+
+# Linux persistence file locations -> (path fragment, technique, description, severity).
+# Matched against auditd-observed written paths and crontab modifications.
+LINUX_PERSISTENCE_PATHS: list[tuple[str, str, str, str]] = [
+    ("/etc/cron", "T1053.003", "Cron persistence", "medium"),
+    ("/var/spool/cron", "T1053.003", "Cron spool persistence", "medium"),
+    ("/etc/systemd/system", "T1543.002", "systemd unit persistence", "medium"),
+    ("/usr/lib/systemd/system", "T1543.002", "systemd unit persistence", "medium"),
+    ("/.config/systemd/user", "T1543.002", "systemd user-unit persistence", "medium"),
+    ("/etc/rc.local", "T1037.004", "rc.local startup persistence", "medium"),
+    ("/etc/init.d", "T1037.004", "init.d startup persistence", "medium"),
+    ("/.ssh/authorized_keys", "T1098.004", "SSH authorized_keys persistence", "high"),
+    ("/etc/sudoers", "T1548.003", "Sudoers modification", "high"),
+    ("/etc/ld.so.preload", "T1574.006", "ld.so.preload linker hijack", "critical"),
+    ("/.bashrc", "T1546.004", "Shell rc persistence (.bashrc)", "low"),
+    ("/.bash_profile", "T1546.004", "Shell rc persistence (.bash_profile)", "low"),
+    ("/etc/profile.d", "T1546.004", "System-wide shell profile persistence", "low"),
+]
+
 MITRE_TECHNIQUE_NAMES: dict[str, str] = {
     "T1003": "OS Credential Dumping",
     "T1003.001": "LSASS Memory",
@@ -447,4 +524,18 @@ MITRE_TECHNIQUE_NAMES: dict[str, str] = {
     "T1562.001": "Disable or Modify Tools",
     "T1562.002": "Disable Windows Event Logging",
     "T1562.004": "Disable or Modify System Firewall",
+    # Linux / Unix and cloud-identity techniques
+    "T1053.003": "Cron",
+    "T1543.002": "Systemd Service",
+    "T1037": "Boot or Logon Initialization Scripts",
+    "T1037.004": "RC Scripts",
+    "T1070.003": "Clear Command History",
+    "T1098.004": "SSH Authorized Keys",
+    "T1548.003": "Sudo and Sudo Caching",
+    "T1574.006": "Dynamic Linker Hijacking",
+    "T1546.004": "Unix Shell Configuration Modification",
+    "T1222.002": "Linux and Mac File and Directory Permissions Modification",
+    "T1021.004": "SSH",
+    "T1078.003": "Local Accounts",
+    "T1078.004": "Cloud Accounts",
 }
