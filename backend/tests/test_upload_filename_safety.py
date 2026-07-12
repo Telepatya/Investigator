@@ -5,8 +5,10 @@ from __future__ import annotations
 # uploads directory (e.g. "../../../etc/cron.d/x" or a Windows "..\\..\\x").
 
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 
 class _BaseModel:
@@ -34,6 +36,7 @@ sys.modules.setdefault("pydantic", types.SimpleNamespace(
     ),
 ))
 
+from app.config import case_db_path, case_upload_file_path  # noqa: E402
 from app.ingest.evidence import sanitize_upload_filename  # noqa: E402
 
 
@@ -59,6 +62,24 @@ class UploadFilenameSafetyTests(unittest.TestCase):
     def test_empty_and_dot_only_names_are_rejected(self) -> None:
         for bad in ("", None, "..", ".", "../", "..\\", "/"):
             self.assertIsNone(sanitize_upload_filename(bad))
+
+    def test_case_path_helpers_reject_untrusted_components(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = types.SimpleNamespace(cases_dir=tmp)
+            with self.assertRaises(ValueError):
+                case_db_path("../escape", config)
+            with self.assertRaises(ValueError):
+                case_upload_file_path("deadbeef", "bad:name.json", config)
+
+    def test_upload_path_resolves_inside_validated_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = types.SimpleNamespace(cases_dir=tmp)
+            path = case_upload_file_path("deadbeef", "evidence.json", config)
+
+            self.assertEqual(
+                path,
+                Path(tmp).resolve() / "deadbeef" / "uploads" / "evidence.json",
+            )
 
 
 if __name__ == "__main__":

@@ -11,7 +11,11 @@ from fastapi import APIRouter, HTTPException, UploadFile, WebSocket, WebSocketDi
 from fastapi.responses import FileResponse
 from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
 
-from app.config import case_uploads_path, get_cases_dir
+from app.config import (
+    case_dir_path,
+    case_upload_file_path,
+    validate_case_id_component,
+)
 from app.detect import overrides
 from app.detect.entity_graph import build_entity_graph, entity_dossier
 from app.detect.process_tree import build_tree, list_sessions, process_dossier
@@ -34,15 +38,18 @@ from app.store.database import Event, Finding, MemoryResult
 from app.store.operations import coordinator
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
-_CASE_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 _MEMORY_SESSION_RE = re.compile(r"^mem-[A-Za-z0-9][A-Za-z0-9_. ()%-]{0,254}$")
 _UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ ()%+-]{0,254}$")
 
 
 def _validated_case_id(case_id: str) -> str:
-    if not _CASE_ID_RE.fullmatch(case_id) or not case_store.case_exists(case_id):
+    try:
+        validated = validate_case_id_component(case_id)
+    except ValueError as exc:
+        raise HTTPException(404, "Case not found") from exc
+    if not case_store.case_exists(validated):
         raise HTTPException(404, "Case not found")
-    return case_id
+    return validated
 
 
 def _safe_upload_name(filename: str | None) -> str:
@@ -57,10 +64,10 @@ def _upload_destination(case_id: str, filename: str | None) -> tuple[str, Path]:
     """Resolve an upload to a direct child of its validated case directory."""
     validated_case_id = _validated_case_id(case_id)
     safe_name = _safe_upload_name(filename)
-    uploads = case_uploads_path(validated_case_id).resolve()
-    destination = (uploads / safe_name).resolve()
-    if destination.parent != uploads:
-        raise HTTPException(400, "Invalid filename")
+    try:
+        destination = case_upload_file_path(validated_case_id, safe_name)
+    except ValueError as exc:
+        raise HTTPException(400, "Invalid filename") from exc
     return safe_name, destination
 
 
@@ -74,7 +81,7 @@ def _memory_file_response(
     case_id: str, local: Path, media_type: str = "application/octet-stream",
 ) -> FileResponse:
     """Serve only regular files generated inside the validated case directory."""
-    case_root = (get_cases_dir() / _validated_case_id(case_id)).resolve()
+    case_root = case_dir_path(_validated_case_id(case_id))
     try:
         resolved = local.resolve(strict=True)
     except OSError as exc:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +14,8 @@ SERVICE_NAME = "investigator-dfir"
 DEFAULT_CONFIG_DIR = Path.home() / ".investigator"
 DEFAULT_CASES_DIR = DEFAULT_CONFIG_DIR / "cases"
 CONFIG_FILE = DEFAULT_CONFIG_DIR / "config.json"
+_CASE_ID_COMPONENT_RE = re.compile(r"^[0-9a-fA-F]{8}$")
+_UPLOAD_NAME_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ ()%+-]{0,254}$")
 
 
 ProviderType = Literal["ollama", "openai", "gemini", "anthropic"]
@@ -85,11 +88,46 @@ def get_cases_dir(config: AppConfig | None = None) -> Path:
     return path
 
 
+def validate_case_id_component(case_id: str) -> str:
+    value = str(case_id or "")
+    if not _CASE_ID_COMPONENT_RE.fullmatch(value):
+        raise ValueError("Invalid case_id path component")
+    return value
+
+
+def case_dir_path(case_id: str, config: AppConfig | None = None) -> Path:
+    root = get_cases_dir(config).resolve()
+    path = (root / validate_case_id_component(case_id)).resolve()
+    if path.parent != root:
+        raise ValueError("Invalid case directory")
+    return path
+
+
 def case_db_path(case_id: str, config: AppConfig | None = None) -> Path:
-    return get_cases_dir(config) / case_id / "case.db"
+    case_root = case_dir_path(case_id, config)
+    path = (case_root / "case.db").resolve()
+    if path.parent != case_root:
+        raise ValueError("Invalid case database path")
+    return path
 
 
 def case_uploads_path(case_id: str, config: AppConfig | None = None) -> Path:
-    path = get_cases_dir(config) / case_id / "uploads"
+    case_root = case_dir_path(case_id, config)
+    path = (case_root / "uploads").resolve()
+    if path.parent != case_root:
+        raise ValueError("Invalid case uploads path")
     path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def case_upload_file_path(
+    case_id: str, filename: str, config: AppConfig | None = None,
+) -> Path:
+    safe_filename = str(filename or "")
+    if not _UPLOAD_NAME_COMPONENT_RE.fullmatch(safe_filename):
+        raise ValueError("Invalid upload filename path component")
+    uploads = case_uploads_path(case_id, config).resolve()
+    path = (uploads / safe_filename).resolve()
+    if path.parent != uploads:
+        raise ValueError("Invalid upload path")
     return path

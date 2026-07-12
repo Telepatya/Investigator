@@ -619,7 +619,8 @@ def _copy_process_range(proc, base: int, size: int, output: Path, metadata: dict
             output.unlink(missing_ok=True)
         except OSError:
             logger.warning(
-                "Could not remove partial memory-range extraction %s", output,
+                "Could not remove partial memory-range extraction %s",
+                _sanitize_for_log(output),
                 exc_info=True,
             )
         raise MemoryExplorerError(f"Could not extract memory range: {exc}", 500) from exc
@@ -651,7 +652,8 @@ def _copy_vfs_file(vmm, source: str, output: Path, entry: Any | None) -> dict[st
             output.unlink(missing_ok=True)
         except OSError:
             logger.warning(
-                "Could not remove partial VFS extraction %s", output,
+                "Could not remove partial VFS extraction %s",
+                _sanitize_for_log(output),
                 exc_info=True,
             )
         raise MemoryExplorerError(f"Could not extract VFS file {source}: {exc}", 500) from exc
@@ -766,9 +768,19 @@ def _record_manifest(case_id: str, dump_stem: str, entry: dict[str, Any]) -> Non
 
 
 def _cache_path(case_id: str, dump_stem: str, group: str, filename: str) -> Path:
-    root = memprocfs_artifact_dir(case_id, dump_stem) / "extracted" / _safe_filename(group)
+    artifact_root = memprocfs_artifact_dir(case_id, dump_stem).resolve()
+    root = (artifact_root / "extracted" / _safe_filename(group)).resolve()
+    try:
+        root.relative_to(artifact_root)
+    except ValueError as exc:
+        raise MemoryExplorerError("Unsafe extraction directory", 500) from exc
     root.mkdir(parents=True, exist_ok=True)
-    return root / _safe_filename(filename)
+    output = (root / _safe_filename(filename)).resolve()
+    try:
+        output.relative_to(root)
+    except ValueError as exc:
+        raise MemoryExplorerError("Unsafe extraction filename", 500) from exc
+    return output
 
 
 def _module_output_path(case_id: str, dump_stem: str, proc, pid: int, module: dict[str, Any], process_image: bool) -> Path:
@@ -847,6 +859,16 @@ def _proc_name(proc, pid: int) -> str:
 def _basename(path: str) -> str:
     text = str(path or "").replace("\\", "/").rstrip("/")
     return text.rsplit("/", 1)[-1] if text else ""
+
+
+def _sanitize_for_log(value: Any) -> str:
+    return (
+        str(value)
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def _safe_filename(name: str) -> str:
