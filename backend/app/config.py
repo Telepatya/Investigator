@@ -24,6 +24,9 @@ class LLMSettings(BaseModel):
     ollama_base_url: str = "http://localhost:11434"
     temperature: float = 0.2
     max_tokens: int = 4096
+    analysis_max_tool_calls: int = Field(default=8, ge=0, le=20)
+    chat_max_tool_calls: int = Field(default=4, ge=0, le=20)
+    entity_max_tool_calls: int = Field(default=5, ge=0, le=20)
 
 
 class AppConfig(BaseModel):

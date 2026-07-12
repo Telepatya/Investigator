@@ -646,6 +646,15 @@ def _grade_handle(
             return "low", "low", reasons or ["cross-process handle"]
 
     normalized = (name or "").lower().replace("/", "\\")
+    # RemCom-style pipes are strong remote-command-execution context, but the
+    # utility can also be used legitimately by administrators. Grade the pipe
+    # itself medium; service/process/path corroboration can raise the resulting
+    # finding without making every named pipe noisy.
+    if kind_l == "file" and "remcom_" in normalized and any(
+        marker in normalized
+        for marker in ("remcom_communicaton", "remcom_stdin", "remcom_stdout", "remcom_stderr")
+    ):
+        return "medium", "medium", ["handle references a RemCom remote-execution named pipe"]
     if kind_l in {"file", "key", "registry"} and normalized:
         suspicious_path = any(fragment in normalized for fragment in USER_WRITABLE_DIR_FRAGMENTS)
         persistence_path = any(token in normalized for token in (

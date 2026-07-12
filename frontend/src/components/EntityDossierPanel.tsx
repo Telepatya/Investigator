@@ -16,6 +16,7 @@ import {
 import { api, memoryModuleDownloadUrl, memoryProcessDownloadUrl, wsUrl } from "../lib/api";
 import { DetailDrawer, SeverityBadge, Spinner, CodeBlock } from "./common";
 import { FlagAsFinding } from "./FlagAsFinding";
+import { EvidenceLinkedText } from "./EvidenceReference";
 import { fmtTime, SEVERITY_COLORS } from "../lib/ui";
 import type { EntityDossier, MemoryModule, MemoryProcessCandidate, MemoryProcessHandle, Severity } from "../lib/types";
 
@@ -519,7 +520,7 @@ function AiInvestigate({ caseId, entityId }: { caseId: string; entityId: string 
       </button>
       {text ? (
         <div className="text-sm text-ink-200 leading-relaxed whitespace-pre-wrap">
-          {text}
+          <EvidenceLinkedText caseId={caseId} text={text} />
           {running && <span className="animate-pulse">▋</span>}
         </div>
       ) : (

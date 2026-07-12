@@ -14,6 +14,7 @@ import {
   Flag,
   RotateCcw,
   Trash2,
+  Loader2,
 } from "lucide-react";
 import type { Finding, Severity } from "../lib/types";
 import { SEVERITY_ORDER } from "../lib/ui";
@@ -34,6 +35,9 @@ export default function FindingsPage() {
   const invalidateCaseViews = () => {
     for (const key of [
       "findings",
+      "finding-detail",
+      "report",
+      "case",
       "entities",
       "entity-dossier",
       "attack-matrix",
@@ -60,6 +64,13 @@ export default function FindingsPage() {
   });
   const deleteManualMut = useMutation({
     mutationFn: (manualId: string) => api.deleteManualFinding(caseId!, manualId),
+    onSuccess: () => {
+      invalidateCaseViews();
+      qc.invalidateQueries({ queryKey: ["case", caseId] });
+    },
+  });
+  const rebuildMut = useMutation({
+    mutationFn: () => api.rebuildDetections(caseId!),
     onSuccess: () => {
       invalidateCaseViews();
       qc.invalidateQueries({ queryKey: ["case", caseId] });
@@ -99,6 +110,12 @@ export default function FindingsPage() {
         icon={<Shield size={22} />}
         title="Findings"
         subtitle="Detections, analyst overrides, AI verdicts, and mapped evidence."
+        right={
+          <button className="btn-ghost" onClick={() => rebuildMut.mutate()} disabled={rebuildMut.isPending}>
+            {rebuildMut.isPending ? <Loader2 size={15} className="animate-spin" /> : <RotateCcw size={15} />}
+            {rebuildMut.isPending ? "Rebuilding…" : "Rebuild detections"}
+          </button>
+        }
       />
       {disabledRules.length > 0 && (
         <div className="card p-3">
@@ -254,9 +271,14 @@ function FindingRow({
         <div className="px-4 pb-4 pl-11 space-y-3">
           <div className="text-sm text-ink-200">{f.description}</div>
           {f.suppressed && (
-            <div className="text-xs text-ink-400">
-              This finding is suppressed ({f.suppressed_reason}); it is shown as informational and
-              excluded from severity counts. Use the buttons above to restore it.
+            <div className="rounded-lg bg-white/5 p-3 text-xs text-ink-400">
+              This finding is suppressed ({f.suppressed_reason}) and excluded from AI conclusions and severity counts.
+              {f.suppression_details?.rationale && (
+                <div className="mt-1 text-ink-300">
+                  {f.suppression_details.actor === "ai" ? "AI" : "Analyst"} rationale: {f.suppression_details.rationale}
+                </div>
+              )}
+              <div className="mt-1">Use the buttons above to restore it.</div>
             </div>
           )}
           {f.ai_verdict && (

@@ -395,25 +395,40 @@ def get_findings(case_id: str) -> dict:
         findings.sort(key=lambda f: order.get(f.severity, 0), reverse=True)
         disabled = overrides.get_disabled_rules(session)
         benign = overrides.get_benign_keys(session)
-        out = []
-        for f in findings:
-            rid = overrides.rule_id_for(f.title, f.source)
-            reason = overrides.is_suppressed(f.title, f.source, f.evidence, disabled, benign)
-            ev = f.evidence or {}
-            out.append({
-                "id": f.id, "title": f.title, "description": f.description,
-                "severity": f.severity, "mitre_techniques": f.mitre_techniques,
-                "evidence": f.evidence, "source": f.source, "ai_verdict": f.ai_verdict,
-                "created_at": f.created_at.isoformat(),
-                "rule_id": rid,
-                "suppressed": reason is not None,
-                "suppressed_reason": reason,
-                "benign": overrides.finding_key(f.title, f.evidence) in benign,
-                "rule_disabled": rid in disabled,
-                "manual": bool(f.source == "manual" or ev.get("manual")),
-                "manual_id": ev.get("manual_id"),
-            })
+        out = [_serialize_finding(session, f, disabled, benign) for f in findings]
         return {"findings": out, "disabled_rules": sorted(disabled)}
+    finally:
+        session.close()
+
+
+def _serialize_finding(session, f: Finding, disabled=None, benign=None) -> dict:
+    disabled = overrides.get_disabled_rules(session) if disabled is None else disabled
+    benign = overrides.get_benign_keys(session) if benign is None else benign
+    rid = overrides.rule_id_for(f.title, f.source)
+    reason = overrides.is_suppressed(f.title, f.source, f.evidence, disabled, benign)
+    ev = f.evidence or {}
+    return {
+        "id": f.id, "title": f.title, "description": f.description,
+        "severity": f.severity, "mitre_techniques": f.mitre_techniques,
+        "evidence": f.evidence, "source": f.source, "ai_verdict": f.ai_verdict,
+        "created_at": f.created_at.isoformat(), "rule_id": rid,
+        "suppressed": reason is not None, "suppressed_reason": reason,
+        "suppression_details": overrides.get_suppression_details(session, f),
+        "benign": overrides.finding_key(f.title, f.evidence) in benign,
+        "rule_disabled": rid in disabled,
+        "manual": bool(f.source == "manual" or ev.get("manual")),
+        "manual_id": ev.get("manual_id"),
+    }
+
+
+@router.get("/{case_id}/findings/{finding_id}")
+def get_finding(case_id: str, finding_id: int) -> dict:
+    session = case_store.get_session(case_id)
+    try:
+        finding = session.get(Finding, finding_id)
+        if not finding:
+            raise HTTPException(404, "Finding not found")
+        return _serialize_finding(session, finding)
     finally:
         session.close()
 
@@ -428,7 +443,13 @@ def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
         if not f:
             raise HTTPException(404, "Finding not found")
         manual_finding = bool(f.source == "manual" or (f.evidence or {}).get("manual"))
-        overrides.set_finding_benign(session, overrides.finding_key(f.title, f.evidence), benign)
+        overrides.set_finding_benign(
+            session,
+            overrides.finding_key(f.title, f.evidence),
+            benign,
+            actor="analyst",
+            rationale=str(body.get("rationale") or "Analyst marked this finding benign"),
+        )
         if manual_finding:
             from app.detect import manual
             manual.apply_manual_findings(session)

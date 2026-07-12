@@ -9,7 +9,8 @@ from sqlalchemy import select
 
 from app.llm.orchestrator import analyze_case, chat_stream, investigate_entity_stream
 from app.store import cases as case_store
-from app.store.database import Report
+from app.detect import overrides
+from app.store.database import Event, Finding, Report
 from app.store.operations import coordinator
 
 router = APIRouter(prefix="/api/cases", tags=["analysis"])
@@ -94,12 +95,40 @@ def get_report(case_id: str) -> dict:
         ).first()
         if not report:
             return {"exists": False}
+        timeline_entries = []
+        for item in report.timeline_entries or []:
+            if not isinstance(item, dict):
+                continue
+            event_refs = []
+            for event_id in item.get("event_ids") or []:
+                event = session.get(Event, event_id)
+                if event:
+                    event_refs.append({
+                        "id": event.id,
+                        "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+                        "summary": event.summary,
+                        "severity": event.severity,
+                        "source": event.source,
+                    })
+            finding_refs = []
+            for finding_id in item.get("finding_ids") or []:
+                finding = session.get(Finding, finding_id)
+                if finding:
+                    finding_refs.append({
+                        "id": finding.id, "title": finding.title,
+                        "severity": finding.severity,
+                        "suppressed": overrides.get_suppression_details(session, finding) is not None,
+                    })
+            timeline_entries.append({**item, "event_refs": event_refs, "finding_refs": finding_refs})
+        current_revision = overrides.get_suppression_revision(session)
         return {
             "exists": True,
             "case_id": case_id,
             "summary": report.summary,
             "timeline_narrative": report.timeline_narrative,
+            "timeline_entries": timeline_entries,
             "findings_analysis": report.findings_analysis,
+            "stale": int(report.suppression_revision or 0) != current_revision,
             "generated_at": report.generated_at.isoformat(),
         }
     finally:

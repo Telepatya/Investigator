@@ -93,7 +93,9 @@ class Report(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     summary: Mapped[str] = mapped_column(Text)
     timeline_narrative: Mapped[str] = mapped_column(Text, default="")
+    timeline_entries: Mapped[list] = mapped_column(JSON, default=list)
     findings_analysis: Mapped[list] = mapped_column(JSON, default=list)
+    suppression_revision: Mapped[int] = mapped_column(Integer, default=0)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -262,6 +264,11 @@ def _initialize_schema(path: Path, engine: Engine) -> None:
         existing_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(events)")}
         if "severity_reason" not in existing_cols:
             conn.exec_driver_sql("ALTER TABLE events ADD COLUMN severity_reason TEXT")
+        report_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(reports)")}
+        if "timeline_entries" not in report_cols:
+            conn.exec_driver_sql("ALTER TABLE reports ADD COLUMN timeline_entries JSON DEFAULT '[]'")
+        if "suppression_revision" not in report_cols:
+            conn.exec_driver_sql("ALTER TABLE reports ADD COLUMN suppression_revision INTEGER DEFAULT 0")
         conn.exec_driver_sql(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(

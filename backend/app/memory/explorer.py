@@ -171,6 +171,18 @@ def _collect_and_cache_process_handles(case_id: str, session, proc) -> None:
             "TargetPID": _dict_get(handle, "pid", "target_pid", "TargetPID", "process_id"),
             "TargetProcess": _dict_get(handle, "process", "target", "Target", "target_process"),
         }
+        if str(row["Type"] or "").lower() == "process":
+            target_match = re.search(
+                r"\bPID\s+(\d+)\s*(?:-\s*(.+))?",
+                str(row["Name"] or ""),
+                re.IGNORECASE,
+            )
+            parsed_target_pid = _to_int(row["TargetPID"])
+            if target_match and (parsed_target_pid is None or parsed_target_pid == proc.pid):
+                row["TargetPID"] = int(target_match.group(1))
+                row["TargetProcess"] = (
+                    (target_match.group(2) or str(row["TargetProcess"] or "")).strip() or None
+                )
         severity, risk, reasons = _grade_handle(
             proc.pid,
             str(row["Type"] or "unknown"),
