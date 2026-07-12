@@ -36,6 +36,9 @@ async def get_llm_config() -> LLMConfigResponse:
         ollama_base_url=cfg.llm.ollama_base_url,
         temperature=cfg.llm.temperature,
         max_tokens=cfg.llm.max_tokens,
+        analysis_max_tool_calls=cfg.llm.analysis_max_tool_calls,
+        chat_max_tool_calls=cfg.llm.chat_max_tool_calls,
+        entity_max_tool_calls=cfg.llm.entity_max_tool_calls,
         has_api_key=has_api_key(cfg.llm.provider),
         available_models=models,
     )
@@ -54,6 +57,12 @@ async def update_llm_config(update: LLMConfigUpdate) -> LLMConfigResponse:
         cfg.llm.temperature = update.temperature
     if update.max_tokens is not None:
         cfg.llm.max_tokens = update.max_tokens
+    if update.analysis_max_tool_calls is not None:
+        cfg.llm.analysis_max_tool_calls = update.analysis_max_tool_calls
+    if update.chat_max_tool_calls is not None:
+        cfg.llm.chat_max_tool_calls = update.chat_max_tool_calls
+    if update.entity_max_tool_calls is not None:
+        cfg.llm.entity_max_tool_calls = update.entity_max_tool_calls
     save_config(cfg)
 
     if update.api_key is not None and update.api_key != "":
@@ -71,6 +80,9 @@ async def update_llm_config(update: LLMConfigUpdate) -> LLMConfigResponse:
         ollama_base_url=cfg.llm.ollama_base_url,
         temperature=cfg.llm.temperature,
         max_tokens=cfg.llm.max_tokens,
+        analysis_max_tool_calls=cfg.llm.analysis_max_tool_calls,
+        chat_max_tool_calls=cfg.llm.chat_max_tool_calls,
+        entity_max_tool_calls=cfg.llm.entity_max_tool_calls,
         has_api_key=has_api_key(cfg.llm.provider),
         available_models=models,
     )

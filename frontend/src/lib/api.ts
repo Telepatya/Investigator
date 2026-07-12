@@ -80,6 +80,8 @@ export const api = {
   getCategories: (id: string) =>
     req<{ categories: { name: string; count: number }[] }>(`/cases/${id}/categories`),
   getFindings: (id: string) => req<FindingsResponse>(`/cases/${id}/findings`),
+  getFinding: (id: string, findingId: number, signal?: AbortSignal) =>
+    req<Finding>(`/cases/${id}/findings/${findingId}`, { signal }),
   setFindingBenign: (id: string, findingId: number, benign: boolean) =>
     req<{ ok: boolean }>(`/cases/${id}/findings/${findingId}/benign`, {
       method: "POST",
@@ -89,6 +91,10 @@ export const api = {
     req<{ ok: boolean; disabled_rules: string[] }>(`/cases/${id}/rules/disable`, {
       method: "POST",
       body: JSON.stringify({ rule_id: ruleId, disabled }),
+    }),
+  rebuildDetections: (id: string) =>
+    req<{ ok: boolean; added: number; rebuild: boolean }>(`/cases/${id}/detections/run?rebuild=true`, {
+      method: "POST",
     }),
   createManualFinding: (
     id: string,

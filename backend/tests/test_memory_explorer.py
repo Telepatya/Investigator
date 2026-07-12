@@ -147,7 +147,7 @@ class MemoryExplorerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.uploads = self.root / "case1" / "uploads"
+        self.uploads = self.root / "deadbeef" / "uploads"
         self.uploads.mkdir(parents=True)
         (self.uploads / "dump.raw").write_bytes(b"raw")
         self.patches = [
@@ -396,38 +396,42 @@ class MemoryExplorerTests(unittest.TestCase):
         self.assertEqual([m["summary"] for m in by_session["mem-other"]["memory_results"]], ["other hit"])
 
     def test_process_image_extraction_caches_extracted_file_and_closes_vmm(self) -> None:
-        output = explorer.extract_process_image("case1", "mem-dump", 123)
+        output = explorer.extract_process_image("deadbeef", "mem-dump", 123)
 
         self.assertTrue(output.name.endswith(".extracted"))
         self.assertEqual(output.read_bytes(), b"MZMAIN")
         self.assertTrue(_FakeVmm.last.closed)
-        manifest = json.loads((self.root / "case1" / "derived" / "memprocfs" / "dump" / "extracted" / "manifest.json").read_text())
+        manifest_path = (
+            self.root / "deadbeef" / "derived" / "memprocfs" / "dump"
+            / "extracted" / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text())
         self.assertEqual(manifest["artifacts"][0]["sha256"], explorer._hash_file(output))
 
     def test_full_process_memory_requires_known_bounded_size(self) -> None:
         with self.assertRaises(explorer.MemoryExplorerError) as cm:
-            explorer.extract_process_image("case1", "mem-dump", 123, kind="vmem")
+            explorer.extract_process_image("deadbeef", "mem-dump", 123, kind="vmem")
 
         self.assertEqual(cm.exception.status_code, 413)
         self.assertIn("size is unknown", str(cm.exception))
 
     def test_vfs_listing_and_download_reject_unsafe_paths(self) -> None:
-        listing = explorer.list_vfs("case1", "mem-dump", "/")
+        listing = explorer.list_vfs("deadbeef", "mem-dump", "/")
         self.assertEqual({e["name"] for e in listing["entries"]}, {"pid", "sys"})
 
-        output = explorer.extract_vfs_file("case1", "mem-dump", "/sys/version.txt")
+        output = explorer.extract_vfs_file("deadbeef", "mem-dump", "/sys/version.txt")
         self.assertEqual(output.read_bytes(), b"build")
         with self.assertRaises(explorer.MemoryExplorerError):
-            explorer.list_vfs("case1", "mem-dump", "/sys/../secret")
+            explorer.list_vfs("deadbeef", "mem-dump", "/sys/../secret")
         with self.assertRaises(explorer.MemoryExplorerError) as cm:
-            explorer.extract_vfs_file("case1", "mem-dump", "/sys/missing.txt")
+            explorer.extract_vfs_file("deadbeef", "mem-dump", "/sys/missing.txt")
         self.assertEqual(cm.exception.status_code, 404)
 
     def test_extensionless_physicalmemory_upload_resolves_as_dump(self) -> None:
         (self.uploads / "PhysicalMemory").write_bytes(b"raw")
 
-        dump = explorer.resolve_memory_dump("case1", "mem-PhysicalMemory")
-        dumps = explorer.list_memory_dumps("case1")
+        dump = explorer.resolve_memory_dump("deadbeef", "mem-PhysicalMemory")
+        dumps = explorer.list_memory_dumps("deadbeef")
 
         self.assertEqual(dump.filename, "PhysicalMemory")
         self.assertIn("mem-PhysicalMemory", {row["session_id"] for row in dumps})
@@ -435,14 +439,14 @@ class MemoryExplorerTests(unittest.TestCase):
     def test_dd_memory_upload_resolves_as_dump(self) -> None:
         (self.uploads / "memory.dd").write_bytes(b"raw")
 
-        dump = explorer.resolve_memory_dump("case1", "mem-memory")
-        dumps = explorer.list_memory_dumps("case1")
+        dump = explorer.resolve_memory_dump("deadbeef", "mem-memory")
+        dumps = explorer.list_memory_dumps("deadbeef")
 
         self.assertEqual(dump.filename, "memory.dd")
         self.assertIn("mem-memory", {row["session_id"] for row in dumps})
 
     def test_vfs_folder_archive_includes_manifest_and_file(self) -> None:
-        archive = explorer.archive_vfs_selection("case1", "mem-dump", ["/sys"])
+        archive = explorer.archive_vfs_selection("deadbeef", "mem-dump", ["/sys"])
 
         with zipfile.ZipFile(archive) as zf:
             self.assertEqual(zf.read("sys/version.txt"), b"build")

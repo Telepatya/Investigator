@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
 from app.llm.orchestrator import analyze_case, chat_stream, investigate_entity_stream
 from app.store import cases as case_store
-from app.store.database import Report
+from app.detect import overrides
+from app.store.database import Event, Finding, Report
 from app.store.operations import coordinator
 
 router = APIRouter(prefix="/api/cases", tags=["analysis"])
+logger = logging.getLogger(__name__)
 
 # Track running analysis jobs and progress listeners
 _analysis_listeners: dict[str, list[asyncio.Queue]] = {}
@@ -24,7 +27,7 @@ def _broadcast_analysis(case_id: str, payload: dict) -> None:
         try:
             q.put_nowait(payload)
         except asyncio.QueueFull:
-            pass
+            logger.debug("Dropped analysis update for a full listener queue")
 
 
 @router.post("/{case_id}/analyze")
@@ -79,7 +82,7 @@ async def analyze_ws(websocket: WebSocket, case_id: str) -> None:
             payload = await queue.get()
             await websocket.send_json(payload)
     except WebSocketDisconnect:
-        pass
+        return
     finally:
         if queue in _analysis_listeners.get(case_id, []):
             _analysis_listeners[case_id].remove(queue)
@@ -94,12 +97,40 @@ def get_report(case_id: str) -> dict:
         ).first()
         if not report:
             return {"exists": False}
+        timeline_entries = []
+        for item in report.timeline_entries or []:
+            if not isinstance(item, dict):
+                continue
+            event_refs = []
+            for event_id in item.get("event_ids") or []:
+                event = session.get(Event, event_id)
+                if event:
+                    event_refs.append({
+                        "id": event.id,
+                        "timestamp": event.timestamp.isoformat() if event.timestamp else None,
+                        "summary": event.summary,
+                        "severity": event.severity,
+                        "source": event.source,
+                    })
+            finding_refs = []
+            for finding_id in item.get("finding_ids") or []:
+                finding = session.get(Finding, finding_id)
+                if finding:
+                    finding_refs.append({
+                        "id": finding.id, "title": finding.title,
+                        "severity": finding.severity,
+                        "suppressed": overrides.get_suppression_details(session, finding) is not None,
+                    })
+            timeline_entries.append({**item, "event_refs": event_refs, "finding_refs": finding_refs})
+        current_revision = overrides.get_suppression_revision(session)
         return {
             "exists": True,
             "case_id": case_id,
             "summary": report.summary,
             "timeline_narrative": report.timeline_narrative,
+            "timeline_entries": timeline_entries,
             "findings_analysis": report.findings_analysis,
+            "stale": int(report.suppression_revision or 0) != current_revision,
             "generated_at": report.generated_at.isoformat(),
         }
     finally:
@@ -128,7 +159,7 @@ async def chat_ws(websocket: WebSocket, case_id: str) -> None:
                 await websocket.send_json({"type": "error", "content": str(e)})
             await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
-        pass
+        return
 
 
 @router.websocket("/{case_id}/investigate-entity-ws")
@@ -148,7 +179,7 @@ async def investigate_entity_ws(websocket: WebSocket, case_id: str) -> None:
                 await websocket.send_json({"type": "error", "content": str(e)})
             await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
-        pass
+        return
 
 
 @router.get("/{case_id}/chat-history")

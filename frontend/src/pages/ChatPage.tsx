@@ -3,6 +3,8 @@ import { useParams } from "react-router-dom";
 import { wsUrl, api } from "../lib/api";
 import { Send, Sparkles, MessageSquare } from "lucide-react";
 import { PageShell, PageTitle } from "../components/common";
+import { EvidenceLinkedText } from "../components/EvidenceReference";
+import { useQueryClient } from "@tanstack/react-query";
 
 interface Msg {
   role: "user" | "assistant" | "tool";
@@ -18,6 +20,7 @@ const SUGGESTIONS = [
 
 export default function ChatPage() {
   const { caseId } = useParams();
+  const queryClient = useQueryClient();
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -44,6 +47,14 @@ export default function ChatPage() {
           }
           return copy;
         });
+      } else if (data.type === "finding_suppressed") {
+        setMessages((m) => [...m, {
+          role: "tool",
+          content: `Suppressed finding #${data.finding_id}: ${data.rationale}`,
+        }]);
+        for (const key of ["findings", "finding-detail", "case", "entities", "entity-dossier", "report", "timeline"]) {
+          queryClient.invalidateQueries({ queryKey: [key, caseId] });
+        }
       } else if (data.type === "done") {
         setStreaming(false);
       } else if (data.type === "error") {
@@ -53,7 +64,7 @@ export default function ChatPage() {
     };
     wsRef.current = ws;
     return () => ws.close();
-  }, [caseId]);
+  }, [caseId, queryClient]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -126,7 +137,10 @@ export default function ChatPage() {
                     : "bg-base-900/60 text-ink-100 border border-white/5"
                 }`}
               >
-                {m.content || (streaming && i === messages.length - 1 ? "▋" : "")}
+                {m.role === "assistant" && caseId ? (
+                  <EvidenceLinkedText caseId={caseId} text={m.content} />
+                ) : m.content}
+                {!m.content && streaming && i === messages.length - 1 ? "▋" : ""}
               </div>
             </div>
           )

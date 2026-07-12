@@ -81,6 +81,9 @@ class FindingResponse(BaseModel):
     source: str
     ai_verdict: str | None = None
     created_at: datetime
+    suppressed: bool = False
+    suppressed_reason: str | None = None
+    suppression_details: dict[str, Any] | None = None
 
 
 class ProcessNode(BaseModel):
@@ -116,7 +119,9 @@ class ReportResponse(BaseModel):
     case_id: str
     summary: str
     timeline_narrative: str
+    timeline_entries: list[dict[str, Any]] = Field(default_factory=list)
     findings_analysis: list[dict[str, Any]] = Field(default_factory=list)
+    stale: bool = False
     generated_at: datetime
 
 
@@ -126,6 +131,9 @@ class LLMConfigUpdate(BaseModel):
     ollama_base_url: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
+    analysis_max_tool_calls: int | None = Field(default=None, ge=0, le=20)
+    chat_max_tool_calls: int | None = Field(default=None, ge=0, le=20)
+    entity_max_tool_calls: int | None = Field(default=None, ge=0, le=20)
     api_key: str | None = None
 
 
@@ -135,6 +143,9 @@ class LLMConfigResponse(BaseModel):
     ollama_base_url: str
     temperature: float
     max_tokens: int
+    analysis_max_tool_calls: int
+    chat_max_tool_calls: int
+    entity_max_tool_calls: int
     has_api_key: bool
     available_models: list["ModelInfo"] = Field(default_factory=list)
 

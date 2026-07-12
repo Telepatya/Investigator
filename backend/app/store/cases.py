@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,6 +33,7 @@ from app.store.database import (
 REGISTRY_FILE = "registry.json"
 _CASE_ID_RE = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
 _REGISTRY_LOCK = RLock()
+logger = logging.getLogger(__name__)
 
 
 def _registry_path() -> Path:
@@ -133,6 +135,27 @@ def update_case_meta(case_id: str, *, include_stats: bool = True, **kwargs) -> d
     if not include_stats:
         return meta
     return {**meta, **get_case_stats(case_id)}
+
+
+def recover_interrupted_case_operations() -> list[str]:
+    """Release transient case states left behind by a stopped backend.
+
+    Ingestion and analysis jobs live only in the backend process. At startup no
+    such job can still be active, so persisted busy states are necessarily stale.
+    """
+    with _REGISTRY_LOCK:
+        registry = _load_registry()
+        recovered: list[str] = []
+        now = datetime.now(timezone.utc).isoformat()
+        for case_id, meta in registry.get("cases", {}).items():
+            if meta.get("status") not in {"ingesting", "analyzing"}:
+                continue
+            meta["status"] = "ready"
+            meta["updated_at"] = now
+            recovered.append(case_id)
+        if recovered:
+            _save_registry(registry)
+        return recovered
 
 
 def case_exists(case_id: str) -> bool:
@@ -260,7 +283,7 @@ def cleanup_stale_case_artifacts() -> list[dict[str, str]]:
                 if derived_root.exists() and not any(derived_root.iterdir()):
                     derived_root.rmdir()
             except OSError:
-                pass
+                logger.debug("Could not remove empty derived-artifact directories", exc_info=True)
     return removed
 
 

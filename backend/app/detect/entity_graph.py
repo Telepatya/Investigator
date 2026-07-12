@@ -828,8 +828,9 @@ def build_entity_graph(
     try:
         g = _Graph()
         procs = list(session.scalars(select(Process)))
-        findings = list(session.scalars(select(Finding)))
-        suppressed_event_ids, suppressed_entities = _suppressed_graph_signals(findings)
+        all_findings = list(session.scalars(select(Finding)))
+        suppressed_event_ids, suppressed_entities = _suppressed_graph_signals(all_findings)
+        findings = [f for f in all_findings if not (f.evidence or {}).get("suppressed_from")]
         _extract_from_processes(g, procs)
 
         all_events = list(session.scalars(select(Event)))
@@ -888,8 +889,9 @@ def entity_dossier(case_id: str, entity_id: str, action_limit: int = 500) -> dic
             session.commit()
         g = _Graph()
         procs = list(session.scalars(select(Process)))
-        findings = list(session.scalars(select(Finding)))
-        suppressed_event_ids, suppressed_entities = _suppressed_graph_signals(findings)
+        all_findings = list(session.scalars(select(Finding)))
+        suppressed_event_ids, suppressed_entities = _suppressed_graph_signals(all_findings)
+        findings = [f for f in all_findings if not (f.evidence or {}).get("suppressed_from")]
         _extract_from_processes(g, procs)
         all_events = list(session.scalars(select(Event)))
         for ev in all_events:

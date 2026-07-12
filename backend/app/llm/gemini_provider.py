@@ -20,6 +20,32 @@ DEFAULT_MODELS = [
 ]
 
 
+def _response_text(response) -> str:
+    """Extract text without asking the SDK to stringify non-text parts.
+
+    Gemini's ``response.text`` convenience property raises a ``ValueError``
+    when a streamed candidate contains a structured function-call part. Tool
+    gathering is handled by Investigator's own protocol, so those parts should
+    be ignored while any text parts in the same response continue streaming.
+    """
+    candidates = getattr(response, "candidates", None) or []
+    pieces: list[str] = []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            value = getattr(part, "text", None)
+            if value:
+                pieces.append(str(value))
+    if pieces:
+        return "".join(pieces)
+
+    try:
+        value = response.text
+    except (AttributeError, ValueError):
+        return ""
+    return str(value) if value else ""
+
+
 class GeminiProvider(LLMProvider):
     provider = "gemini"
 
@@ -81,7 +107,7 @@ class GeminiProvider(LLMProvider):
                     max_output_tokens=self.max_tokens,
                 ),
             )
-            return resp.text or ""
+            return _response_text(resp)
 
         async def _stream() -> AsyncIterator[str]:
             resp = model.generate_content(
@@ -93,7 +119,8 @@ class GeminiProvider(LLMProvider):
                 ),
             )
             for chunk in resp:
-                if chunk.text:
-                    yield chunk.text
+                text = _response_text(chunk)
+                if text:
+                    yield text
 
         return _stream()

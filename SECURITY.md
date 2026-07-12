@@ -50,6 +50,23 @@ should still review `git status` and staged diffs before every push.
 API keys configured in the application are stored in the operating system
 credential vault, not in the repository.
 
+## Filesystem Boundaries
+
+Externally supplied path components are validated before filesystem access:
+
+- Case IDs are eight hexadecimal characters and must exist in the case registry.
+- Upload names are reduced to a basename, checked against a conservative allowlist,
+  resolved, and accepted only as direct children of that case's `uploads/` directory.
+- Memory session IDs use an allowlist that excludes directory separators and traversal
+  components. MemProcFS VFS paths are normalized separately and reject drive paths,
+  NUL bytes, `.` segments, and `..` segments.
+- Extracted process/module/VFS downloads are resolved before serving and must be
+  regular files contained by the validated case root.
+
+These checks belong at the API boundary even when a lower-level parser or extractor
+also sanitizes its inputs. New download/upload routes must reuse the same containment
+rules rather than constructing paths directly from route or form values.
+
 ## Case Isolation And Concurrency
 
 Investigator is designed as a single local backend process with one SQLite
@@ -62,6 +79,9 @@ Two independent synchronization layers protect case integrity:
 - The per-case operation coordinator serializes ingestion, memory analysis, AI
   analysis, detection rebuilds, and deletion. A queued operation rechecks that
   the case still exists after it acquires the operation slot.
+- Multi-file artifact ingestion defers whole-case detection until the final queued
+  file and skips it when no queued file produced events. This avoids repeated long
+  detection passes and keeps the busy state accurate for the complete queue.
 - The per-database writer gate serializes SQLite write transactions. Code that
   performs a metadata read-modify-write must acquire the gate before reading,
   not only when flushing, to prevent lost JSON metadata updates.
@@ -70,6 +90,10 @@ SQLite WAL keeps case reads available while a writer is active. Running multiple
 independent backend processes against the same `~/.investigator/cases` directory
 is not supported because the operation coordinator and writer gate are
 process-local.
+
+Persisted `ingesting` and `analyzing` values are transient UI states, not durable
+jobs. Startup recovery changes them to `ready` because an interrupted process-local
+operation cannot still be running after a backend restart.
 
 ## Evidence Integrity And Analyst Overrides
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 import zipfile
@@ -27,6 +28,7 @@ MAX_ARCHIVE_DEPTH = 6
 MAX_ARCHIVE_FILES = 1000
 MAX_MODULE_HASH_BYTES = 512 * 1024 * 1024
 MAX_PROCESS_VMEM_EXTRACT_BYTES = 512 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class MemoryExplorerError(RuntimeError):
@@ -171,6 +173,18 @@ def _collect_and_cache_process_handles(case_id: str, session, proc) -> None:
             "TargetPID": _dict_get(handle, "pid", "target_pid", "TargetPID", "process_id"),
             "TargetProcess": _dict_get(handle, "process", "target", "Target", "target_process"),
         }
+        if str(row["Type"] or "").lower() == "process":
+            target_match = re.search(
+                r"\bPID\s+(\d+)\s*(?:-\s*(.+))?",
+                str(row["Name"] or ""),
+                re.IGNORECASE,
+            )
+            parsed_target_pid = _to_int(row["TargetPID"])
+            if target_match and (parsed_target_pid is None or parsed_target_pid == proc.pid):
+                row["TargetPID"] = int(target_match.group(1))
+                row["TargetProcess"] = (
+                    (target_match.group(2) or str(row["TargetProcess"] or "")).strip() or None
+                )
         severity, risk, reasons = _grade_handle(
             proc.pid,
             str(row["Type"] or "unknown"),
@@ -604,7 +618,11 @@ def _copy_process_range(proc, base: int, size: int, output: Path, metadata: dict
         try:
             output.unlink(missing_ok=True)
         except OSError:
-            pass
+            logger.warning(
+                "Could not remove partial memory-range extraction %s",
+                _sanitize_for_log(output),
+                exc_info=True,
+            )
         raise MemoryExplorerError(f"Could not extract memory range: {exc}", 500) from exc
 
 
@@ -633,7 +651,11 @@ def _copy_vfs_file(vmm, source: str, output: Path, entry: Any | None) -> dict[st
         try:
             output.unlink(missing_ok=True)
         except OSError:
-            pass
+            logger.warning(
+                "Could not remove partial VFS extraction %s",
+                _sanitize_for_log(output),
+                exc_info=True,
+            )
         raise MemoryExplorerError(f"Could not extract VFS file {source}: {exc}", 500) from exc
     return {
         "kind": "vfs_file",
@@ -746,9 +768,19 @@ def _record_manifest(case_id: str, dump_stem: str, entry: dict[str, Any]) -> Non
 
 
 def _cache_path(case_id: str, dump_stem: str, group: str, filename: str) -> Path:
-    root = memprocfs_artifact_dir(case_id, dump_stem) / "extracted" / _safe_filename(group)
+    artifact_root = memprocfs_artifact_dir(case_id, dump_stem).resolve()
+    root = (artifact_root / "extracted" / _safe_filename(group)).resolve()
+    try:
+        root.relative_to(artifact_root)
+    except ValueError as exc:
+        raise MemoryExplorerError("Unsafe extraction directory", 500) from exc
     root.mkdir(parents=True, exist_ok=True)
-    return root / _safe_filename(filename)
+    output = (root / _safe_filename(filename)).resolve()
+    try:
+        output.relative_to(root)
+    except ValueError as exc:
+        raise MemoryExplorerError("Unsafe extraction filename", 500) from exc
+    return output
 
 
 def _module_output_path(case_id: str, dump_stem: str, proc, pid: int, module: dict[str, Any], process_image: bool) -> Path:
@@ -827,6 +859,16 @@ def _proc_name(proc, pid: int) -> str:
 def _basename(path: str) -> str:
     text = str(path or "").replace("\\", "/").rstrip("/")
     return text.rsplit("/", 1)[-1] if text else ""
+
+
+def _sanitize_for_log(value: Any) -> str:
+    return (
+        str(value)
+        .replace("\r", "\\r")
+        .replace("\n", "\\n")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
 
 
 def _safe_filename(name: str) -> str:

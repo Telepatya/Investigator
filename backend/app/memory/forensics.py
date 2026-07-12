@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from sqlalchemy import select
 
-from app.config import get_cases_dir
+from app.config import get_cases_dir, validate_case_id_component
 from app.ingest.normalize import (
     extract_entity,
     extract_host,
@@ -29,7 +29,21 @@ BATCH_SIZE = 2000
 
 
 def memprocfs_artifact_dir(case_id: str, dump_stem: str) -> Path:
-    return get_cases_dir() / case_id / "derived" / "memprocfs" / _safe_dir_name(dump_stem)
+    root = get_cases_dir().resolve()
+    case_root = (root / validate_case_id_component(case_id)).resolve()
+    if case_root.parent != root:
+        raise ValueError("Invalid case directory")
+    artifact_root = (case_root / "derived" / "memprocfs").resolve()
+    try:
+        artifact_root.relative_to(case_root)
+    except ValueError as exc:
+        raise ValueError("Invalid MemProcFS artifact root") from exc
+    path = (artifact_root / _safe_dir_name(dump_stem)).resolve()
+    try:
+        path.relative_to(artifact_root)
+    except ValueError as exc:
+        raise ValueError("Invalid MemProcFS artifact path") from exc
+    return path
 
 
 def reset_memprocfs_artifact_dir(case_id: str, dump_stem: str) -> Path:
@@ -431,7 +445,7 @@ def _load_manifest(artifact_dir: Path, fallback: dict[str, Any] | None) -> dict[
         try:
             return json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            pass
+            return fallback or {"artifacts": []}
     return fallback or {"artifacts": []}
 
 

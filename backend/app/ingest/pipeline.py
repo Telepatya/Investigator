@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import traceback
 from pathlib import Path
@@ -22,6 +23,7 @@ MIN_INGEST_BATCH_SIZE = 1000
 MAX_INGEST_BATCH_SIZE = 50000
 
 ProgressCallback = Callable[[str, float, str, bool, str | None], Any]
+logger = logging.getLogger(__name__)
 
 
 def _ingest_batch_size() -> int:
@@ -324,6 +326,10 @@ class IngestionManager:
     def __init__(self):
         self.jobs: dict[str, dict[str, Any]] = {}
         self.listeners: dict[str, list[asyncio.Queue]] = {}
+        # A multi-file upload creates one queued ingestion per file. Remember
+        # that at least one of those files added events so detections can be
+        # coalesced into a single pass after the final queued file is parsed.
+        self._detections_pending: set[str] = set()
 
     def subscribe(self, case_id: str) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
@@ -340,7 +346,7 @@ class IngestionManager:
             try:
                 queue.put_nowait(payload)
             except asyncio.QueueFull:
-                pass
+                logger.debug("Dropped ingestion update for a full listener queue")
 
     def get_status(self, case_id: str) -> dict[str, Any] | None:
         return self.jobs.get(case_id)
@@ -407,15 +413,38 @@ class IngestionManager:
                 stats = await loop.run_in_executor(
                     None, ingest_file_sync, case_id, file_path, progress
                 )
-                progress(
-                    "detection", 90.0,
-                    f"Ingested {stats['events']} events; running detections", False, None,
-                )
-                from app.detect.engine import run_detections_sync
-                await loop.run_in_executor(None, run_detections_sync, case_id)
+                if stats["events"] > 0:
+                    self._detections_pending.add(case_id)
 
-            case_store.update_case_meta(case_id, include_stats=False, status="ready")
-            progress("done", 100.0, "Ingestion complete", True, None)
+                queued = int(coordinator.snapshot(case_id).get("queued") or 0)
+                if case_id in self._detections_pending and queued == 0:
+                    progress(
+                        "detection", 90.0,
+                        "All queued evidence is ingested; running detections", False, None,
+                    )
+                    from app.detect.engine import run_detections_sync
+                    await loop.run_in_executor(None, run_detections_sync, case_id)
+                    self._detections_pending.discard(case_id)
+                elif queued > 0:
+                    progress(
+                        "queued", 90.0,
+                        f"Evidence ingested; waiting for {queued} queued file(s)", False, None,
+                    )
+                else:
+                    progress(
+                        "parsing", 90.0,
+                        "No events were parsed; skipping detections", False, None,
+                    )
+
+            queued = int(coordinator.snapshot(case_id).get("queued") or 0)
+            if queued > 0:
+                progress(
+                    "queued", 90.0,
+                    f"Evidence processed; waiting for {queued} queued file(s)", False, None,
+                )
+            else:
+                case_store.update_case_meta(case_id, include_stats=False, status="ready")
+                progress("done", 100.0, "Ingestion complete", True, None)
         except Exception as e:
             traceback.print_exc()
             case_store.update_case_meta(case_id, include_stats=False, status="error")

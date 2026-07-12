@@ -171,7 +171,7 @@ sequenceDiagram
     API->>CO: request evidence-ingestion slot
     CO->>PIPE: start when case is available
     PIPE->>DB: batched normalized rows
-    PIPE->>DET: run deterministic detections
+    PIPE->>DET: run one detection pass after final queued artifact
     DET->>DB: findings and severity provenance
     API-->>UI: progress over ingestion WebSocket
 
@@ -192,12 +192,17 @@ Important lifecycle behavior:
 
 - Ingestion and memory analysis run outside the request/response lifetime.
 - The operation coordinator queues mutually exclusive work for the same case.
+- Artifact ingestions remember whether any queued file added events. Detection is
+  deferred while more files are queued and runs once after the last file. An isolated
+  zero-event upload skips detection.
 - After a queued job acquires its slot, it rechecks that the case still exists.
   This prevents a delayed job from recreating a deleted case database.
 - Upload and analysis progress are pushed to the UI. Completion invalidates all
   case-scoped views that can be affected by newly derived data.
 - The case remains readable during long operations. Editing controls that would
   conflict with the current operation are disabled or queued with visible state.
+- On backend startup, persisted `ingesting`/`analyzing` states are recovered to
+  `ready` because their process-local jobs cannot have survived the restart.
 
 ## Backend architecture
 
@@ -209,7 +214,7 @@ Important lifecycle behavior:
 - restricts CORS to the application and Vite development origins;
 - serves `frontend/dist` with an SPA fallback when a production build exists;
 - exposes health information for optional memory/YARA capabilities;
-- performs startup cleanup of stale/orphaned case artifacts; and
+- recovers interrupted transient case states and cleans stale/orphaned artifacts; and
 - disposes cached SQLAlchemy engines at shutdown.
 
 Blocking or CPU-heavy work must not execute directly on the asyncio event loop.
@@ -229,7 +234,7 @@ Each case directory contains:
 |-- case.db                         SQLAlchemy/SQLite database
 |-- case.db-wal / case.db-shm       SQLite WAL state while active
 |-- uploads/                        original uploaded evidence
-`-- memory/extracted artifacts      source-dependent derived files
+`-- derived/memprocfs/<dump>/       manifests, forensic output, and extracted files
 ```
 
 Registry writes are serialized and persisted atomically. Deletion disposes the
@@ -270,6 +275,8 @@ It serializes operations whose side effects must not overlap:
 - case deletion.
 
 The coordinator tracks the active operation and queue depth for status messages.
+The ingestion manager additionally tracks a per-case pending-detection marker so a
+batch of separately uploaded files does not rerun whole-case detection for every file.
 It is an asyncio coordination layer, distinct from the SQLite writer gate:
 
 - the coordinator protects high-level workflows and filesystem/database lifetime;
@@ -288,7 +295,8 @@ logs, and Microsoft Defender / Azure (Sentinel) log exports.
 - `parsers.py` streams source rows without requiring complete archive extraction.
 - `normalize.py` maps source-specific fields into the shared `Event` schema.
 - `pipeline.py` batches event inserts, synchronizes FTS rows, extracts process
-  inventory where available, reports progress, and invokes detections.
+  inventory where available, reports progress, coalesces queued artifact detection
+  work, and skips redundant detection for zero-event uploads.
 - `evidence.py` owns uploaded-file listing, deletion, and re-ingestion semantics.
 
 Memory images route through `app/memory`:
@@ -361,13 +369,18 @@ send only prompt/tool excerpts to the configured provider. API keys live in the 
 credential vault.
 
 The tool loop exposes bounded database operations such as event search/filtering,
-counts, process lookup, memory results, and findings. `analyze_case()` performs a
+counts, process lookup, memory results, findings, and a compact download inventory
+that merges event provenance with correlated finding evidence. Executables and
+archives are prioritized before high-volume browser assets, and filename filtering
+is available when the analyst asks about one file. `analyze_case()` performs a
 map/reduce-style workflow over event categories, deterministic findings, and memory
 signals, then writes a report, timeline narrative, and finding verdicts.
 
 Chat and entity investigation stream over WebSockets. Chat history is persisted and
-older turns are compacted into a rolling memo. Model output remains advisory and
-never replaces raw evidence.
+older turns are compacted into a rolling memo. Tool results use per-result and
+combined-context budgets; a final response with no displayable text gets one
+plain-text retry so structured provider parts cannot produce a silent blank answer.
+Model output remains advisory and never replaces raw evidence.
 
 ### API and WebSockets
 
@@ -587,12 +600,16 @@ Contributors must preserve these invariants:
 9. Raw strings rendered as visualization HTML are escaped.
 10. Remote LLM use is explicit; secrets stay in the OS keyring and real evidence
     is never committed to the repository.
+11. Route-derived filesystem values use allowlisted case/session identifiers,
+    upload destinations resolve to direct children of the case upload directory,
+    and generated downloads are served only after resolving inside the case root.
 
 ## Testing and change checklist
 
 Backend tests use `unittest` and cover parsing, bulk ingest, API reads, case
 lifecycle, concurrency, detections, severity propagation, manual findings,
-overrides, entity correlation, memory analysis, and source-specific provenance.
+overrides, entity correlation, memory analysis, source-specific provenance, upload
+filename safety, interrupted-state recovery, and queued detection coalescing.
 
 Frontend acceptance currently uses TypeScript compilation plus a production build;
 there is no dedicated frontend test runner yet.

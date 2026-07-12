@@ -29,6 +29,9 @@ export interface LLMConfig {
   ollama_base_url: string;
   temperature: number;
   max_tokens: number;
+  analysis_max_tool_calls: number;
+  chat_max_tool_calls: number;
+  entity_max_tool_calls: number;
   has_api_key: boolean;
   available_models: ModelInfo[];
 }
@@ -76,6 +79,14 @@ export interface Finding {
   rule_id: string;
   suppressed: boolean;
   suppressed_reason: string | null;
+  suppression_details: {
+    reason: string;
+    actor: "analyst" | "ai" | "rule";
+    rationale: string;
+    confidence: string | null;
+    evidence_refs: { type: "event" | "memory_result"; id: number }[];
+    timestamp: string | null;
+  } | null;
   benign: boolean;
   rule_disabled: boolean;
   manual: boolean;
@@ -309,8 +320,29 @@ export interface Report {
   case_id?: string;
   summary?: string;
   timeline_narrative?: string;
-  findings_analysis?: { id: number; title: string; severity: Severity; verdict: string }[];
+  timeline_entries?: ReportTimelineEntry[];
+  findings_analysis?: {
+    id: number;
+    title: string;
+    severity: Severity;
+    verdict: string;
+    basis?: "ai-verdict" | "finding-evidence";
+  }[];
+  stale?: boolean;
   generated_at?: string;
+}
+
+export interface ReportTimelineEntry {
+  id: string;
+  title: string;
+  description: string;
+  confidence: "high" | "medium" | "low";
+  start: string;
+  end: string;
+  event_ids: number[];
+  finding_ids: number[];
+  event_refs: { id: number; timestamp: string | null; summary: string; severity: Severity; source: string }[];
+  finding_refs: { id: number; title: string; severity: Severity; suppressed: boolean }[];
 }
 
 export interface Progress {

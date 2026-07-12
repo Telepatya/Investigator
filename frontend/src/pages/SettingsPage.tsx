@@ -27,6 +27,9 @@ export default function SettingsPage() {
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
   const [temperature, setTemperature] = useState(0.2);
   const [maxTokens, setMaxTokens] = useState(4096);
+  const [analysisToolCalls, setAnalysisToolCalls] = useState(8);
+  const [chatToolCalls, setChatToolCalls] = useState(4);
+  const [entityToolCalls, setEntityToolCalls] = useState(5);
   const [apiKey, setApiKey] = useState("");
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [hasKey, setHasKey] = useState(false);
@@ -49,6 +52,9 @@ export default function SettingsPage() {
       setOllamaUrl(cfg.ollama_base_url);
       setTemperature(cfg.temperature);
       setMaxTokens(cfg.max_tokens);
+      setAnalysisToolCalls(cfg.analysis_max_tool_calls);
+      setChatToolCalls(cfg.chat_max_tool_calls);
+      setEntityToolCalls(cfg.entity_max_tool_calls);
       setHasKey(cfg.has_api_key);
       setModels(cfg.available_models);
     });
@@ -108,6 +114,9 @@ export default function SettingsPage() {
       ollama_base_url: ollamaUrl,
       temperature,
       max_tokens: maxTokens,
+      analysis_max_tool_calls: analysisToolCalls,
+      chat_max_tool_calls: chatToolCalls,
+      entity_max_tool_calls: entityToolCalls,
       ...(apiKey ? { api_key: apiKey } : {}),
     });
     await api.updateGeneralSettings({ yara_rules_dir: yaraDir });
@@ -239,6 +248,17 @@ export default function SettingsPage() {
             />
           </div>
         </div>
+        <div className="mt-5 border-t border-white/5 pt-4">
+          <div className="label mb-2">Maximum AI database interactions</div>
+          <p className="text-xs text-ink-500 mb-3">
+            Each tool call usually adds a model round trip. Set a workflow to 0 to use only its compact initial context.
+          </p>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <ToolCallLimit label="Case analysis" value={analysisToolCalls} onChange={setAnalysisToolCalls} />
+            <ToolCallLimit label="Chat turn" value={chatToolCalls} onChange={setChatToolCalls} />
+            <ToolCallLimit label="Entity investigation" value={entityToolCalls} onChange={setEntityToolCalls} />
+          </div>
+        </div>
       </Section>
 
       <Section title="Detection Engine">
@@ -273,6 +293,22 @@ export default function SettingsPage() {
         )}
       </div>
     </PageShell>
+  );
+}
+
+function ToolCallLimit({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {
+  return (
+    <div>
+      <label className="text-xs text-ink-400">{label}</label>
+      <input
+        className="input mt-1"
+        type="number"
+        min={0}
+        max={20}
+        value={value}
+        onChange={(e) => onChange(Math.max(0, Math.min(20, Number(e.target.value) || 0)))}
+      />
+    </div>
   );
 }
 

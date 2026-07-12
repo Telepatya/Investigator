@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -26,6 +27,8 @@ from app.store.database import Finding, acquire_session_write_lock
 
 _DISABLED_RULES_KEY = "disabled_rules"
 _BENIGN_FINDINGS_KEY = "benign_findings"
+_SUPPRESSION_AUDIT_KEY = "suppression_audit"
+_SUPPRESSION_REVISION_KEY = "suppression_revision"
 SUPPRESSED_SEVERITY = "info"
 
 # Findings whose title carries a variable subject (a process/service/account name
@@ -36,6 +39,8 @@ _VARIABLE_TITLE_RULES: list[tuple[str, str]] = [
     ("Execution from suspicious directory", "execution-from-suspicious-directory"),
     ("System process masquerade", "system-process-masquerade"),
     ("Random-looking executable in Windows root", "random-executable-windows-root"),
+    ("Service-hosted executable in Windows root", "service-executable-windows-root"),
+    ("RemCom named-pipe activity by", "remcom-named-pipe-activity"),
     ("Suspicious process chain", "suspicious-process-chain"),
     ("Anomalous parent for", "anomalous-parent"),
     ("Unresolved parentage for", "unresolved-parentage"),
@@ -94,6 +99,30 @@ def _store_set(session, key: str, values: set[str]) -> None:
     case_store.set_meta(session, key, json.dumps(sorted(values)))
 
 
+def _load_audit(session) -> dict[str, dict]:
+    raw = case_store.get_meta(session, _SUPPRESSION_AUDIT_KEY)
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def get_suppression_revision(session) -> int:
+    try:
+        return int(case_store.get_meta(session, _SUPPRESSION_REVISION_KEY) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bump_suppression_revision(session) -> int:
+    revision = get_suppression_revision(session) + 1
+    case_store.set_meta(session, _SUPPRESSION_REVISION_KEY, str(revision))
+    return revision
+
+
 def get_disabled_rules(session) -> set[str]:
     return _load_set(session, _DISABLED_RULES_KEY)
 
@@ -105,23 +134,67 @@ def get_benign_keys(session) -> set[str]:
 def set_rule_disabled(session, rule_id: str, disabled: bool) -> set[str]:
     acquire_session_write_lock(session)
     rules = get_disabled_rules(session)
+    before = set(rules)
     if disabled:
         rules.add(rule_id)
     else:
         rules.discard(rule_id)
     _store_set(session, _DISABLED_RULES_KEY, rules)
+    if rules != before:
+        _bump_suppression_revision(session)
     return rules
 
 
-def set_finding_benign(session, key: str, benign: bool) -> set[str]:
+def set_finding_benign(
+    session,
+    key: str,
+    benign: bool,
+    *,
+    actor: str = "analyst",
+    rationale: str = "",
+    confidence: str | None = None,
+    evidence_refs: list[dict] | None = None,
+) -> set[str]:
     acquire_session_write_lock(session)
     keys = get_benign_keys(session)
+    before = set(keys)
+    audit = _load_audit(session)
     if benign:
         keys.add(key)
+        audit[key] = {
+            "actor": actor,
+            "rationale": rationale.strip()[:2000],
+            "confidence": confidence,
+            "evidence_refs": (evidence_refs or [])[:20],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
     else:
         keys.discard(key)
+        audit.pop(key, None)
     _store_set(session, _BENIGN_FINDINGS_KEY, keys)
+    case_store.set_meta(session, _SUPPRESSION_AUDIT_KEY, json.dumps(audit, sort_keys=True))
+    if keys != before:
+        _bump_suppression_revision(session)
     return keys
+
+
+def get_suppression_details(session, finding: Finding) -> dict | None:
+    """Return durable audit metadata for the finding's current suppression."""
+    disabled = get_disabled_rules(session)
+    benign = get_benign_keys(session)
+    reason = is_suppressed(finding.title, finding.source, finding.evidence, disabled, benign)
+    if reason is None:
+        return None
+    key = finding_key(finding.title, finding.evidence)
+    audit = _load_audit(session).get(key, {}) if reason == "marked benign" else {}
+    return {
+        "reason": reason,
+        "actor": audit.get("actor") or ("analyst" if reason == "marked benign" else "rule"),
+        "rationale": audit.get("rationale") or "",
+        "confidence": audit.get("confidence"),
+        "evidence_refs": audit.get("evidence_refs") or [],
+        "timestamp": audit.get("timestamp"),
+    }
 
 
 # --- application -------------------------------------------------------------

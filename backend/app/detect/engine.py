@@ -827,7 +827,7 @@ def _parse_schtasks_create(text: str) -> dict[str, Any] | None:
         try:
             high_freq = high_freq or 0 < int(ri) < 15
         except ValueError:
-            pass
+            logger.debug("Ignoring non-numeric scheduled-task repetition interval %r", ri)
     schedule = " ".join(x for x in (f"/sc {sc}" if sc else "", f"/mo {mo}" if mo else "", f"/ri {ri}" if ri else "") if x)
     return {
         "name": grab("tn"),
@@ -2574,8 +2574,10 @@ def run_detections_sync(case_id: str) -> int:
 
         processes = list(session.scalars(select(Process)))
         proc_by_pid: dict[tuple[str, int], Process] = {}
+        proc_names_by_pid: dict[int, str] = {}
         for p in processes:
             proc_by_pid[(p.session_id, p.pid)] = p
+            proc_names_by_pid.setdefault(p.pid, p.name)
 
         # Scheduled-task creations observed anywhere in the case (4698/106 events,
         # schtasks /create command lines); analyzed and cross-corroborated at the end.
@@ -2692,6 +2694,27 @@ def run_detections_sync(case_id: str) -> int:
             if parent:
                 pname = (parent.name or "").lower()
                 parent_flags = set(parent.flags or [])
+                if pname == "services.exe" and path and _WINDOWS_ROOT_EXEC_RE.match(path):
+                    _add_finding(
+                        session, existing,
+                        title=f"Service-hosted executable in Windows root: {proc.name}",
+                        description=(
+                            f"services.exe launched {proc.name} (pid {proc.pid}) directly from "
+                            f"{proc.path}. A service binary in the Windows root, outside "
+                            "System32/SysWOW64 and standard component directories, combines an "
+                            "unusual image location with SYSTEM service execution."
+                        ),
+                        severity="high",
+                        techniques=["T1543.003", "T1036.005"],
+                        evidence={
+                            **evidence, "parent": parent.name, "parent_pid": parent.pid,
+                            "normalized_path": path,
+                        },
+                        source="process-heuristics",
+                    )
+                    flags.extend(["suspicious-path", "service-execution"])
+                    if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
+                        proc.severity = "high"
                 # PPID reuse: a "parent" that started after the child cannot be the real
                 # parent -- the original parent exited and its PID was recycled.
                 pid_reused = bool(
@@ -2820,9 +2843,35 @@ def run_detections_sync(case_id: str) -> int:
         # NTFS $UsnJrnl:$J rename rows are correlated by FileReferenceNumber after
         # this event pass, so old/new names become one timeline lead.
         usn_events: list[Event] = []
+        remcom_handles: dict[int, dict[str, Any]] = defaultdict(
+            lambda: {"process": "", "events": [], "pipes": set()}
+        )
 
         for event in event_stream:
             raw = event.raw or {}
+            source_l = (event.source or "").lower()
+            if "handle" in source_l or event.category == "handle":
+                try:
+                    handle_pid = int(str(raw.get("PID") or raw.get("Pid") or ""), 0)
+                except (TypeError, ValueError):
+                    handle_pid = None
+                handle_name = str(raw.get("Name") or raw.get("Description") or "")
+                device = str(raw.get("Device") or "")
+                if device.lower() == "namedpipe" and handle_name:
+                    handle_name = "\\NamedPipe" + (
+                        handle_name if handle_name.startswith("\\") else "\\" + handle_name
+                    )
+                if handle_pid is not None and "remcom_" in handle_name.lower():
+                    group = remcom_handles[handle_pid]
+                    group["process"] = str(
+                        raw.get("Process") or event.entity or proc_names_by_pid.get(handle_pid) or f"pid-{handle_pid}"
+                    )
+                    group["events"].append(event)
+                    group["pipes"].add(handle_name)
+                    _escalate_event(
+                        session, event, "medium",
+                        "Detection: RemCom remote-execution named-pipe handle",
+                    )
             is_usn_event = _is_usn_journal_event(event, raw)
             if is_usn_event:
                 tokens = _usn_reason_tokens(raw)
@@ -3144,6 +3193,36 @@ def run_detections_sync(case_id: str) -> int:
         )
         _analyze_usn_rename_chains(session, existing, usn_events)
         mark_phase("usn rename analysis", usn_events=len(usn_events))
+
+        for pid, group in remcom_handles.items():
+            pipes = sorted(group["pipes"])
+            events_for_pid = group["events"]
+            has_control = any("remcom_communicaton" in pipe.lower() for pipe in pipes)
+            stdio_count = sum(
+                any(marker in pipe.lower() for marker in ("remcom_stdin", "remcom_stdout", "remcom_stderr"))
+                for pipe in pipes
+            )
+            severity = "high" if has_control and stdio_count >= 2 else "medium"
+            process_name = group["process"]
+            _add_finding(
+                session, existing,
+                title=f"RemCom named-pipe activity by {process_name} (pid {pid})",
+                description=(
+                    f"{process_name} (pid {pid}) holds {len(pipes)} RemCom-style named-pipe "
+                    f"handle(s), including {', '.join(pipes[:5])}. A communication pipe plus "
+                    "stdin/stdout/stderr channels is consistent with RemCom remote command "
+                    "execution; verify whether this was authorized administration."
+                ),
+                severity=severity,
+                techniques=["T1021.002", "T1059"],
+                evidence={
+                    "entity": process_name, "pid": pid, "pipe_names": pipes[:20],
+                    "event_ids": [event.id for event in events_for_pid[:20]],
+                    "handle_count": len(events_for_pid),
+                },
+                source="memory-handles",
+            )
+        mark_phase("named-pipe handle analysis", processes=len(remcom_handles))
 
         # Beacon candidates: >= 5 connections to same endpoint with regular-ish spacing
         # over a meaningful window (a burst within one second is not a beacon).
