@@ -196,6 +196,20 @@ class DefenderMappingTests(unittest.TestCase):
             ev = normalize_row(row, "DeviceProcessEvents")
             self.assertIsNotNone(ev["timestamp"], f"{tskey} should parse to a timestamp")
 
+    def test_portal_grid_locale_timestamp_populates_timeline(self) -> None:
+        # The original bug: Sentinel/Defender portal grid CSV exports render the
+        # time in a locale 12-hour format the parser didn't recognise, so
+        # extract_timestamp returned None and the event never reached the timeline.
+        for tskey in ("Timestamp", "TimeGenerated [UTC]"):
+            row = {
+                tskey: "7/8/2026, 11:57:31.123 AM", "DeviceName": "WKS-01",
+                "ActionType": "ProcessCreated", "FileName": "a.exe",
+                "FolderPath": "C:\\x\\a.exe", "ProcessId": 5,
+                "InitiatingProcessFileName": "explorer.exe",
+            }
+            ev = normalize_row(row, "DeviceProcessEvents")
+            self.assertIsNotNone(ev["timestamp"], f"{tskey} locale value should parse")
+
     def test_unknown_table_generic_fallback(self) -> None:
         # An unmodeled Device*/AH table is still ingested best-effort, with host
         # attributed and all columns retained in raw (nothing dropped).

@@ -14,6 +14,8 @@ from sqlalchemy import Text, cast, or_, select
 
 from app.detect.rules import (
     EXPECTED_PARENTS,
+    LINUX_PERSISTENCE_PATHS,
+    LINUX_SUSPICIOUS_CMDLINE_PATTERNS,
     LOLBINS,
     LOW_SIGNAL_LOLBINS,
     PERSISTENCE_REGISTRY_PATHS,
@@ -597,15 +599,17 @@ def _check_memprocfs_timeline_event(
             )
 
 
-def _check_cmdline(session, existing, text: str, evidence: dict[str, Any], source: str) -> str | None:
-    """Returns highest severity matched, adds findings."""
+def _check_cmdline_impl(session, existing, text, evidence, source, patterns, prefilter) -> str | None:
+    """Match `text` against a command-line pattern list, emitting a finding per
+    match and returning the highest severity seen. `prefilter` is a cheap literal
+    gate that must fire before the full list is scanned."""
     if not text:
         return None
-    if not _CMDLINE_PREFILTER_RE.search(text):
+    if not prefilter.search(text):
         return None
     lower = text.lower()
     top: str | None = None
-    for regex, technique, description, severity in SUSPICIOUS_CMDLINE_PATTERNS:
+    for regex, technique, description, severity in patterns:
         m = regex.search(lower)
         if m:
             matched = m.group(0).strip() or description  # lookahead-only rules match empty
@@ -621,6 +625,22 @@ def _check_cmdline(session, existing, text: str, evidence: dict[str, Any], sourc
             if top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[top]:
                 top = severity
     return top
+
+
+def _check_cmdline(session, existing, text: str, evidence: dict[str, Any], source: str) -> str | None:
+    """Returns highest severity matched, adds findings (Windows pattern set)."""
+    return _check_cmdline_impl(
+        session, existing, text, evidence, source,
+        SUSPICIOUS_CMDLINE_PATTERNS, _CMDLINE_PREFILTER_RE,
+    )
+
+
+def _check_linux_cmdline(session, existing, text: str, evidence: dict[str, Any], source: str) -> str | None:
+    """Returns highest severity matched, adds findings (Linux/Unix pattern set)."""
+    return _check_cmdline_impl(
+        session, existing, text, evidence, source,
+        LINUX_SUSPICIOUS_CMDLINE_PATTERNS, _LINUX_CMDLINE_PREFILTER_RE,
+    )
 
 
 def _scan_cmdline_severity(text: str) -> str | None:
@@ -1103,6 +1123,161 @@ _CMDLINE_PREFILTER_RE = re.compile(
     ),
     re.IGNORECASE,
 )
+
+# Cheap literal gate for the Linux command-line rules. Every pattern in
+# LINUX_SUSPICIOUS_CMDLINE_PATTERNS must have one of its literals here, otherwise
+# the pattern is unreachable (guarded by test_linux_detections_corpus).
+_LINUX_CMDLINE_PREFILTER_RE = re.compile(
+    "|".join(
+        re.escape(term)
+        for term in (
+            "curl", "wget", "chmod", "base64", "/dev/tcp", "nc -e", "ncat",
+            "-e /bin/", "mkfifo", "python", "perl", "socat", "history -c",
+            "histfile", "histsize", ".bash_history", "authorized_keys",
+            "/etc/crontab", "/etc/cron.d", "/etc/sudoers", "ld.so.preload",
+            "useradd", "adduser", "usermod", "systemctl enable",
+        )
+    ),
+    re.IGNORECASE,
+)
+
+# Group names whose membership grants root-equivalent or high-value access.
+_LINUX_PRIV_GROUPS = {"sudo", "wheel", "root", "admin", "adm", "docker"}
+
+
+def _check_linux_persistence(session, existing, event, raw, evidence) -> None:
+    """Flag Linux persistence-file writes observed via auditd PATH records or a
+    crontab modification event."""
+    candidates: list[str] = []
+    paths = raw.get("Paths")
+    write_ish = bool(raw.get("Key"))
+    if isinstance(paths, list):
+        for p in paths:
+            if isinstance(p, dict):
+                name = str(p.get("name") or "")
+                if name:
+                    candidates.append(name.lower())
+                if str(p.get("nametype") or "").upper() in ("CREATE", "DELETE"):
+                    write_ish = True
+    if not write_ish or not candidates:
+        return
+    for fragment, technique, description, severity in LINUX_PERSISTENCE_PATHS:
+        if any(fragment in name for name in candidates):
+            _add_finding(
+                session, existing,
+                title=description,
+                description=f"Linux persistence location written: {event.summary[:400]}",
+                severity=severity,
+                techniques=[technique],
+                evidence=evidence,
+                source=f"event:{event.source}",
+            )
+            _escalate_event(session, event, severity, f"Detection: {description}")
+
+
+def _check_linux_event(session, existing, event, raw, evidence, auth_fail, auth_success) -> None:
+    """Per-event Linux/Entra heuristics: feed the auth brute-force trackers, flag
+    root logins, account/group changes, risky Entra sign-ins, and persistence
+    writes. Called only for events carrying Linux/Entra markers."""
+    proto = _field(raw, "AuthProto")
+    if proto:
+        outcome = _field(raw, "AuthOutcome")
+        ip = _field(raw, "SrcIp")
+        user = _field(raw, "AuthUser")
+        key = (proto, ip.lower(), user.lower())
+        if outcome == "failure":
+            st = auth_fail[key]
+            st["count"] += 1
+            if event.timestamp and (st["first"] is None or _aware(event.timestamp) < _aware(st["first"])):
+                st["first"] = event.timestamp
+            if event.timestamp and (st["last"] is None or _aware(event.timestamp) > _aware(st["last"])):
+                st["last"] = event.timestamp
+            if len(st["events"]) < 200:
+                st["events"].append(event)
+        elif outcome == "success":
+            auth_success[key].append(event)
+            if proto != "entra" and (raw.get("RootLogin") or user.lower() == "root"):
+                scope = _addr_scope(ip)
+                sev = "high" if scope == "public" else "medium"
+                combo = f"root@{ip or 'unknown-source'}"
+                _add_finding(
+                    session, existing,
+                    title=f"Root login: {combo}",
+                    description=(
+                        f"Successful {proto} login as root from {ip or 'an unknown source'}. "
+                        "Direct root logins are usually disabled by policy; an interactive root "
+                        "session, especially from a public address, warrants review."
+                    ),
+                    severity=sev,
+                    techniques=["T1021.004", "T1078.003"],
+                    evidence={**evidence, "source_ip": ip or None, "scope": scope},
+                    source="logon-heuristics",
+                )
+                _escalate_event(session, event, sev, f"Detection: root login from {ip or 'unknown'}")
+
+    risk = _field(raw, "RiskLevelDuringSignIn").lower()
+    risk_state = _field(raw, "RiskState").lower()
+    if risk == "high" or risk_state in ("atrisk", "confirmedcompromised"):
+        user = _field(raw, "AuthUser")
+        _add_finding(
+            session, existing,
+            title=f"Risky Entra sign-in: {user or 'unknown user'}",
+            description=(
+                f"Entra ID flagged this sign-in for {user or 'an account'} as risky "
+                f"(risk level {risk or 'n/a'}, state {risk_state or 'n/a'}). "
+                "Consistent with credential compromise or impossible-travel signals."
+            ),
+            severity="high",
+            techniques=["T1078.004"],
+            evidence=evidence,
+            source="identity-heuristics",
+        )
+        _escalate_event(session, event, "high", "Detection: risky Entra ID sign-in")
+
+    action = _field(raw, "LinuxAccountAction")
+    if action == "new_user":
+        name = _field(raw, "AccountName") or "unknown"
+        _add_finding(
+            session, existing,
+            title=f"Linux user account created: {name}",
+            description=f"A new local account was created: {event.summary[:300]}",
+            severity="medium",
+            techniques=["T1136.001"],
+            evidence=evidence,
+            source=f"event:{event.source}",
+        )
+        _escalate_event(session, event, "medium", "Detection: Linux account created")
+    elif action == "group_add":
+        group = _field(raw, "GroupName").lower()
+        if group in _LINUX_PRIV_GROUPS:
+            name = _field(raw, "AccountName") or "unknown"
+            _add_finding(
+                session, existing,
+                title=f"User added to privileged group: {name} -> {group}",
+                description=(
+                    f"Account '{name}' was added to the privileged group '{group}', granting "
+                    f"root-equivalent or high-value access: {event.summary[:300]}"
+                ),
+                severity="high",
+                techniques=["T1098"],
+                evidence=evidence,
+                source=f"event:{event.source}",
+            )
+            _escalate_event(session, event, "high", f"Detection: user added to '{group}'")
+
+    if raw.get("CronAction", "").upper() in ("REPLACE", "EDIT"):
+        _add_finding(
+            session, existing,
+            title="Cron job modified",
+            description=f"A crontab was modified: {event.summary[:300]}",
+            severity="medium",
+            techniques=["T1053.003"],
+            evidence=evidence,
+            source=f"event:{event.source}",
+        )
+        _escalate_event(session, event, "medium", "Detection: crontab modified")
+
+    _check_linux_persistence(session, existing, event, raw, evidence)
 
 
 def _mem_result_technique(plugin: str, summary: str) -> list[str]:
@@ -2838,6 +3013,12 @@ def run_detections_sync(case_id: str) -> int:
         logon_success: dict[tuple[str, str], list[Event]] = defaultdict(list)
         rdp_logons: dict[str, dict[str, Any]] = {}
         priv_logons: dict[str, dict[str, Any]] = {}
+        # Linux/Entra auth trackers, keyed (proto, ip, user). Parallel to the
+        # 4624/4625 trackers above: Windows logon semantics/wording don't apply.
+        linux_auth_fail: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(
+            lambda: {"count": 0, "first": None, "last": None, "events": []}
+        )
+        linux_auth_success: dict[tuple[str, str, str], list[Event]] = defaultdict(list)
         # Log-clear events (1102 / wevtutil cl) for the intrusion-window correlation.
         log_clear_marks: list[tuple[Event, str]] = []
         # NTFS $UsnJrnl:$J rename rows are correlated by FileReferenceNumber after
@@ -2917,11 +3098,24 @@ def run_detections_sync(case_id: str) -> int:
                     "dangerous process access, or high-risk handle)",
                 )
 
-            top = _check_cmdline(session, existing, summary_text, evidence, f"event:{event.source}")
+            # Linux events run only the Linux pattern set (and vice-versa) so free-text
+            # syslog prose can't trip Windows rules and Windows cmdlines can't trip
+            # Linux rules.
+            is_linux = bool(raw.get("linux_log"))
+            if is_linux:
+                top = _check_linux_cmdline(session, existing, summary_text, evidence, f"event:{event.source}")
+            else:
+                top = _check_cmdline(session, existing, summary_text, evidence, f"event:{event.source}")
             if top:
                 _escalate_event(
                     session, event, top,
                     f"Detection: embedded command line matched suspicious patterns ({top})",
+                )
+
+            if is_linux or raw.get("AuthProto") or raw.get("LinuxAccountAction"):
+                _check_linux_event(
+                    session, existing, event, raw, evidence,
+                    linux_auth_fail, linux_auth_success,
                 )
 
             _check_memprocfs_timeline_event(
@@ -3398,6 +3592,69 @@ def run_detections_sync(case_id: str) -> int:
                         session, e, "medium",
                         f"Detection: authentication brute-force attempts for {combo}",
                     )
+
+        # --- Linux / Entra logon brute force (SSH, pam, auditd, Entra sign-ins) ---
+        for (proto, ip, user), stat in linux_auth_fail.items():
+            if stat["count"] < 10:
+                continue
+            label = "Entra ID sign-in" if proto == "entra" else f"{proto.upper()} login"
+            combo = f"{user or 'unknown-user'}@{ip or 'unknown-source'}"
+            successes: list[Event] = []
+            for (sproto, sip, suser), evs in linux_auth_success.items():
+                if sproto == proto and suser == user and (sip == ip or not sip or not ip):
+                    successes.extend(evs)
+            succ_after = [
+                e for e in successes
+                if stat["last"] is None
+                or (e.timestamp is not None and _aware(e.timestamp) >= _aware(stat["last"]))
+            ]
+            base_evidence = {
+                "entity": combo, "protocol": proto, "source_ip": ip or None,
+                "target_user": user or None, "failed_attempts": stat["count"],
+                "first_failure": stat["first"].isoformat() if stat["first"] else None,
+                "last_failure": stat["last"].isoformat() if stat["last"] else None,
+            }
+            if succ_after:
+                succ_ts = [e.timestamp for e in succ_after if e.timestamp]
+                _add_finding(
+                    session, existing,
+                    title=f"Brute force followed by successful login: {combo}",
+                    description=(
+                        f"{stat['count']} failed {label} attempts for {combo} were followed by a "
+                        "successful authentication for the same account/source. The subsequent "
+                        "success for the very same pairing is what makes this consistent with a "
+                        "completed credential brute force rather than a typo storm."
+                    ),
+                    severity="critical",
+                    techniques=["T1110", "T1078"],
+                    evidence={
+                        **base_evidence, "successful_logins": len(succ_after),
+                        "first_success": min(_aware(t) for t in succ_ts).isoformat() if succ_ts else None,
+                    },
+                    source="logon-heuristics",
+                )
+                for e in stat["events"][:50]:
+                    _escalate_event(session, e, "high",
+                                    f"Detection: brute force followed by successful login for {combo}")
+                for e in succ_after[:50]:
+                    _escalate_event(session, e, "high",
+                                    f"Detection: successful login after brute-force failures for {combo}")
+            else:
+                _add_finding(
+                    session, existing,
+                    title=f"Authentication brute force attempts: {combo}",
+                    description=(
+                        f"{stat['count']} failed {label} attempts for {combo} with no matching "
+                        "success observed. Consistent with a brute-force / password-spray attempt."
+                    ),
+                    severity="medium",
+                    techniques=["T1110"],
+                    evidence=base_evidence,
+                    source="logon-heuristics",
+                )
+                for e in stat["events"][:50]:
+                    _escalate_event(session, e, "medium",
+                                    f"Detection: authentication brute-force attempts for {combo}")
 
         # --- Persistence + execution pairing: artifact action executed as a flagged process ---
         flagged_by_base: dict[str, list[Process]] = defaultdict(list)

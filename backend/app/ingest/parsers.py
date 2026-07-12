@@ -6,12 +6,22 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import zipfile
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.ingest.linux import (
+    classify_syslog_event,
+    is_auditd_line,
+    is_journald_row,
+    normalize_journald_row,
+    parse_auditd,
+    parse_syslog_line,
+)
 from app.ingest.normalize import (
     decode_win_codes,
     extract_entity,
@@ -20,6 +30,7 @@ from app.ingest.normalize import (
     summarize_row,
     truncate,
 )
+from app.ingest.sentinel import is_sentinel_row, normalize_sentinel_row
 
 # Map artifact-name fragments to event categories
 CATEGORY_HINTS = [
@@ -54,6 +65,14 @@ CATEGORY_HINTS = [
     ("chrome", "browser"),
     ("firefox", "browser"),
     ("edge", "browser"),
+    # Linux log sources. Appended last so Windows fragments win on overlap
+    # ("security" above must beat "secure"). Only fall-through rows the row-level
+    # classifiers didn't categorize are affected.
+    ("auth", "auth"),
+    ("secure", "auth"),
+    ("syslog", "log"),
+    ("messages", "log"),
+    ("audit", "eventlog"),
 ]
 
 
@@ -73,6 +92,10 @@ def normalize_row(row: dict[str, Any], source: str) -> dict[str, Any]:
         return _normalize_usn_journal_row(row, source)
     if _is_defender_row(row, source):
         return _normalize_defender_row(row, source)
+    if is_journald_row(row):
+        return normalize_journald_row(row, source)
+    if is_sentinel_row(row, source):
+        return normalize_sentinel_row(row, source)
     return {
         "timestamp": extract_timestamp(row),
         "host": extract_host(row),
@@ -626,7 +649,10 @@ def parse_jsonl(path: Path, source: str) -> Iterator[dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             if isinstance(row, dict):
-                yield normalize_row(row, source)
+                if _is_log_analytics_export(row):
+                    yield from _iter_log_analytics_rows(row, source)
+                else:
+                    yield normalize_row(row, source)
 
 
 def parse_json(path: Path, source: str) -> Iterator[dict[str, Any]]:
@@ -639,6 +665,9 @@ def parse_json(path: Path, source: str) -> Iterator[dict[str, Any]]:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             data = json.load(f)
     except json.JSONDecodeError:
+        return
+    if _is_log_analytics_export(data):
+        yield from _iter_log_analytics_rows(data, source)
         return
     if isinstance(data, dict):
         data = [data]
@@ -693,6 +722,66 @@ def _parse_json_array_stream(path: Path, source: str) -> Iterator[dict[str, Any]
                     yield normalize_row(row, source)
             if not chunk and not done:
                 break
+
+
+# Log Analytics / Sentinel "Export to JSON" wraps results in a columnar envelope
+# {"tables":[{"name":..,"columns":[{"name":..,"type":..}],"rows":[[..],..]}]}
+# rather than an array of row dicts. Flatten each row list against its column
+# names so the rows flow through the normal normalize_row / Defender / Sentinel
+# machinery. Generic result-table names carry no table identity, so they are not
+# stamped onto _TableName (which _defender_table / _sentinel_table read).
+_LA_GENERIC_TABLE_NAMES = {"primaryresult", "table_0", "table0", "result", "results"}
+def _is_log_analytics_export(data: Any) -> bool:
+    """True for a Log Analytics / Sentinel columnar export envelope."""
+    if not isinstance(data, dict):
+        return False
+    tables = data.get("tables")
+    if not isinstance(tables, list) or not tables:
+        return False
+    for table in tables:
+        if not isinstance(table, dict):
+            return False
+        cols = table.get("columns")
+        rows = table.get("rows")
+        if not isinstance(cols, list) or not isinstance(rows, list):
+            return False
+        if not all(isinstance(c, dict) and "name" in c for c in cols):
+            return False
+    return True
+
+
+def _iter_log_analytics_rows(data: dict[str, Any], source: str) -> Iterator[dict[str, Any]]:
+    """Zip each columnar row list against its table's column names and normalize."""
+    for table in data.get("tables", []):
+        if not isinstance(table, dict):
+            continue
+        names = [str(c.get("name") or "") for c in table.get("columns", []) if isinstance(c, dict)]
+        table_name = str(table.get("name") or "").strip()
+        stamp_table = bool(table_name) and table_name.lower() not in _LA_GENERIC_TABLE_NAMES
+        for row in table.get("rows", []):
+            if not isinstance(row, list):
+                continue
+            flat = {
+                name: value
+                for name, value in zip(names, row)
+                if name and value not in (None, "")
+            }
+            if not flat:
+                continue
+            if stamp_table:
+                flat["_TableName"] = table_name
+            yield normalize_row(flat, source)
+
+
+def parse_log_analytics_export(path: Path, source: str) -> Iterator[dict[str, Any]]:
+    """Parse a Log Analytics / Sentinel columnar JSON export ({"tables":[...]})."""
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        return
+    if _is_log_analytics_export(data):
+        yield from _iter_log_analytics_rows(data, source)
 
 
 def parse_csv(path: Path, source: str) -> Iterator[dict[str, Any]]:
@@ -911,22 +1000,14 @@ def _message_first_line(flat: dict[str, Any]) -> str:
     return msg.splitlines()[0].strip() if msg else ""
 
 
-def _normalize_vr_evtx_row(row: dict[str, Any], source: str) -> dict[str, Any]:
-    flat = _flatten_vr_evtx_row(row)
+def _apply_windows_event_mapping(event: dict[str, Any], flat: dict[str, Any]) -> None:
+    """Classify a flattened Windows event-log record (EVTX or Sentinel
+    SecurityEvent) by channel/EventID, mutating `event` in place. `flat` is
+    event["raw"] and must carry EventID / Channel / Provider plus the promoted
+    EventData fields (TargetUserName, IpAddress, ImagePath, ...)."""
     eid = str(flat.get("EventID") or "")
     channel = str(flat.get("Channel") or "")
     provider = str(flat.get("Provider") or "")
-    event: dict[str, Any] = {
-        "timestamp": extract_timestamp(flat) or extract_timestamp(row),
-        "host": flat.get("Computer") or extract_host(row),
-        "source": source,
-        "category": "eventlog",
-        "entity": None,
-        "severity": "info",
-        "summary": "",
-        "raw": _json_safe(flat),
-    }
-    flat = event["raw"]
 
     def g(key: str) -> str:
         val = flat.get(key)
@@ -995,6 +1076,21 @@ def _normalize_vr_evtx_row(row: dict[str, Any], source: str) -> dict[str, Any]:
         event["summary"] = _message_first_line(flat) or summarize_row(flat)
     if not event.get("entity"):
         event["entity"] = f"EventID {eid or '?'} ({channel})"
+
+
+def _normalize_vr_evtx_row(row: dict[str, Any], source: str) -> dict[str, Any]:
+    flat = _flatten_vr_evtx_row(row)
+    event: dict[str, Any] = {
+        "timestamp": extract_timestamp(flat) or extract_timestamp(row),
+        "host": flat.get("Computer") or extract_host(row),
+        "source": source,
+        "category": "eventlog",
+        "entity": None,
+        "severity": "info",
+        "summary": "",
+        "raw": _json_safe(flat),
+    }
+    _apply_windows_event_mapping(event, event["raw"])
     return event
 
 
@@ -1067,9 +1163,33 @@ _CLF_RE = re.compile(
 )
 
 
+def _mtime_hint(path: Path) -> datetime:
+    """File mtime (UTC) used to infer the year of RFC3164 syslog lines, which
+    carry no year. Evidence is examined long after collection, so the file's own
+    timestamp beats 'current year'. Falls back to now() if stat fails."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return datetime.now(timezone.utc)
+
+
 def parse_textlog(path: Path, source: str) -> Iterator[dict[str, Any]]:
-    """Parse text logs. Recognizes web access logs (CLF/Combined); otherwise
-    emits one event per line as a generic log entry."""
+    """Parse text logs. Recognizes web access logs (CLF/Combined), Linux syslog /
+    auth.log lines, and auditd audit.log; otherwise emits one event per line as a
+    generic log entry."""
+    # auditd files are line-structured but need whole-file record merging.
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            for probe in f:
+                if probe.strip():
+                    if is_auditd_line(probe):
+                        yield from parse_auditd(path, source)
+                        return
+                    break
+    except OSError:
+        return
+
+    hint_dt = _mtime_hint(path)
     with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             line = line.rstrip("\n").rstrip("\r")
@@ -1107,16 +1227,20 @@ def parse_textlog(path: Path, source: str) -> Iterator[dict[str, Any]]:
                     "raw": raw,
                 }
             else:
-                yield {
-                    "timestamp": None,
-                    "host": None,
-                    "source": source,
-                    "category": "log",
-                    "entity": None,
-                    "severity": "info",
-                    "summary": summarize_row({"line": line}),
-                    "raw": {"log_line": line},
-                }
+                rec = parse_syslog_line(line, hint_dt)
+                if rec is not None:
+                    yield classify_syslog_event(rec, source)
+                else:
+                    yield {
+                        "timestamp": None,
+                        "host": None,
+                        "source": source,
+                        "category": "log",
+                        "entity": None,
+                        "severity": "info",
+                        "summary": summarize_row({"line": line}),
+                        "raw": {"log_line": line},
+                    }
 
 
 PARSABLE_EXTENSIONS = {".json", ".jsonl", ".csv", ".evtx", ".txt", ".log"}
@@ -1137,7 +1261,19 @@ def parse_file(path: Path, source: str | None = None) -> Iterator[dict[str, Any]
         if prefix.startswith("["):
             yield from parse_json(path, src)
         elif prefix.startswith("{") and "\n" in prefix:
-            yield from parse_jsonl(path, src)
+            # A complete object on the first physical line indicates JSONL. A
+            # pretty-printed top-level object starts with a partial "{" line and
+            # must be parsed as JSON regardless of property order (Log Analytics
+            # envelopes may place metadata before their `tables` property).
+            first_line = prefix.splitlines()[0].strip()
+            try:
+                first_row = json.loads(first_line)
+            except json.JSONDecodeError:
+                first_row = None
+            if isinstance(first_row, dict):
+                yield from parse_jsonl(path, src)
+            else:
+                yield from parse_json(path, src)
         else:
             try:
                 first, idx = json.JSONDecoder().raw_decode(prefix)
@@ -1175,6 +1311,14 @@ def iter_zip_members(zip_path: Path, extract_dir: Path) -> Iterator[tuple[Path, 
                     if not chunk:
                         break
                     dst_f.write(chunk)
+            # RFC3164 syslog records carry no year, so parse_textlog uses the
+            # extracted file's mtime as its year hint. Preserve the ZIP member
+            # timestamp instead of leaving the newly-created extraction time.
+            try:
+                member_ts = datetime(*info.date_time, tzinfo=timezone.utc).timestamp()
+                os.utime(target, (member_ts, member_ts))
+            except (OSError, OverflowError, ValueError):
+                pass
             # derive source name from the artifact path inside the zip
             source = _source_from_member(member_path)
             yield target, source

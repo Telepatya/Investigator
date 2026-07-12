@@ -12,7 +12,9 @@ _NUMERIC_TS_RE = re.compile(r"\d{9,19}(\.\d+)?")
 _FRAC_TRIM_RE = re.compile(r"(.*\.\d{6})\d+(.*)")
 
 # Timestamp formats tried in order. Order is semantic (e.g. %m/%d vs %d/%m both
-# parse some strings, with different results) — do NOT reorder.
+# parse some strings, with different results) — do NOT reorder, and never insert
+# slash-date formats before the ISO family. Slash dates are tried US-order
+# (%m/%d) first; day <= 12 is inherently ambiguous and resolves US-style.
 _TIMESTAMP_FORMATS = (
     "%Y-%m-%dT%H:%M:%S.%f%z",
     "%Y-%m-%dT%H:%M:%S%z",
@@ -25,6 +27,22 @@ _TIMESTAMP_FORMATS = (
     "%Y-%m-%d %H:%M:%S %Z",
     "%m/%d/%Y %H:%M:%S",
     "%d/%m/%Y %H:%M:%S",
+    # Sentinel / Log Analytics / Defender portal grid exports render times in a
+    # locale 12-hour format ("7/8/2026, 11:57:31.123 AM"). Grids show the
+    # analyst's display timezone; values are treated as UTC (no zone in string).
+    # AM/PM vs 24h and comma vs no-comma shapes are disjoint under strptime, so
+    # these cannot shadow the formats above.
+    "%m/%d/%Y, %I:%M:%S.%f %p",
+    "%m/%d/%Y, %I:%M:%S %p",
+    "%m/%d/%Y %I:%M:%S.%f %p",
+    "%m/%d/%Y %I:%M:%S %p",
+    "%d/%m/%Y, %I:%M:%S.%f %p",
+    "%d/%m/%Y, %I:%M:%S %p",
+    "%m/%d/%Y, %H:%M:%S.%f",
+    "%m/%d/%Y, %H:%M:%S",
+    "%d/%m/%Y, %H:%M:%S.%f",
+    "%d/%m/%Y, %H:%M:%S",
+    "%m/%d/%Y %H:%M:%S.%f",
     "%d/%b/%Y:%H:%M:%S %z",
     "%d/%b/%Y:%H:%M:%S",
 )
@@ -87,7 +105,8 @@ def parse_timestamp(value: Any) -> datetime | None:
 @lru_cache(maxsize=4096)
 def _parse_timestamp_str(s: str) -> datetime | None:
     """Parse a non-empty, non-numeric timestamp string. Cached: pure function
-    returning immutable (tz-aware) datetimes, so results are safe to share."""
+    returning immutable (tz-aware) datetimes, so results are safe to share.
+    Tests that depend on _TIMESTAMP_FORMATS must call cache_clear() in setup."""
     # normalize timezone suffix
     s = s.replace("Z", "+00:00")
     # trim excess fractional digits (python supports max 6)
