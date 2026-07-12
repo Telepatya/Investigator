@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import traceback
 from pathlib import Path
@@ -22,6 +23,7 @@ MIN_INGEST_BATCH_SIZE = 1000
 MAX_INGEST_BATCH_SIZE = 50000
 
 ProgressCallback = Callable[[str, float, str, bool, str | None], Any]
+logger = logging.getLogger(__name__)
 
 
 def _ingest_batch_size() -> int:
@@ -344,7 +346,7 @@ class IngestionManager:
             try:
                 queue.put_nowait(payload)
             except asyncio.QueueFull:
-                pass
+                logger.debug("Dropped ingestion update for a full listener queue")
 
     def get_status(self, case_id: str) -> dict[str, Any] | None:
         return self.jobs.get(case_id)

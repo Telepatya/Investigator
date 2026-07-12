@@ -827,7 +827,7 @@ def _parse_schtasks_create(text: str) -> dict[str, Any] | None:
         try:
             high_freq = high_freq or 0 < int(ri) < 15
         except ValueError:
-            pass
+            logger.debug("Ignoring non-numeric scheduled-task repetition interval %r", ri)
     schedule = " ".join(x for x in (f"/sc {sc}" if sc else "", f"/mo {mo}" if mo else "", f"/ri {ri}" if ri else "") if x)
     return {
         "name": grab("tn"),

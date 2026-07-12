@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from pathlib import Path
 from threading import Lock
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 MEMPROCFS_CAPABILITIES = (
@@ -280,8 +283,8 @@ class MemProcFSRunner:
             self._failures[f"vfs.read:{source_path}"] = str(exc)
             try:
                 target.unlink(missing_ok=True)
-            except OSError:
-                pass
+            except OSError as cleanup_exc:
+                artifact["cleanup_error"] = str(cleanup_exc)
         return artifact
 
     def _collect_process(self, proc, progress=None, index: int = 0, total: int = 0) -> dict[str, list[dict[str, Any]]]:

@@ -8,6 +8,17 @@ import sys
 import types
 import unittest
 
+
+class _BaseModel:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    @classmethod
+    def model_validate(cls, data):
+        return cls(**data)
+
+
 # Match the stubbing style used by the other API tests so this suite runs even
 # when optional native deps aren't installed; real packages win when present.
 sys.modules.setdefault("keyring", types.SimpleNamespace(
@@ -15,6 +26,12 @@ sys.modules.setdefault("keyring", types.SimpleNamespace(
     set_password=lambda *_a, **_k: None,
     delete_password=lambda *_a, **_k: None,
     errors=types.SimpleNamespace(PasswordDeleteError=Exception),
+))
+sys.modules.setdefault("pydantic", types.SimpleNamespace(
+    BaseModel=_BaseModel,
+    Field=lambda default=None, default_factory=None, **_k: (
+        default_factory() if default_factory else default
+    ),
 ))
 
 from app.ingest.evidence import sanitize_upload_filename  # noqa: E402

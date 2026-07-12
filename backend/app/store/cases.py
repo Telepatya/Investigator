@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,6 +33,7 @@ from app.store.database import (
 REGISTRY_FILE = "registry.json"
 _CASE_ID_RE = re.compile(r"^[0-9a-f]{8}$", re.IGNORECASE)
 _REGISTRY_LOCK = RLock()
+logger = logging.getLogger(__name__)
 
 
 def _registry_path() -> Path:
@@ -281,7 +283,7 @@ def cleanup_stale_case_artifacts() -> list[dict[str, str]]:
                 if derived_root.exists() and not any(derived_root.iterdir()):
                     derived_root.rmdir()
             except OSError:
-                pass
+                logger.debug("Could not remove empty derived-artifact directories", exc_info=True)
     return removed
 
 

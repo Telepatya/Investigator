@@ -71,7 +71,7 @@ def delete_api_key(provider: ProviderType) -> None:
     try:
         keyring.delete_password(SERVICE_NAME, _key_name(provider))
     except keyring.errors.PasswordDeleteError:
-        pass
+        return
 
 
 def has_api_key(provider: ProviderType) -> bool:

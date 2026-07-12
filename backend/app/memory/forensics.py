@@ -431,7 +431,7 @@ def _load_manifest(artifact_dir: Path, fallback: dict[str, Any] | None) -> dict[
         try:
             return json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            pass
+            return fallback or {"artifacts": []}
     return fallback or {"artifacts": []}
 
 

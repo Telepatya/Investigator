@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ FRONTEND_LOCK = FRONTEND / "package-lock.json"
 FRONTEND_LOCK_STATE = FRONTEND / "node_modules" / ".investigator-package-lock.sha256"
 FRONTEND_DIST = FRONTEND / "dist"
 FRONTEND_BUILD_STATE = FRONTEND_DIST / ".investigator-src.sha256"
+logger = logging.getLogger(__name__)
 # Files whose contents determine the built frontend; a change to any triggers a
 # rebuild. node_modules and dist are excluded (deps handled separately, dist is
 # the output).
@@ -174,7 +176,7 @@ def open_browser_later(url: str, delay: float = 2.0) -> None:
         try:
             webbrowser.open(url)
         except Exception:
-            pass
+            logger.debug("Could not open the browser automatically", exc_info=True)
 
     threading.Thread(target=_open, daemon=True).start()
 
@@ -215,7 +217,7 @@ def main() -> int:
     try:
         run([str(py), "-m", "app.main"], cwd=BACKEND, env=env, check=False)
     except KeyboardInterrupt:
-        pass
+        log("Stopping Investigator...")
     return 0
 
 

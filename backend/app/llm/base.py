@@ -17,15 +17,15 @@ class LLMProvider(ABC):
 
     @abstractmethod
     async def list_models(self) -> list[ModelInfo]:
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     async def test_connection(self) -> tuple[bool, str]:
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     async def complete(self, messages: list[dict[str, str]], stream: bool = False) -> str | AsyncIterator[str]:
-        ...
+        raise NotImplementedError
 
     @property
     def model(self) -> str:

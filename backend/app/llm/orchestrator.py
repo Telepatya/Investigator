@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -20,6 +21,7 @@ from app.store import cases as case_store
 from app.store.database import ChatHistory, Event, Finding, MemoryResult, Process, Report
 
 MAX_EVIDENCE_ROWS_PER_BATCH = 40
+logger = logging.getLogger(__name__)
 MAX_CATEGORIES = 12
 MEMO_THRESHOLD_CHARS = 6000  # un-summarized history beyond the raw tail triggers a memo update
 MEMO_KEEP_RAW = 6  # newest messages always sent raw, never folded into the memo
@@ -765,7 +767,7 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
         try:
             await _update_chat_memo(session)
         except Exception:
-            pass  # memo failure must never break chat
+            logger.debug("Chat memo update failed", exc_info=True)
     finally:
         session.close()
 

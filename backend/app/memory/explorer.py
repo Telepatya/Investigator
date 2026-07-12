@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 import zipfile
@@ -27,6 +28,7 @@ MAX_ARCHIVE_DEPTH = 6
 MAX_ARCHIVE_FILES = 1000
 MAX_MODULE_HASH_BYTES = 512 * 1024 * 1024
 MAX_PROCESS_VMEM_EXTRACT_BYTES = 512 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 class MemoryExplorerError(RuntimeError):
@@ -616,7 +618,10 @@ def _copy_process_range(proc, base: int, size: int, output: Path, metadata: dict
         try:
             output.unlink(missing_ok=True)
         except OSError:
-            pass
+            logger.warning(
+                "Could not remove partial memory-range extraction %s", output,
+                exc_info=True,
+            )
         raise MemoryExplorerError(f"Could not extract memory range: {exc}", 500) from exc
 
 
@@ -645,7 +650,10 @@ def _copy_vfs_file(vmm, source: str, output: Path, entry: Any | None) -> dict[st
         try:
             output.unlink(missing_ok=True)
         except OSError:
-            pass
+            logger.warning(
+                "Could not remove partial VFS extraction %s", output,
+                exc_info=True,
+            )
         raise MemoryExplorerError(f"Could not extract VFS file {source}: {exc}", 500) from exc
     return {
         "kind": "vfs_file",

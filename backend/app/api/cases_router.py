@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from pathlib import Path
 
 import aiofiles
 from fastapi import APIRouter, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
 
-from app.config import case_uploads_path
+from app.config import case_uploads_path, get_cases_dir
 from app.detect import overrides
 from app.detect.entity_graph import build_entity_graph, entity_dossier
 from app.detect.process_tree import build_tree, list_sessions, process_dossier
@@ -32,14 +34,60 @@ from app.store.database import Event, Finding, MemoryResult
 from app.store.operations import coordinator
 
 router = APIRouter(prefix="/api/cases", tags=["cases"])
+_CASE_ID_RE = re.compile(r"^[0-9a-fA-F]{8}$")
+_MEMORY_SESSION_RE = re.compile(r"^mem-[A-Za-z0-9][A-Za-z0-9_. ()%-]{0,254}$")
+_UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ ()%+-]{0,254}$")
+
+
+def _validated_case_id(case_id: str) -> str:
+    if not _CASE_ID_RE.fullmatch(case_id) or not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
+    return case_id
 
 
 def _safe_upload_name(filename: str | None) -> str:
     """Validate/normalize a client filename to a safe basename or 400."""
     name = evidence_store.sanitize_upload_filename(filename)
-    if name is None:
+    if name is None or not _UPLOAD_NAME_RE.fullmatch(name):
         raise HTTPException(400, "Invalid filename")
     return name
+
+
+def _upload_destination(case_id: str, filename: str | None) -> tuple[str, Path]:
+    """Resolve an upload to a direct child of its validated case directory."""
+    validated_case_id = _validated_case_id(case_id)
+    safe_name = _safe_upload_name(filename)
+    uploads = case_uploads_path(validated_case_id).resolve()
+    destination = (uploads / safe_name).resolve()
+    if destination.parent != uploads:
+        raise HTTPException(400, "Invalid filename")
+    return safe_name, destination
+
+
+def _validated_memory_session_id(session_id: str) -> str:
+    if not _MEMORY_SESSION_RE.fullmatch(session_id):
+        raise HTTPException(400, "Invalid memory session")
+    return session_id
+
+
+def _memory_file_response(
+    case_id: str, local: Path, media_type: str = "application/octet-stream",
+) -> FileResponse:
+    """Serve only regular files generated inside the validated case directory."""
+    case_root = (get_cases_dir() / _validated_case_id(case_id)).resolve()
+    try:
+        resolved = local.resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(404, "Generated file not found") from exc
+    try:
+        resolved.relative_to(case_root)
+    except ValueError as exc:
+        raise HTTPException(500, "Generated file escaped the case directory") from exc
+    if not resolved.is_file():
+        raise HTTPException(404, "Generated file not found")
+    return FileResponse(
+        str(resolved), media_type=media_type, filename=resolved.name,
+    )
 
 
 @router.get("")
@@ -78,13 +126,7 @@ async def upload_file(
     mem_forensic_timeline: bool = False,
     mem_eventlogs: bool = False,
 ) -> dict:
-    case = await asyncio.to_thread(case_store.get_case, case_id)
-    if not case:
-        raise HTTPException(404, "Case not found")
-
-    safe_name = _safe_upload_name(file.filename)
-    uploads = case_uploads_path(case_id)
-    dest = uploads / safe_name
+    safe_name, dest = _upload_destination(case_id, file.filename)
     async with aiofiles.open(dest, "wb") as out:
         while True:
             chunk = await file.read(4 * 1024 * 1024)
@@ -113,13 +155,7 @@ async def upload_chunk(
     mem_eventlogs: bool = False,
 ) -> dict:
     """Chunked upload for multi-GB memory dumps."""
-    case = await asyncio.to_thread(case_store.get_case, case_id)
-    if not case:
-        raise HTTPException(404, "Case not found")
-
-    safe_name = _safe_upload_name(filename)
-    uploads = case_uploads_path(case_id)
-    dest = uploads / safe_name
+    safe_name, dest = _upload_destination(case_id, filename)
     mode = "wb" if chunk_index == 0 else "ab"
     async with aiofiles.open(dest, mode) as out:
         while True:
@@ -192,7 +228,7 @@ async def ingestion_ws(websocket: WebSocket, case_id: str) -> None:
                 # keep open a moment for final message delivery
                 pass
     except WebSocketDisconnect:
-        pass
+        return
     finally:
         manager.unsubscribe(case_id, queue)
 
@@ -686,25 +722,25 @@ def get_memory_vfs(case_id: str, session_id: str, path: str = "/") -> dict:
 
 @router.get("/{case_id}/memory/{session_id}/vfs/download")
 def download_memory_vfs_file(case_id: str, session_id: str, path: str) -> FileResponse:
-    if not case_store.get_case(case_id):
-        raise HTTPException(404, "Case not found")
+    validated_case_id = _validated_case_id(case_id)
+    validated_session_id = _validated_memory_session_id(session_id)
     try:
-        local = extract_vfs_file(case_id, session_id, path)
-        return FileResponse(local, media_type="application/octet-stream", filename=local.name)
+        local = extract_vfs_file(validated_case_id, validated_session_id, path)
+        return _memory_file_response(validated_case_id, local)
     except MemoryExplorerError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 @router.post("/{case_id}/memory/{session_id}/vfs/archive")
 def archive_memory_vfs(case_id: str, session_id: str, body: dict) -> FileResponse:
-    if not case_store.get_case(case_id):
-        raise HTTPException(404, "Case not found")
+    validated_case_id = _validated_case_id(case_id)
+    validated_session_id = _validated_memory_session_id(session_id)
     paths = body.get("paths") if isinstance(body, dict) else None
     if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
         raise HTTPException(400, "Expected JSON body with string paths")
     try:
-        local = archive_vfs_selection(case_id, session_id, paths)
-        return FileResponse(local, media_type="application/zip", filename=local.name)
+        local = archive_vfs_selection(validated_case_id, validated_session_id, paths)
+        return _memory_file_response(validated_case_id, local, media_type="application/zip")
     except MemoryExplorerError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
@@ -738,11 +774,11 @@ def get_memory_process_handles(
 
 @router.get("/{case_id}/memory/{session_id}/processes/{pid}/download")
 def download_memory_process(case_id: str, session_id: str, pid: int, kind: str = "image") -> FileResponse:
-    if not case_store.get_case(case_id):
-        raise HTTPException(404, "Case not found")
+    validated_case_id = _validated_case_id(case_id)
+    validated_session_id = _validated_memory_session_id(session_id)
     try:
-        local = extract_process_image(case_id, session_id, pid, kind=kind)
-        return FileResponse(local, media_type="application/octet-stream", filename=local.name)
+        local = extract_process_image(validated_case_id, validated_session_id, pid, kind=kind)
+        return _memory_file_response(validated_case_id, local)
     except MemoryExplorerError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
 
@@ -755,10 +791,12 @@ def download_memory_process_module(
     base: str | None = None,
     name: str | None = None,
 ) -> FileResponse:
-    if not case_store.get_case(case_id):
-        raise HTTPException(404, "Case not found")
+    validated_case_id = _validated_case_id(case_id)
+    validated_session_id = _validated_memory_session_id(session_id)
     try:
-        local = extract_process_module(case_id, session_id, pid, base=base, name=name)
-        return FileResponse(local, media_type="application/octet-stream", filename=local.name)
+        local = extract_process_module(
+            validated_case_id, validated_session_id, pid, base=base, name=name,
+        )
+        return _memory_file_response(validated_case_id, local)
     except MemoryExplorerError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc

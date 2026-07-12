@@ -31,7 +31,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - **Memory forensics.** MemProcFS process, module, VAD, thread, handle, network, service, and driver maps feed deterministic injection, hollowing, suspicious-service, network, and driver heuristics. Executable private-memory candidates are checked against VAD shape, module load order, live thread start addresses, network context, and machine-wide prevalence before escalation.
 - **APT hunting.** YARA sweep of memory using a bundled C2 / offensive-tooling ruleset (Cobalt Strike, Meterpreter, Sliver/Covenant/Havoc, Mimikatz, Rubeus, reflective loaders, shellcode markers) plus your own rules directory.
 - **Deterministic detection engine.** LOLBins, suspicious parent/child chains, masquerading, execution from staging directories, persistence, log clearing, and C2 beaconing — every finding mapped to MITRE ATT&CK before the LLM ever runs.
-- **AI orchestration.** Map-reduce analysis over the evidence produces an executive summary, a timeline narrative, and per-finding verdicts. During correlation, verdicts, and chat, the model can query the case database itself (full-text event search, process trees, memory correlation data, findings, aggregates) through a provider-agnostic tool loop — it pulls the actual log lines behind a claim before committing to it. A retrieval-augmented chat answers questions from the case's own data and keeps a compact rolling memo of long conversations, so context truncation doesn't lose the investigation thread.
+- **AI orchestration.** Map-reduce analysis over the evidence produces an executive summary, a timeline narrative, and per-finding verdicts. During correlation, verdicts, and chat, the model can query the case database itself (full-text event search, process trees, memory correlation data, findings, download path/URL inventories, and aggregates) through a provider-agnostic tool loop — it pulls the actual records behind a claim before committing to it. A retrieval-augmented chat answers questions from the case's own data and keeps a compact rolling memo of long conversations, so context truncation doesn't lose the investigation thread.
 - **Analyst workstation UI.** Responsive glass-panel workspace with system-aware light/dark themes, a persistent case shell, expandable current-case event search, reusable detail drawers, subtle loading/interaction animation, and case-scoped busy states.
 - **Investigation views.** A server-filtered chronological timeline, deterministic layered entity map, overview dashboard, memory explorer, findings and event tables, evidence management, report export, and streaming AI chat. Timeline and entity-map bundles load only when those routes are opened.
 - **Analyst findings.** Events and entities can be promoted to durable manual findings. Event flags carry their chosen severity into the referenced event and exact-entity-related timeline activity, while benign/delete actions restore the prior parser or detector severity.
@@ -145,10 +145,15 @@ Open **Settings**:
 
 With Ollama, no case data ever leaves your machine. With a remote provider, only the evidence excerpts included in prompts are sent to that provider.
 
+Chat uses a bounded tool-gathering phase followed by a plain-text answer phase. If a
+provider returns only a structured function-call part instead of displayable text,
+Investigator retries once with an explicit plain-text-only instruction rather than
+silently saving an empty answer.
+
 ## Working a case
 
 1. **Create a case.**
-2. **Upload evidence** — drop a log or artifact collection (ZIP / JSON / JSONL / CSV / EVTX, including Velociraptor collections and Defender/Azure log exports) or a memory dump (`.raw`, `.dmp`, `.mem`, `.vmem`, `.lime`, ...). Ingestion, detection, and memory analysis run automatically with live progress.
+2. **Upload evidence** — drop a log or artifact collection (ZIP / JSON / JSONL / CSV / EVTX, including Velociraptor collections and Defender/Azure log exports) or a memory dump (`.raw`, `.dmp`, `.mem`, `.vmem`, `.lime`, ...). Ingestion, detection, and memory analysis run automatically with live progress. Multi-file artifact uploads are parsed serially per case and share one detection pass after the final queued file; files that produce zero events do not trigger a redundant detection run.
 3. **Run AI analysis** — correlates everything into a report, timeline narrative, and per-finding verdicts.
 4. **Explore** the **Overview**, **Timeline**, **Entity Map**, **Memory**, **Findings**, and **Events** tabs, export the **Report**, or interrogate the case in **AI Chat**.
 
@@ -157,6 +162,9 @@ The magnifying-glass control in the workspace header expands into a current-case
 Manual findings are analyst intent, not destructive edits to source evidence. The app stores the finding and the event's previous severity separately. Removing the finding or marking it benign restores the previous severity; detection rebuilds restore their baseline first and then reapply active manual findings.
 
 Cases and configuration live under `~/.investigator/` — one self-contained SQLite database per case.
+If the backend is stopped during ingestion or AI analysis, startup recovery changes
+the stale transient case state back to `ready`; background jobs themselves are not
+resumed across process restarts.
 
 ## How analysis works
 
@@ -197,6 +205,7 @@ The short version:
 # Backend tests
 cd backend
 python -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.lock
+.venv/bin/ruff check app tests
 .venv/bin/python -m unittest discover -s tests
 
 # Frontend with hot reload (backend must be running)

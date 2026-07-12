@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
@@ -14,6 +15,7 @@ from app.store.database import Event, Finding, Report
 from app.store.operations import coordinator
 
 router = APIRouter(prefix="/api/cases", tags=["analysis"])
+logger = logging.getLogger(__name__)
 
 # Track running analysis jobs and progress listeners
 _analysis_listeners: dict[str, list[asyncio.Queue]] = {}
@@ -25,7 +27,7 @@ def _broadcast_analysis(case_id: str, payload: dict) -> None:
         try:
             q.put_nowait(payload)
         except asyncio.QueueFull:
-            pass
+            logger.debug("Dropped analysis update for a full listener queue")
 
 
 @router.post("/{case_id}/analyze")
@@ -80,7 +82,7 @@ async def analyze_ws(websocket: WebSocket, case_id: str) -> None:
             payload = await queue.get()
             await websocket.send_json(payload)
     except WebSocketDisconnect:
-        pass
+        return
     finally:
         if queue in _analysis_listeners.get(case_id, []):
             _analysis_listeners[case_id].remove(queue)
@@ -157,7 +159,7 @@ async def chat_ws(websocket: WebSocket, case_id: str) -> None:
                 await websocket.send_json({"type": "error", "content": str(e)})
             await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
-        pass
+        return
 
 
 @router.websocket("/{case_id}/investigate-entity-ws")
@@ -177,7 +179,7 @@ async def investigate_entity_ws(websocket: WebSocket, case_id: str) -> None:
                 await websocket.send_json({"type": "error", "content": str(e)})
             await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
-        pass
+        return
 
 
 @router.get("/{case_id}/chat-history")

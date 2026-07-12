@@ -8,6 +8,7 @@ replies with one JSON object per turn ({"tool": ..., "args": ...} or
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,7 @@ from app.detect import overrides
 from app.store.database import Event, Finding, MemoryResult, Process
 
 MAX_RESULT_CHARS = 8000
+logger = logging.getLogger(__name__)
 _SEV_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
 
 
@@ -448,6 +450,7 @@ def _get_process_handles(session: Session, case_id: str | None, args: dict) -> s
                     ).limit(2000)
                 ))
             except Exception:
+                logger.debug("On-demand process-handle collection failed", exc_info=True)
                 rows = []
     handles = []
     counts: dict[str, int] = {}
@@ -755,7 +758,7 @@ async def run_tool_loop(
             try:
                 await on_tool(name, args)
             except Exception:
-                pass
+                logger.debug("Tool progress callback failed", exc_info=True)
         messages.append({"role": "assistant", "content": text})
         messages.append({"role": "user", "content": f"TOOL RESULT ({name}): {result}"})
     # budget exhausted while the model was still calling tools: force an answer
@@ -769,5 +772,5 @@ async def run_tool_loop(
         if action and "final" in action:
             return str(action["final"]), trace
     except Exception:
-        pass
+        logger.debug("Forced final tool-loop response failed", exc_info=True)
     return text.strip(), trace
