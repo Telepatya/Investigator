@@ -279,3 +279,9 @@ The deterministic engine and bundled YARA rules are heuristic, tuned to surface 
 ## Credits
 
 Investigator DFIR is made by **Roei.f**.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). You may use, modify,
+and distribute this software under its terms. It is provided "as is", without
+warranty of any kind; see the LICENSE and [NOTICE](NOTICE) files for details.
