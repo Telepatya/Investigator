@@ -179,7 +179,7 @@ Open **Settings**:
 - **Ollama (local):** point at your Ollama server URL (default `http://localhost:11434`); the model dropdown is populated live from your installed models.
 - **OpenAI / Anthropic / Gemini:** paste your API key (stored in the OS keyring), click **Test**, then pick a model.
 
-With Ollama, no case data ever leaves your machine. With a remote provider, only the evidence excerpts included in prompts are sent to that provider.
+With Ollama, no case data ever leaves your machine. With a remote provider, only the evidence excerpts included in prompts are sent to that provider — Settings shows an explicit warning while a remote provider is selected.
 
 Chat uses a bounded tool-gathering phase followed by a plain-text answer phase. If a
 provider returns only a structured function-call part instead of displayable text,
@@ -217,6 +217,8 @@ Correlation exists to reduce noisy one-off alerts:
 - Benign developer and forensic tooling stays low-confidence or contextual unless there is stronger evidence of compromise.
 
 The LLM layer runs **after** deterministic parsing and detection. It receives normalized findings, source events, memory context, process trees, entity relationships, and database search tools; during report generation and chat it can query the case database for supporting rows before writing conclusions. Reports are intentionally cautious: each finding describes what was observed, what it may indicate, what evidence supports it, and what follow-up would confirm or dismiss it. Always take AI verdicts and output with a grain of salt.
+
+Because evidence is untrusted input, automated analysis is advisory only: it can **propose** suppressing a finding but never applies it — suppression is always an analyst action. A case with no ingested evidence is reported as **"not assessed"**, never "clean", so an empty case is never mistaken for a safe one.
 
 Memory correlation combines MemProcFS process, module, VAD, thread, handle, service, driver, network, forensic CSV, event log, and YARA outputs. Where possible, memory findings are attached back to concrete entities — a process, module, file, service, registry item, command line, or connection. If the source can't be confidently resolved, Investigator keeps the finding as a standalone memory result instead of inventing a relationship.
 

@@ -80,12 +80,69 @@ These checks belong at the API boundary even when a lower-level parser or extrac
 also sanitizes its inputs. New download/upload routes must reuse the same containment
 rules rather than constructing paths directly from route or form values.
 
+## Network Exposure And Local-Only Model
+
+Investigator is a single-user, loopback-only application. It binds to `127.0.0.1`
+and has no built-in authentication. Binding to loopback alone does **not** protect
+it from a hostile web page in the user's browser or from DNS rebinding, so the
+backend enforces origin/host controls, centralized in `backend/app/api/security.py`:
+
+- **Host allowlist.** `TrustedHostMiddleware` compares each request's `Host`
+  header (port stripped) against `ALLOWED_HOSTS` (`localhost`, `127.0.0.1`) and
+  rejects anything else with `400`. This blocks DNS rebinding, where an attacker
+  domain resolves to `127.0.0.1`: the rebound request still carries the attacker's
+  hostname in `Host` and is refused.
+- **CORS allowlist.** Cross-origin HTTP reads are limited to the built app on
+  `INVESTIGATOR_PORT` and the Vite dev server on `:5173`.
+- **WebSocket origin validation.** CORS does not apply to WebSocket handshakes, so
+  every WebSocket route validates the browser `Origin` against the same allowlist
+  (and the target case's existence) *before* accepting. A missing `Origin` denotes
+  a non-browser client and is not a cross-site vector; any present-but-unlisted
+  origin (including a rebound attacker page or `null`) is refused.
+
+**Changing the bind address.** If you deliberately expose the backend on a
+non-loopback hostname, you must add that hostname to `ALLOWED_HOSTS` **and** to
+`allowed_origins()` in `backend/app/api/security.py` — the two lists must stay
+aligned, or the app will reject its own traffic. Exposing this app beyond loopback
+also means exposing an unauthenticated DFIR tool; add authentication and transport
+security (e.g. a reverse proxy) before doing so.
+
+## Resource Limits
+
+Untrusted uploads and archives are bounded so they cannot exhaust local disk or
+memory:
+
+- Per-file and per-case upload caps (`INVESTIGATOR_MAX_UPLOAD_BYTES` and
+  `INVESTIGATOR_MAX_CASE_BYTES`; defaults are generous because memory dumps are
+  legitimately large) and chunk-order validation for resumable uploads.
+- ZIP extraction limits the parsable-member count, per-member and total expanded
+  size, and rejects decompression-bomb members by their real expanded/compressed
+  ratio. Declared archive sizes are attacker-controlled, so the extraction write
+  loop — not the ZIP header — is authoritative.
+
+## AI Analysis Boundaries
+
+Evidence is attacker-controlled and enters LLM prompts as data. To keep the model
+advisory:
+
+- **Automated analysis cannot suppress findings.** The analysis tool loop runs
+  read-only with respect to analyst conclusions, so a prompt injection in a log
+  cannot bury a legitimate finding. The model may *propose* suppression; only an
+  analyst applies one, via the UI or an explicit chat request.
+- **Empty cases are never reported clean.** A case with no ingested evidence is
+  reported as "not assessed", not "clean", in both the report and the dashboard.
+- **Remote providers are explicit.** With Ollama, no case data leaves the machine.
+  With a remote provider, only prompt/tool excerpts are sent, and the settings UI
+  warns that evidence will leave the machine.
+
 ## Case Isolation And Concurrency
 
 Investigator is designed as a single local backend process with one SQLite
-database per case. Case IDs received from API routes must be validated against
-the case registry before a database session is created; otherwise a stale or
-crafted ID could create an orphan database directory.
+database per case. Case IDs received from API routes are validated against the
+case registry before a database session is created — `get_session()` raises
+`CaseNotFoundError` (surfaced as `404`) for any unregistered id, before the case
+directory or database file is created — so a stale or crafted ID cannot create an
+orphan database directory through any route.
 
 Two independent synchronization layers protect case integrity:
 

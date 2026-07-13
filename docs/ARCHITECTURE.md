@@ -211,15 +211,40 @@ Important lifecycle behavior:
 `backend/app/main.py` owns the FastAPI application:
 
 - binds to loopback by default;
+- rejects requests whose `Host` header is not a loopback name via
+  `TrustedHostMiddleware` (see network controls below);
 - restricts CORS to the application and Vite development origins;
 - serves `frontend/dist` with an SPA fallback when a production build exists;
 - exposes health information for optional memory/YARA capabilities;
+- maps `CaseNotFoundError` to a `404` so a request for an unregistered case
+  never surfaces as a `500`;
 - recovers interrupted transient case states and cleans stale/orphaned artifacts; and
 - disposes cached SQLAlchemy engines at shutdown.
 
 Blocking or CPU-heavy work must not execute directly on the asyncio event loop.
 The ingest and analysis pipelines use executors/threads, and entity dossier
 construction invoked from an async WebSocket uses `asyncio.to_thread()`.
+
+#### Network controls
+
+`app/api/security.py` centralizes the request-origin controls for this
+loopback-only backend. Binding to `127.0.0.1` alone does not stop a hostile web
+page — or a DNS-rebinding attack — from reaching the backend through the user's
+own browser, and CORS does not apply to WebSocket handshakes. The module defines:
+
+- `ALLOWED_HOSTS` (`localhost`, `127.0.0.1`) — the loopback names the server
+  answers to. `TrustedHostMiddleware` compares the `Host` header (port stripped)
+  against this list, so a rebound `attacker.example` resolving to `127.0.0.1` is
+  refused. **If the backend is ever bound to a non-loopback hostname, add that
+  hostname here and to `allowed_origins()`; the two lists must stay aligned.**
+- `allowed_origins()` — the browser origins permitted for CORS *and* WebSocket
+  handshakes (the built app on `INVESTIGATOR_PORT` and the Vite dev server on
+  `:5173`), derived from `INVESTIGATOR_PORT` so a custom `--port` is covered.
+- `authorize_ws(websocket, case_id)` — used by every WebSocket route before
+  `accept()`. It refuses a handshake whose browser `Origin` is present but not in
+  `allowed_origins()` (a missing `Origin` denotes a non-browser client and is not
+  a cross-site vector) and refuses unknown cases, closing before the handshake
+  completes.
 
 ### Case registry and storage
 
@@ -238,9 +263,14 @@ Each case directory contains:
 ```
 
 Registry writes are serialized and persisted atomically. Deletion disposes the
-cached database engine before removing the directory. Single-event detail and
-manual-finding mutation routes verify registry membership before opening a session,
-and queued background jobs recheck membership before doing work.
+cached database engine before removing the directory. Registry membership is
+enforced at a single chokepoint: `get_session()` raises `CaseNotFoundError`
+(mapped to `404`) for any id absent from the registry, *before* the case
+directory or database file is materialized. This prevents a crafted or stale id
+(for example a well-formed but unknown `deadbeef`) from creating orphan case
+state through any route, rather than relying on each route to check first.
+Queued background jobs additionally recheck membership after acquiring their
+operation slot, so a delayed job cannot recreate a deleted case.
 
 ### SQLite concurrency
 
@@ -305,6 +335,15 @@ log exports.
   inventory where available, reports progress, coalesces queued artifact detection
   work, and skips redundant detection for zero-event uploads.
 - `evidence.py` owns uploaded-file listing, deletion, and re-ingestion semantics.
+
+Uploads and archive expansion are bounded so a single file, a runaway case, or a
+ZIP bomb cannot exhaust local disk. The upload routes enforce a per-file cap and
+a per-case total cap (`INVESTIGATOR_MAX_UPLOAD_BYTES` / `INVESTIGATOR_MAX_CASE_BYTES`,
+generous defaults because memory dumps are legitimately large) and validate chunk
+ordering for resumable uploads. `iter_zip_members` caps the parsable-member count,
+the per-member and total expanded size, and rejects members whose real
+expanded/compressed ratio looks like a decompression bomb — the write loop is
+authoritative, since declared central-directory sizes are attacker-controlled.
 
 Format routing follows content before filename hints. Journald field signatures are
 checked before Sentinel source-name inference, and pretty-printed JSON objects are
@@ -383,8 +422,10 @@ dossier and runs its synchronous construction off the asyncio event loop.
 ### AI orchestration
 
 `app/llm` is provider-neutral. Ollama stays local; OpenAI, Anthropic, and Gemini
-send only prompt/tool excerpts to the configured provider. API keys live in the OS
-credential vault.
+send only prompt/tool excerpts to the configured provider. The Gemini provider
+uses the maintained `google-genai` client (not the legacy `google-generativeai`
+package). API keys live in the OS credential vault, and the settings UI warns that
+evidence leaves the machine whenever a remote provider is selected.
 
 The tool loop exposes bounded database operations such as event search/filtering,
 counts, process lookup, memory results, findings, and a compact download inventory
@@ -393,6 +434,17 @@ archives are prioritized before high-volume browser assets, and filename filteri
 is available when the analyst asks about one file. `analyze_case()` performs a
 map/reduce-style workflow over event categories, deterministic findings, and memory
 signals, then writes a report, timeline narrative, and finding verdicts.
+
+Two safety rules constrain automated analysis. First, it is **read-only with
+respect to analyst conclusions**: the correlation tool loop runs with
+`allow_suppression=False`, so a prompt injection embedded in attacker-controlled
+evidence cannot cause the model to bury a legitimate finding. The model may
+*propose* suppression in its narrative; only an analyst applies one, through the
+UI benign toggle or an explicit chat request. Second, an **empty case is never
+reported clean**: with no events, processes, or memory results, `analyze_case()`
+short-circuits without calling the model and writes a "Not assessed — no evidence
+analyzed" report, because absence of findings there reflects absence of data, not
+a safe host.
 
 Chat and entity investigation stream over WebSockets. Chat history is persisted and
 older turns are compacted into a rolling memo. Tool results use per-result and
@@ -415,8 +467,11 @@ Model output remains advisory and never replaces raw evidence.
 | `/api/cases/{id}/chat-ws` | Tool activity and streamed chat output. |
 | `/api/cases/{id}/investigate-entity-ws` | Streamed investigation of one entity dossier. |
 
-REST reads remain available while long operations run. Mutations validate case
-existence and long operations recheck after waiting for their coordinator slot.
+Every WebSocket route calls `authorize_ws()` before `accept()`, rejecting a
+handshake from a disallowed browser `Origin` or for an unknown case. REST reads
+remain available while long operations run. Case existence is enforced centrally
+when a session is opened (`get_session` → `CaseNotFoundError` → `404`), and long
+operations recheck after waiting for their coordinator slot.
 
 ## Frontend architecture
 
@@ -442,7 +497,10 @@ React.StrictMode
 `CaseLayout.tsx` owns case-scoped chrome:
 
 - reusable case identity/status hero;
-- active/suppressed finding verdict banner;
+- a three-state verdict banner — *Not assessed* (neutral) when no evidence has
+  been ingested, *Environment appears clean* only once evidence exists and no
+  active findings remain, and *Findings need review* otherwise — so an empty case
+  is never shown as clean;
 - segmented case-tab navigation;
 - upload and analysis actions; and
 - a visible busy-state banner while ingestion or analysis is active.
@@ -619,9 +677,10 @@ be restored when analyst intent no longer applies.
 
 Contributors must preserve these invariants:
 
-1. New externally reachable case routes must validate registry membership before
-   opening a database; existing read routes must not be copied as validation
-   examples without checking their behavior.
+1. Registry membership is enforced centrally: `get_session()` refuses an
+   unregistered case id, so no route can materialize orphan case state. Do not
+   reintroduce a session factory that bypasses this check, and keep the
+   `CaseNotFoundError` → `404` mapping so behavior stays a clean not-found.
 2. A queued background job must recheck case existence after acquiring its case
    operation slot.
 3. Per-case long operations that mutate shared case state must use the operation
@@ -645,6 +704,16 @@ Contributors must preserve these invariants:
     a source name must not cause a richer structured format to lose fields.
 13. Archive extraction preserves member timestamps when downstream parsing uses file
     metadata to infer evidence time.
+14. WebSocket routes authorize the handshake (`authorize_ws`) before `accept()`,
+    and the `TrustedHostMiddleware` host allowlist stays aligned with
+    `allowed_origins()`. Do not add a WebSocket route that accepts unconditionally.
+15. Automated analysis never applies suppressions (`allow_suppression=False`); only
+    an analyst approves one. Evidence is treated as untrusted prompt data.
+16. An empty case (no events, processes, or memory results) reports "not assessed",
+    never "clean", in both the analysis report and the dashboard banner.
+17. Uploads and archive expansion stay bounded (per-file, per-case, member-count,
+    expanded-size, and compression-ratio limits) so untrusted input cannot exhaust
+    disk; the extraction write loop is authoritative over declared sizes.
 
 ## Testing and change checklist
 
