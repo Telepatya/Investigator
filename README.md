@@ -2,6 +2,12 @@
 
 **Made by Roei.f**
 
+> **Public Beta — v0.1.0**
+>
+> This is pre-release software for evaluation and analyst-assisted investigation.
+> Interfaces and stored data may change before 1.0; validate conclusions against
+> the underlying evidence before relying on them.
+
 A fully local DFIR workstation. Ingest endpoint and log evidence — event logs, EVTX, forensic artifacts, DFIR collections (e.g. Velociraptor), and Microsoft Defender / Azure logs — plus raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
 
 Everything runs on your machine. API keys are stored in your OS credential vault, never on disk in plaintext.

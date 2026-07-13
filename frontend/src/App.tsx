@@ -11,6 +11,8 @@ import { fmtTime } from "./lib/ui";
 import type { EventRow } from "./lib/types";
 
 const BRAND_CREDIT = "Made by Roei.f";
+const APP_VERSION = "0.1.0";
+const RELEASE_LABEL = "Public Beta";
 
 const NAV = [
   { to: "/", label: "Cases", icon: <Folder size={19} /> },
@@ -52,9 +54,12 @@ export default function App() {
             <div className="grid h-11 w-11 place-items-center rounded-2xl bg-accent-blue/10 text-accent-blue ring-1 ring-accent-blue/20">
               <ShieldCheck size={26} />
             </div>
-            <div className="leading-tight">
+            <div className="min-w-0 leading-tight">
               <div className="text-lg font-extrabold tracking-tight text-ink-50">Investigator</div>
               <div className="text-xs text-ink-300">DFIR Workstation</div>
+              <div className="text-[9px] font-bold uppercase tracking-[0.12em] text-accent-blue">
+                {RELEASE_LABEL} · v{APP_VERSION}
+              </div>
             </div>
           </Link>
 

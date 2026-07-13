@@ -242,7 +242,15 @@ export const api = {
     }),
 
   health: () =>
-    req<{ status: string; brand: string; credit: string; memprocfs: boolean; yara: boolean }>(
+    req<{
+      status: string;
+      brand: string;
+      version: string;
+      release_channel: string;
+      credit: string;
+      memprocfs: boolean;
+      yara: boolean;
+    }>(
       "/health",
     ),
 };

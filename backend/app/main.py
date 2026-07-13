@@ -28,7 +28,9 @@ from app.store.database import dispose_all_db_engines
 logger = logging.getLogger(__name__)
 
 APP_TITLE = "Investigator DFIR"
-APP_VERSION = "1.0.0"
+APP_VERSION = "0.1.0"
+APP_RELEASE_CHANNEL = "public-beta"
+APP_RELEASE_LABEL = "Public Beta"
 APP_CREDIT = "Made by Roei.f"
 
 
@@ -69,7 +71,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=APP_TITLE,
     version=APP_VERSION,
-    description=APP_CREDIT,
+    description=f"{APP_CREDIT} — {APP_RELEASE_LABEL}",
     lifespan=lifespan,
 )
 
@@ -118,6 +120,8 @@ async def health() -> dict:
     return {
         "status": "ok",
         "brand": APP_TITLE,
+        "version": APP_VERSION,
+        "release_channel": APP_RELEASE_CHANNEL,
         "credit": APP_CREDIT,
         "memprocfs": is_memprocfs_available(),
         "yara": get_scanner().available(),

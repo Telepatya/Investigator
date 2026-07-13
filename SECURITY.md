@@ -2,9 +2,14 @@
 
 ## Supported Versions
 
-Security fixes are applied to the current `main` branch. If release branches or
-tagged versions are introduced later, this section will be updated with their
-support status.
+Investigator `0.1.0` is a public beta. Security fixes are applied to the current
+`main` branch and the latest `0.1.x` release only. Pre-beta snapshots and older
+development commits are not supported.
+
+| Version | Supported | Status |
+| --- | --- | --- |
+| `0.1.x` | Yes | Public beta |
+| `< 0.1` | No | Development snapshots |
 
 ## Reporting A Vulnerability
 
