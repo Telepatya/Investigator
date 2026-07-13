@@ -71,7 +71,7 @@ class ManualFindingTests(_ManualFindingBase):
         from app.detect.entity_graph import build_entity_graph
         from app.store.database import Event
 
-        path = r"C:\Users\roeif\Downloads\go-winpmem_amd64_1.0-rc1_signed.exe"
+        path = r"C:\Users\analyst\Downloads\go-winpmem_amd64_1.0-rc1_signed.exe"
         device_path = rf"\\.\{path}"
         session = cases.get_session(self.case)
         try:

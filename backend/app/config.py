@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Literal
@@ -95,12 +96,26 @@ def validate_case_id_component(case_id: str) -> str:
     return value
 
 
+def _ensure_contained(base: Path, target: Path) -> Path:
+    """Reject a path that escapes ``base`` after full symlink resolution.
+
+    The guard uses ``os.path.realpath`` and a separator-terminated prefix check
+    so both the runtime and static analysis recognize containment before any
+    filesystem operation runs on ``target``.
+    """
+    base_real = os.path.realpath(base)
+    target_real = os.path.realpath(target)
+    if target_real != base_real and not target_real.startswith(base_real + os.sep):
+        raise ValueError("Path escapes its permitted directory")
+    return target
+
+
 def case_dir_path(case_id: str, config: AppConfig | None = None) -> Path:
     root = get_cases_dir(config).resolve()
     path = (root / validate_case_id_component(case_id)).resolve()
     if path.parent != root:
         raise ValueError("Invalid case directory")
-    return path
+    return _ensure_contained(root, path)
 
 
 def case_db_path(case_id: str, config: AppConfig | None = None) -> Path:
@@ -108,7 +123,7 @@ def case_db_path(case_id: str, config: AppConfig | None = None) -> Path:
     path = (case_root / "case.db").resolve()
     if path.parent != case_root:
         raise ValueError("Invalid case database path")
-    return path
+    return _ensure_contained(case_root, path)
 
 
 def case_uploads_path(case_id: str, config: AppConfig | None = None) -> Path:
@@ -116,6 +131,7 @@ def case_uploads_path(case_id: str, config: AppConfig | None = None) -> Path:
     path = (case_root / "uploads").resolve()
     if path.parent != case_root:
         raise ValueError("Invalid case uploads path")
+    _ensure_contained(case_root, path)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -130,4 +146,4 @@ def case_upload_file_path(
     path = (uploads / safe_filename).resolve()
     if path.parent != uploads:
         raise ValueError("Invalid upload path")
-    return path
+    return _ensure_contained(uploads, path)

@@ -146,7 +146,7 @@ class DownloadCorrelationTests(unittest.TestCase):
     def test_list_downloads_includes_finding_provenance_and_prioritizes_binary(self) -> None:
         case = cases.create_case("finding download inventory")
         session = cases.get_session(case["id"])
-        binary = r"\\.\C:\Users\roeif\Downloads\Collector_velociraptor.exe"
+        binary = r"\\.\C:\Users\analyst\Downloads\Collector_velociraptor.exe"
         internal_url = (
             "https://127.0.0.1:8889/api/v1/DownloadVFSFile?"
             "fs_components=Collector_velociraptor.exe"
@@ -226,8 +226,8 @@ class DownloadCorrelationTests(unittest.TestCase):
         s = cases.get_session(case["id"])
         t0 = datetime(2026, 7, 4, 17, 22, 28, tzinfo=timezone.utc)
         name = "velociraptor-v0.77.1-windows-amd64.exe"
-        dlpath = f"\\\\.\\C:\\Users\\roeif\\Downloads\\{name}"
-        runpath = f"C:\\Users\\roeif\\Desktop\\velociraptor\\{name}"
+        dlpath = f"\\\\.\\C:\\Users\\analyst\\Downloads\\{name}"
+        runpath = f"C:\\Users\\analyst\\Desktop\\velociraptor\\{name}"
         try:
             cases.add_event(
                 s, timestamp=t0, host="Atlas",

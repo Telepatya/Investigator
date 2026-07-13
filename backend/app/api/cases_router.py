@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
 from app.config import (
     case_dir_path,
     case_upload_file_path,
+    case_uploads_path,
     validate_case_id_component,
 )
 from app.detect import overrides
@@ -68,6 +70,11 @@ def _upload_destination(case_id: str, filename: str | None) -> tuple[str, Path]:
         destination = case_upload_file_path(validated_case_id, safe_name)
     except ValueError as exc:
         raise HTTPException(400, "Invalid filename") from exc
+    # Re-verify containment at the request boundary so the resolved write target
+    # cannot escape the case uploads directory before it reaches a file sink.
+    uploads_root = os.path.realpath(case_uploads_path(validated_case_id))
+    if not os.path.realpath(destination).startswith(uploads_root + os.sep):
+        raise HTTPException(400, "Invalid filename")
     return safe_name, destination
 
 

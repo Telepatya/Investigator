@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 import zipfile
@@ -769,17 +770,15 @@ def _record_manifest(case_id: str, dump_stem: str, entry: dict[str, Any]) -> Non
 
 def _cache_path(case_id: str, dump_stem: str, group: str, filename: str) -> Path:
     artifact_root = memprocfs_artifact_dir(case_id, dump_stem).resolve()
+    artifact_root_real = os.path.realpath(artifact_root)
     root = (artifact_root / "extracted" / _safe_filename(group)).resolve()
-    try:
-        root.relative_to(artifact_root)
-    except ValueError as exc:
-        raise MemoryExplorerError("Unsafe extraction directory", 500) from exc
+    if not os.path.realpath(root).startswith(artifact_root_real + os.sep):
+        raise MemoryExplorerError("Unsafe extraction directory", 500)
     root.mkdir(parents=True, exist_ok=True)
+    root_real = os.path.realpath(root)
     output = (root / _safe_filename(filename)).resolve()
-    try:
-        output.relative_to(root)
-    except ValueError as exc:
-        raise MemoryExplorerError("Unsafe extraction filename", 500) from exc
+    if not os.path.realpath(output).startswith(root_real + os.sep):
+        raise MemoryExplorerError("Unsafe extraction filename", 500)
     return output
 
 
