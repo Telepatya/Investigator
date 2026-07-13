@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 import re
 import zipfile
@@ -1311,8 +1312,25 @@ def parse_file(path: Path, source: str | None = None) -> Iterator[dict[str, Any]
         yield from parse_evtx(path, src)
 
 
+# Archive-expansion limits. Collector bundles are legitimately large, so these
+# are generous, but they are bounded so a ZIP bomb or a maliciously crafted
+# collection cannot exhaust disk. The write loop is authoritative: declared
+# central-directory sizes are attacker-controlled and only used as a cheap
+# pre-filter, while the compression-ratio check is applied to bytes actually
+# written and only once a member is large enough for a bomb to be plausible.
+MAX_ARCHIVE_MEMBERS = 20000
+MAX_ARCHIVE_MEMBER_BYTES = 2 * 1024 ** 3           # 2 GiB per extracted member
+MAX_ARCHIVE_TOTAL_BYTES = 20 * 1024 ** 3           # 20 GiB total expanded
+COMPRESSION_RATIO_LIMIT = 500                       # expanded/compressed per member
+COMPRESSION_RATIO_MIN_BYTES = 64 * 1024 * 1024      # only judge ratio above this size
+
+logger = logging.getLogger(__name__)
+
+
 def iter_zip_members(zip_path: Path, extract_dir: Path) -> Iterator[tuple[Path, str]]:
     """Extract parsable members of a collector ZIP (e.g. Velociraptor); yield (path, source_name)."""
+    total_written = 0
+    members_seen = 0
     with zipfile.ZipFile(zip_path) as zf:
         for info in zf.infolist():
             if info.is_dir():
@@ -1320,18 +1338,64 @@ def iter_zip_members(zip_path: Path, extract_dir: Path) -> Iterator[tuple[Path, 
             member_path = Path(info.filename)
             if member_path.suffix.lower() not in PARSABLE_EXTENSIONS:
                 continue
+            members_seen += 1
+            if members_seen > MAX_ARCHIVE_MEMBERS:
+                logger.warning(
+                    "Archive %s exceeds the %d parsable-member cap; stopping extraction",
+                    zip_path.name, MAX_ARCHIVE_MEMBERS,
+                )
+                break
+            # Cheap pre-filter on the declared (spoofable) size; the loop below caps
+            # the real bytes regardless.
+            if info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                logger.warning("Skipping oversized archive member %s", info.filename)
+                continue
             target = extract_dir / member_path.name
             # avoid collisions
             counter = 1
             while target.exists():
                 target = extract_dir / f"{member_path.stem}_{counter}{member_path.suffix}"
                 counter += 1
+            written = 0
+            member_over_cap = False
+            total_over_cap = False
             with zf.open(info) as src_f, open(target, "wb") as dst_f:
                 while True:
                     chunk = src_f.read(1024 * 1024)
                     if not chunk:
                         break
+                    if written + len(chunk) > MAX_ARCHIVE_MEMBER_BYTES:
+                        member_over_cap = True
+                        break
+                    if total_written + len(chunk) > MAX_ARCHIVE_TOTAL_BYTES:
+                        total_over_cap = True
+                        break
                     dst_f.write(chunk)
+                    written += len(chunk)
+                    total_written += len(chunk)
+            if member_over_cap or total_over_cap:
+                target.unlink(missing_ok=True)
+                total_written -= written
+                logger.warning(
+                    "Aborted extraction of %s: %s size limit exceeded",
+                    info.filename, "total-archive" if total_over_cap else "per-member",
+                )
+                if total_over_cap:
+                    break          # whole-archive budget spent; stop entirely
+                continue           # this member too big; keep going
+            # Compression-ratio (zip-bomb) check on the real expanded size.
+            if (
+                written >= COMPRESSION_RATIO_MIN_BYTES
+                and info.compress_size > 0
+                and written / info.compress_size > COMPRESSION_RATIO_LIMIT
+            ):
+                target.unlink(missing_ok=True)
+                total_written -= written
+                logger.warning(
+                    "Skipping suspected zip-bomb member %s (ratio %.0f:1)",
+                    info.filename, written / info.compress_size,
+                )
+                continue
             # RFC3164 syslog records carry no year, so parse_textlog uses the
             # extracted file's mtime as its year hint. Preserve the ZIP member
             # timestamp instead of leaving the newly-created extraction time.

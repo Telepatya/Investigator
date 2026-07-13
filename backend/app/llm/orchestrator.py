@@ -443,6 +443,37 @@ async def analyze_case(case_id: str, emit=None) -> dict[str, Any]:
         # Build a deterministic compact evidence map; this replaces up to twelve
         # category-specific LLM calls while retaining source and time diversity.
         events = list(session.scalars(select(Event)))
+        has_memory = session.scalars(select(MemoryResult.id).limit(1)).first() is not None
+        has_processes = session.scalars(select(Process.id).limit(1)).first() is not None
+        if not events and not has_memory and not has_processes:
+            # No evidence has been ingested. Never run the LLM here: an empty case
+            # must report "not assessed", not a reassuring "clean" verdict. The
+            # absence of findings reflects the absence of data, not a safe host.
+            not_assessed = (
+                "Not assessed — no evidence has been ingested for this case. "
+                "Upload evidence (logs, forensic artifacts, or a memory dump) and run "
+                "analysis to produce findings. An empty case cannot be judged clean."
+            )
+            report = Report(
+                summary=not_assessed,
+                timeline_narrative="",
+                timeline_entries=[],
+                findings_analysis=[],
+                suppression_revision=overrides.get_suppression_revision(session),
+            )
+            session.add(report)
+            session.commit()
+            case_store.update_case_meta(
+                case_id, include_stats=False, status="ready", ai_summary=not_assessed[:1000],
+            )
+            await _emit("done", "No evidence to analyze", 100)
+            return {
+                "summary": not_assessed,
+                "timeline_narrative": "",
+                "timeline_entries": [],
+                "findings_analysis": [],
+                "correlation": "",
+            }
         by_category: dict[str, list[Event]] = defaultdict(list)
         for e in events:
             by_category[e.category].append(e)
@@ -495,7 +526,12 @@ async def analyze_case(case_id: str, emit=None) -> dict[str, Any]:
                 prompts.SYSTEM_ANALYST + "\n\n" + prompts.TOOLS_PROTOCOL,
                 correlation_prompt + prompts.TOOL_TASK_NOTE,
                 max_iters=cfg.analysis_max_tool_calls, on_tool=_on_reduce_tool,
-                case_id=case_id, allow_suppression=True,
+                # Evidence is attacker-controlled and enters the prompt as data, so
+                # automated analysis must not be able to apply suppressions: a
+                # prompt injection in a log could otherwise bury a real finding.
+                # The model may still *propose* suppression in its narrative; only
+                # an analyst (UI toggle or explicit chat request) can apply one.
+                case_id=case_id, allow_suppression=False,
             )
         except Exception:
             correlation = ""

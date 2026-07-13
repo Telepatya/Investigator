@@ -25,8 +25,16 @@ sys.modules.setdefault("pydantic", types.SimpleNamespace(
         default_factory() if default_factory else default
     ),
 ))
-sys.modules.setdefault("google", types.ModuleType("google"))
-sys.modules.setdefault("google.generativeai", types.SimpleNamespace())
+_google_mod = types.ModuleType("google")
+_genai_mod = types.ModuleType("google.genai")
+_genai_types_mod = types.ModuleType("google.genai.types")
+_genai_types_mod.GenerateContentConfig = lambda **_k: None
+_genai_mod.types = _genai_types_mod
+_genai_mod.Client = lambda **_k: None
+_google_mod.genai = _genai_mod
+sys.modules.setdefault("google", _google_mod)
+sys.modules.setdefault("google.genai", _genai_mod)
+sys.modules.setdefault("google.genai.types", _genai_types_mod)
 
 from app.llm.gemini_provider import _response_text
 from app.llm.orchestrator import _chat_tool_context, _retry_plain_text_answer

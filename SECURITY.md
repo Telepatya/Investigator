@@ -9,12 +9,25 @@ support status.
 ## Reporting A Vulnerability
 
 Please report security issues privately rather than opening a public issue with
-exploit details, credentials, forensic evidence, or sensitive logs. Include:
+exploit details, credentials, forensic evidence, or sensitive logs.
+
+**How to report privately:** use GitHub's private vulnerability reporting on this
+repository — open the **Security** tab and choose **Report a vulnerability**
+(**Security → Advisories → Report a vulnerability**). This opens a private
+advisory visible only to the maintainer and you; no public disclosure or email
+address is required. If private reporting is not available to you, open a public
+issue that says only "requesting a private security contact" with **no exploit
+details**, and a private channel will be arranged.
+
+Please include:
 
 - A short description of the issue.
 - Affected component or file path, if known.
 - Reproduction steps or proof of concept, when safe to share.
 - Any relevant environment details.
+
+You can expect an initial acknowledgement within a few days. Please allow a
+reasonable period for a fix before any public disclosure.
 
 Public issues are fine for general hardening ideas, dependency-update requests,
 or documentation improvements that do not expose a vulnerability.

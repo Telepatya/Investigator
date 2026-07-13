@@ -37,6 +37,20 @@ _REGISTRY_LOCK = RLock()
 logger = logging.getLogger(__name__)
 
 
+class CaseNotFoundError(Exception):
+    """Raised when a database session is requested for an unregistered case.
+
+    Opening a session materializes the case directory and SQLite file, so an
+    unvalidated case id would let any request create orphan state (SECURITY.md,
+    "Case Isolation And Concurrency"). Guarding session creation keeps that
+    invariant at a single chokepoint instead of relying on every route.
+    """
+
+    def __init__(self, case_id: str) -> None:
+        super().__init__(f"Case not found: {case_id}")
+        self.case_id = case_id
+
+
 def _registry_path() -> Path:
     return get_cases_dir() / REGISTRY_FILE
 
@@ -182,6 +196,10 @@ def delete_case(case_id: str) -> bool:
 
 
 def get_session(case_id: str) -> Session:
+    # Validate against the registry before touching the filesystem so a crafted
+    # or stale id cannot create an orphan case directory / database.
+    if not case_exists(case_id):
+        raise CaseNotFoundError(case_id)
     db_path = case_db_path(case_id)
     factory = init_db(db_path)
     return factory()

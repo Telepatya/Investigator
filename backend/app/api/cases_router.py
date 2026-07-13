@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, WebSocket, WebSocketDi
 from fastapi.responses import FileResponse
 from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
 
+from app.api.security import authorize_ws
 from app.config import (
     case_dir_path,
     case_upload_file_path,
@@ -132,6 +133,31 @@ async def delete_case(case_id: str) -> dict:
     return {"ok": True}
 
 
+# Upload ceilings so a single file or a runaway case cannot exhaust local disk.
+# Memory dumps are legitimately huge, so the per-file cap is generous and both
+# limits are overridable via the environment for large-RAM targets.
+MAX_UPLOAD_BYTES = int(os.environ.get("INVESTIGATOR_MAX_UPLOAD_BYTES", str(64 * 1024 ** 3)))
+MAX_CASE_BYTES = int(os.environ.get("INVESTIGATOR_MAX_CASE_BYTES", str(256 * 1024 ** 3)))
+
+
+def _uploads_total_bytes(case_id: str) -> int:
+    total = 0
+    for path in case_uploads_path(case_id).iterdir():
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _remove_partial(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 @router.post("/{case_id}/upload")
 async def upload_file(
     case_id: str,
@@ -141,12 +167,22 @@ async def upload_file(
     mem_eventlogs: bool = False,
 ) -> dict:
     safe_name, dest = _upload_destination(case_id, file.filename)
-    async with aiofiles.open(dest, "wb") as out:
-        while True:
-            chunk = await file.read(4 * 1024 * 1024)
-            if not chunk:
-                break
-            await out.write(chunk)
+    if await asyncio.to_thread(_uploads_total_bytes, case_id) >= MAX_CASE_BYTES:
+        raise HTTPException(413, "Case storage limit reached; delete evidence before uploading more")
+    try:
+        written = 0
+        async with aiofiles.open(dest, "wb") as out:
+            while True:
+                chunk = await file.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "Upload exceeds the per-file size limit")
+                await out.write(chunk)
+    except HTTPException:
+        await asyncio.to_thread(_remove_partial, dest)
+        raise
 
     # kick off ingestion in the background
     memory_options = {
@@ -170,13 +206,32 @@ async def upload_chunk(
 ) -> dict:
     """Chunked upload for multi-GB memory dumps."""
     safe_name, dest = _upload_destination(case_id, filename)
+    if total_chunks < 1 or chunk_index < 0 or chunk_index >= total_chunks:
+        raise HTTPException(400, "Invalid chunk sequence")
+    dest_exists = await asyncio.to_thread(dest.exists)
+    if chunk_index == 0:
+        if await asyncio.to_thread(_uploads_total_bytes, case_id) >= MAX_CASE_BYTES:
+            raise HTTPException(413, "Case storage limit reached; delete evidence before uploading more")
+    elif not dest_exists:
+        # Appending to a file that was never started means chunks arrived out of
+        # order; refuse rather than silently writing a corrupt dump.
+        raise HTTPException(409, "Chunk received out of order; restart the upload")
     mode = "wb" if chunk_index == 0 else "ab"
-    async with aiofiles.open(dest, mode) as out:
-        while True:
-            chunk = await file.read(4 * 1024 * 1024)
-            if not chunk:
-                break
-            await out.write(chunk)
+    already = await asyncio.to_thread(lambda: dest.stat().st_size) if mode == "ab" else 0
+    try:
+        written = already
+        async with aiofiles.open(dest, mode) as out:
+            while True:
+                chunk = await file.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "Upload exceeds the per-file size limit")
+                await out.write(chunk)
+    except HTTPException:
+        await asyncio.to_thread(_remove_partial, dest)
+        raise
 
     if chunk_index + 1 >= total_chunks:
         memory_options = {
@@ -228,6 +283,8 @@ async def ingestion_status(case_id: str) -> dict:
 
 @router.websocket("/{case_id}/ingestion-ws")
 async def ingestion_ws(websocket: WebSocket, case_id: str) -> None:
+    if not await authorize_ws(websocket, case_id):
+        return
     await websocket.accept()
     queue = manager.subscribe(case_id)
     try:

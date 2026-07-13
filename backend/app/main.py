@@ -8,14 +8,17 @@ import logging
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api import analysis_router, cases_router, settings_router
+from app.api.security import ALLOWED_HOSTS, allowed_origins
 from app.config import ensure_dirs
 from app.store.cases import (
+    CaseNotFoundError,
     cleanup_orphan_case_dirs,
     cleanup_stale_case_artifacts,
     recover_interrupted_case_operations,
@@ -70,23 +73,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Reject requests whose Host header is not a loopback name we serve. This blocks
+# DNS-rebinding, where a hostile page resolves its own domain to 127.0.0.1 and
+# reaches this backend from the victim's browser: the rebound request still
+# carries the attacker's hostname in Host and is refused here.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
 # Local-only tool: restrict cross-origin reads to our own frontend origins
 # (built app served by this backend, plus the Vite dev server).
-_PORT = os.environ.get("INVESTIGATOR_PORT", "8400")
-ALLOWED_ORIGINS = [
-    f"http://localhost:{_PORT}",
-    f"http://127.0.0.1:{_PORT}",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(CaseNotFoundError)
+async def _case_not_found_handler(_request: Request, _exc: CaseNotFoundError) -> JSONResponse:
+    # A session was requested for an id absent from the registry; surface it as a
+    # clean 404 instead of a 500 and, crucially, without creating case state.
+    return JSONResponse(status_code=404, content={"detail": "Case not found"})
 
 app.include_router(settings_router.router)
 app.include_router(cases_router.router)

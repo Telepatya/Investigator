@@ -8,6 +8,7 @@ import logging
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
+from app.api.security import authorize_ws
 from app.llm.orchestrator import analyze_case, chat_stream, investigate_entity_stream
 from app.store import cases as case_store
 from app.detect import overrides
@@ -69,6 +70,8 @@ async def start_analysis(case_id: str) -> dict:
 
 @router.websocket("/{case_id}/analyze-ws")
 async def analyze_ws(websocket: WebSocket, case_id: str) -> None:
+    if not await authorize_ws(websocket, case_id):
+        return
     await websocket.accept()
     queue: asyncio.Queue = asyncio.Queue()
     _analysis_listeners.setdefault(case_id, []).append(queue)
@@ -139,6 +142,8 @@ def get_report(case_id: str) -> dict:
 
 @router.websocket("/{case_id}/chat-ws")
 async def chat_ws(websocket: WebSocket, case_id: str) -> None:
+    if not await authorize_ws(websocket, case_id):
+        return
     await websocket.accept()
     try:
         while True:
@@ -165,6 +170,8 @@ async def chat_ws(websocket: WebSocket, case_id: str) -> None:
 
 @router.websocket("/{case_id}/investigate-entity-ws")
 async def investigate_entity_ws(websocket: WebSocket, case_id: str) -> None:
+    if not await authorize_ws(websocket, case_id):
+        return
     await websocket.accept()
     try:
         while True:

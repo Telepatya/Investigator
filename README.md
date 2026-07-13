@@ -223,7 +223,7 @@ Memory correlation combines MemProcFS process, module, VAD, thread, handle, serv
 ## Requirements
 
 - **Python 3.11+**
-- **Node.js 18+**
+- **Node.js 20.19+ or 22.12+** (required by Vite 8; the CI build runs Node 22)
 - Optional but recommended: `memprocfs` and `yara-python` (installed via `backend/requirements-memory.lock`). Without them, log and artifact analysis still works; raw memory-dump parsing and YARA scanning are skipped and reported in the UI health status.
 
 ## Architecture

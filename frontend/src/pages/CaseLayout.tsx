@@ -11,6 +11,7 @@ import {
   FileText,
   FolderOpen,
   HardDrive,
+  HelpCircle,
   LayoutDashboard,
   List,
   Loader2,
@@ -48,9 +49,53 @@ export default function CaseLayout() {
   // Reflect only findings that still need review: suppressed (disabled-rule or
   // marked-benign) findings should not keep the banner in an alerting state.
   const activeFindings = c?.active_finding_count ?? 0;
-  const clean = activeFindings === 0;
   const suppressedCount = (c?.finding_count ?? 0) - activeFindings;
   const caseBusy = c?.status === "ingesting" || c?.status === "analyzing";
+
+  // "Clean" is only meaningful once evidence has actually been ingested. A brand
+  // new case with nothing uploaded must read as "not assessed", never as clean —
+  // absence of findings there reflects absence of data, not a safe environment.
+  const hasEvidence =
+    (c?.event_count ?? 0) > 0 ||
+    (c?.process_count ?? 0) > 0 ||
+    !!c?.has_memory_dump;
+  const notAssessed = !!c && !hasEvidence;
+  const clean = hasEvidence && activeFindings === 0;
+
+  const banner = notAssessed
+    ? {
+        wrap: "border-white/15 bg-white/[0.03]",
+        badge: "bg-white/10 text-ink-300",
+        dot: "bg-ink-400",
+        icon: <HelpCircle size={34} />,
+        title: "Not assessed",
+        subtitle: "No evidence analyzed yet",
+        footer: "Upload evidence and run analysis to assess this case",
+      }
+    : clean
+      ? {
+          wrap: "border-emerald-400/25 bg-emerald-400/10",
+          badge: "bg-emerald-400/10 text-emerald-500",
+          dot: "bg-emerald-500",
+          icon: <ShieldCheck size={34} />,
+          title: "Environment appears clean",
+          subtitle:
+            suppressedCount > 0
+              ? `No active findings · ${suppressedCount} suppressed`
+              : "No ongoing threat detected",
+          footer: `Last scan: ${c ? fmtTime(c.updated_at) : "not available"}`,
+        }
+      : {
+          wrap: "border-sev-high/25 bg-sev-high/10",
+          badge: "bg-sev-high/10 text-sev-high",
+          dot: "bg-sev-high",
+          icon: <AlertTriangle size={34} />,
+          title: "Findings need review",
+          subtitle: `${activeFindings} active finding${activeFindings === 1 ? "" : "s"}${
+            suppressedCount > 0 ? ` · ${suppressedCount} suppressed` : ""
+          }`,
+          footer: `Last scan: ${c ? fmtTime(c.updated_at) : "not available"}`,
+        };
 
   return (
     <div className="page-enter space-y-5">
@@ -74,27 +119,17 @@ export default function CaseLayout() {
             </div>
           </div>
 
-          <div className={clsx("rounded-3xl border p-5", clean ? "border-emerald-400/25 bg-emerald-400/10" : "border-sev-high/25 bg-sev-high/10")}>
+          <div className={clsx("rounded-3xl border p-5", banner.wrap)}>
             <div className="flex items-center gap-4">
-              <div className={clsx("grid h-16 w-16 place-items-center rounded-3xl", clean ? "bg-emerald-400/10 text-emerald-500" : "bg-sev-high/10 text-sev-high")}>
-                {clean ? <ShieldCheck size={34} /> : <AlertTriangle size={34} />}
+              <div className={clsx("grid h-16 w-16 place-items-center rounded-3xl", banner.badge)}>
+                {banner.icon}
               </div>
               <div>
-                <div className="text-lg font-bold text-ink-50">
-                  {clean ? "Environment appears clean" : "Findings need review"}
-                </div>
-                <div className="mt-1 text-sm text-ink-300">
-                  {clean
-                    ? suppressedCount > 0
-                      ? `No active findings · ${suppressedCount} suppressed`
-                      : "No ongoing threat detected"
-                    : `${activeFindings} active finding${activeFindings === 1 ? "" : "s"}${
-                        suppressedCount > 0 ? ` · ${suppressedCount} suppressed` : ""
-                      }`}
-                </div>
+                <div className="text-lg font-bold text-ink-50">{banner.title}</div>
+                <div className="mt-1 text-sm text-ink-300">{banner.subtitle}</div>
                 <div className="mt-3 flex items-center gap-2 text-xs text-ink-300">
-                  <span className={clsx("h-1.5 w-1.5 rounded-full", clean ? "bg-emerald-500" : "bg-sev-high")} />
-                  Last scan: {c ? fmtTime(c.updated_at) : "not available"}
+                  <span className={clsx("h-1.5 w-1.5 rounded-full", banner.dot)} />
+                  {banner.footer}
                 </div>
               </div>
             </div>

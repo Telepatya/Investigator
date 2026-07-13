@@ -91,7 +91,9 @@ export default function OverviewPage() {
                 ? truncate(report.summary, 260)
                 : "Initial triage is waiting for AI analysis. Upload evidence and run analysis to generate a concise analyst summary."}
               <div className="mt-4 text-xs text-ink-400">
-                AI-generated summary · {c ? fmtTime(c.updated_at) : "not available"}
+                {report?.summary
+                  ? `AI-generated summary · ${c ? fmtTime(c.updated_at) : "not available"}`
+                  : "Not yet assessed — run AI analysis to generate a summary"}
               </div>
             </div>
           </div>

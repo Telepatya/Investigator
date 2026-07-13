@@ -163,6 +163,20 @@ export default function SettingsPage() {
           ))}
         </div>
 
+        {!current.local && (
+          <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-300">
+            <ShieldAlert size={16} className="mt-0.5 shrink-0" />
+            <div>
+              <span className="font-semibold">Evidence leaves your machine.</span>{" "}
+              With a remote provider, the evidence excerpts placed in analysis and
+              chat prompts — log lines, command lines, process and memory details —
+              are transmitted to {current.name} for processing. Choose{" "}
+              <span className="font-semibold">Ollama (Local)</span> to keep all case
+              data on this machine.
+            </div>
+          </div>
+        )}
+
         {provider === "ollama" && (
           <div className="mb-4">
             <label className="label">Ollama server URL</label>

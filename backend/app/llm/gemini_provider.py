@@ -1,10 +1,16 @@
-"""Google Gemini LLM provider."""
+"""Google Gemini LLM provider (google-genai SDK).
+
+Uses the actively maintained ``google-genai`` client library. Google now
+classifies the older ``google-generativeai`` package as legacy, so this provider
+targets ``from google import genai`` and its ``Client`` API.
+"""
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 from app.config import get_api_key
 from app.llm.base import LLMProvider
@@ -49,11 +55,11 @@ def _response_text(response) -> str:
 class GeminiProvider(LLMProvider):
     provider = "gemini"
 
-    def _configure(self) -> None:
+    def _client(self) -> genai.Client:
         key = get_api_key("gemini")
         if not key:
             raise ValueError("Gemini API key not configured")
-        genai.configure(api_key=key)
+        return genai.Client(api_key=key)
 
     def _model_name(self) -> str:
         """Return a valid Gemini model name, guarding against stale/cross-provider values."""
@@ -67,31 +73,42 @@ class GeminiProvider(LLMProvider):
             return DEFAULT_MODELS[0]
         return name
 
+    def _config(self) -> genai_types.GenerateContentConfig:
+        return genai_types.GenerateContentConfig(
+            temperature=self.temperature,
+            max_output_tokens=self.max_tokens,
+        )
+
     async def list_models(self) -> list[ModelInfo]:
         try:
-            self._configure()
+            client = self._client()
             models = []
-            for m in genai.list_models():
-                if "generateContent" in getattr(m, "supported_generation_methods", []):
-                    name = m.name.replace("models/", "")
-                    models.append(ModelInfo(id=name, name=name, provider="gemini"))
+            for m in client.models.list():
+                actions = (
+                    getattr(m, "supported_actions", None)
+                    or getattr(m, "supported_generation_methods", None)
+                    or []
+                )
+                if "generateContent" in actions:
+                    name = (getattr(m, "name", "") or "").replace("models/", "")
+                    if name:
+                        models.append(ModelInfo(id=name, name=name, provider="gemini"))
             return models or [ModelInfo(id=m, name=m, provider="gemini") for m in DEFAULT_MODELS]
         except Exception:
             return [ModelInfo(id=m, name=m, provider="gemini") for m in DEFAULT_MODELS]
 
     async def test_connection(self) -> tuple[bool, str]:
         try:
-            self._configure()
-            model = genai.GenerativeModel(self._model_name())
-            resp = model.generate_content("ping")
-            _ = resp.text
+            client = self._client()
+            resp = client.models.generate_content(model=self._model_name(), contents="ping")
+            _ = _response_text(resp)
             return True, f"Gemini API key is valid (using {self._model_name()})"
         except Exception as e:
             return False, str(e)
 
     async def complete(self, messages: list[dict[str, str]], stream: bool = False) -> str | AsyncIterator[str]:
-        self._configure()
-        model = genai.GenerativeModel(self._model_name())
+        client = self._client()
+        model_name = self._model_name()
 
         # Flatten to single prompt for simplicity
         parts = []
@@ -100,25 +117,15 @@ class GeminiProvider(LLMProvider):
         prompt = "\n\n".join(parts)
 
         if not stream:
-            resp = model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(
-                    temperature=self.temperature,
-                    max_output_tokens=self.max_tokens,
-                ),
+            resp = client.models.generate_content(
+                model=model_name, contents=prompt, config=self._config(),
             )
             return _response_text(resp)
 
         async def _stream() -> AsyncIterator[str]:
-            resp = model.generate_content(
-                prompt,
-                stream=True,
-                generation_config=genai.GenerationConfig(
-                    temperature=self.temperature,
-                    max_output_tokens=self.max_tokens,
-                ),
-            )
-            for chunk in resp:
+            for chunk in client.models.generate_content_stream(
+                model=model_name, contents=prompt, config=self._config(),
+            ):
                 text = _response_text(chunk)
                 if text:
                     yield text
