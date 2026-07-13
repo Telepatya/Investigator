@@ -1105,8 +1105,8 @@ _CMDLINE_PREFILTER_RE = re.compile(
             "clear-eventlog", "net user", "net1 user", "localgroup", "administrators",
             "reg add", "currentversion\\run", "attrib", "+h", "icacls", "/grant", "/deny",
             "/setowner", "/reset", "/inheritance", "/remove", "javascript:", "scrobj.dll",
-            "-urlcache", "certutil", "-decode", "schtasks", "/create", "mshta", "http://",
-            "https://", "regsvr32", "/i:http", "activexobject", "wscript.shell",
+            "-urlcache", "certutil", "-decode", "schtasks", "/create", "mshta",
+            "regsvr32", "/i:http", "activexobject", "wscript.shell",
             "shell.application", "hidden", "wmic", "process call create", "/node:", "psexec",
             "ntdsutil", "ntds.dit", "reg save", "hklm\\sam", "hklm\\system", "dcsync",
             "kerberos::golden", "golden ticket", "golden-ticket", "golden_ticket",
@@ -1119,6 +1119,18 @@ _CMDLINE_PREFILTER_RE = re.compile(
             "/clear", "/success:disable", "/failure:disable", "fsutil", "usn deletejournal",
             "netsh", "advfirewall", "state off", "sdelete", "cipher", "/w", "eventfilter",
             "commandlineeventconsumer", "bitsadmin", "/transfer",
+            # backconnect / tunneling / C2 / RAT tool names
+            "tcpclient", "powercat", "ncat", "nc.exe", "portproxy", "frpc", "revsocks",
+            "stowaway", "ligolo", "regeorg", "pystinger", "poshc2", "nimplant", "koadic",
+            "brute ratel", "bruteratel", "pupy", "asyncrat", "njrat", "dcrat", "nanocore",
+            "xworm", "remcos",
+            # defense evasion / credential access
+            "amsiutils", "amsiinitfailed", "amsiscanbuffer", "etweventwrite", "wdigest",
+            "uselogoncredential", "win32_shadowcopy", "mavinject", "certoc", "--headless",
+            "nslookup", "resolve-dnsname",
+            # supply chain / git
+            "npm install", "npm ci", "npm exec", "pip install", "pip3 install",
+            "git clone", "core.hookspath",
         )
     ),
     re.IGNORECASE,
@@ -1136,6 +1148,18 @@ _LINUX_CMDLINE_PREFILTER_RE = re.compile(
             "histfile", "histsize", ".bash_history", "authorized_keys",
             "/etc/crontab", "/etc/cron.d", "/etc/sudoers", "ld.so.preload",
             "useradd", "adduser", "usermod", "systemctl enable",
+            # backconnect / reverse shells / tunneling
+            "php", "ruby", "/inet/tcp", "ssh", "chisel", "frpc", "ngrok",
+            # supply chain / git
+            "pip install", "pip3 install", "npm install", "npm ci", "npm exec", "npx",
+            "git clone", "core.hookspath",
+            # defense evasion / persistence
+            "setenforce", "iptables", "ufw disable", "firewalld", "chattr", "crontab",
+            ".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zshenv",
+            "ld_preload",
+            # credential access / cloud / container
+            "/etc/shadow", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+            "mimipenguin", "unshadow", "lazagne", "nsenter", "docker run",
         )
     ),
     re.IGNORECASE,
@@ -3884,6 +3908,9 @@ def _check_weblog(session, existing, event, raw, web_ip_tracker) -> None:
         if matched_top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[matched_top]:
             matched_top = severity
 
+    # These are overwhelmingly plain-substring checks, for which `in` is already
+    # C-fast; a literal prefilter gate here measured *slower* than the loop itself
+    # (unlike the all-regex cmdline path, which a prefilter genuinely accelerates).
     for pattern, technique, desc, severity in WEB_ATTACK_PATTERNS:
         hit = pattern.search(req_lower) if isinstance(pattern, re.Pattern) else pattern in req_lower
         if hit:
