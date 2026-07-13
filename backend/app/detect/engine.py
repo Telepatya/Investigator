@@ -1,0 +1,4087 @@
+"""Deterministic detection engine. Runs over ingested events/processes before the LLM."""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import re
+import time
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import Text, cast, or_, select
+
+from app.detect.rules import (
+    DGA_MIN_ENTROPY,
+    DGA_MIN_LABEL_LEN,
+    DNS_TUNNEL_MIN_LABEL_LEN,
+    DNS_TUNNEL_MIN_LABELS,
+    DNS_TUNNEL_MIN_QNAME_LEN,
+    DOMAIN_ANALYSIS_ALLOWLIST,
+    DOMAIN_FINDING_CAP,
+    DYNAMIC_DNS_SUFFIXES,
+    EXPECTED_PARENTS,
+    LINUX_PERSISTENCE_PATHS,
+    LINUX_SUSPICIOUS_CMDLINE_PATTERNS,
+    LOLBINS,
+    LOW_SIGNAL_LOLBINS,
+    PERSISTENCE_REGISTRY_PATHS,
+    SCHEDULED_TASK_SCRIPT_HOSTS,
+    SUSPICIOUS_CMDLINE_PATTERNS,
+    SUSPICIOUS_EXECUTION_DIRS,
+    SUSPICIOUS_PARENT_CHILD_MAP,
+    SUSPICIOUS_TLDS,
+    SYSTEM_PROCESS_PATHS,
+    TASK_UPDATER_MASQUERADES,
+    WEB_ATTACK_PATTERNS,
+    WEB_USER_AGENT_PATTERNS,
+)
+from app.detect.manual import apply_manual_findings
+from app.detect.overrides import (
+    apply_overrides,
+    get_benign_keys,
+    get_disabled_rules,
+    is_suppressed,
+    rule_id_for,
+)
+from app.store import cases as case_store
+from app.store.database import Event, Finding, MemoryResult, Process
+
+logger = logging.getLogger(__name__)
+
+SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+_RANK_TO_SEVERITY = {v: k for k, v in SEVERITY_RANK.items()}
+EVENT_STREAM_BATCH_SIZE = 10000
+_MEMPROCFS_TIMELINE_SOURCE = ":forensic/csv/timeline"
+_EXECUTABLE_ARTIFACT_RE = re.compile(r"\.(?:exe|dll|ps1|bat|cmd|vbs|js|scr|com)$", re.IGNORECASE)
+_USN_EXECUTABLE_ARTIFACT_RE = re.compile(
+    r"\.(?:exe|dll|sys|scr|com|ps1|psm1|bat|cmd|vbs|vbe|js|jse|wsf|wsh|hta|cpl|msi|jar|lnk)$",
+    re.IGNORECASE,
+)
+_USN_SCRIPT_EXTENSIONS = {
+    ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse",
+    ".wsf", ".wsh", ".hta", ".scr", ".com", ".cpl", ".lnk",
+}
+_USN_DECOY_EXTENSIONS = {
+    ".txt", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".jpg", ".jpeg", ".png", ".gif", ".zip", ".rar", ".7z", ".iso",
+}
+_USN_TEMPORARY_EXTENSIONS = {
+    ".tmp", ".temp", ".partial", ".part", ".crdownload", ".download",
+}
+_USN_USER_WRITABLE_HINTS = tuple(SUSPICIOUS_EXECUTION_DIRS) + (
+    r"\users\public",
+    r"\downloads",
+    r"\desktop",
+    r"\appdata\local",
+    r"\appdata\roaming",
+)
+_TASK_ACTION_RE = re.compile(r"^(?P<name>.*?)\s+-\s+\[(?P<action>.*?)\]\s+\((?P<meta>.*?)\)\s*$")
+_TASK_ARTIFACT_HINTS = (
+    r"\windows\system32\tasks\\",
+    r"\windows\syswow64\tasks\\",
+    r"\windows\tasks\\",
+)
+_WINDOWS_ROOT_EXEC_RE = re.compile(r"^\\windows\\[^\\]+\.exe$")
+_WEAK_MEMPROCFS_FINDEVIL_TYPES = {
+    "HIGH_ENTROPY", "PRIVATE_RX", "PRIVATE_RWX", "NOIMAGE_RX", "NOIMAGE_RWX",
+    "PE_PATCHED", "PE_NOLINK", "THREAD", "DRIVER_PATH", "PROC_DEBUG", "PEB_BAD_LDR",
+}
+
+# Signal classes treated as independent evidence in the correlation pass:
+# flag -> (baseline severity contribution, representative ATT&CK technique).
+# Includes flags set by the memory pipeline (hidden/injected/hollowing-suspect).
+CORRELATION_FLAGS: dict[str, tuple[str, str]] = {
+    "lolbin": ("medium", "T1218"),
+    "suspicious-cmdline": ("medium", "T1059"),
+    "suspicious-path": ("medium", "T1204"),
+    "masquerade": ("high", "T1036.005"),
+    "bad-parent-child": ("high", "T1204.002"),
+    "anomalous-parent": ("high", "T1055"),
+    "hidden": ("critical", "T1014"),
+    "injected": ("high", "T1055"),
+    "hollowing-suspect": ("high", "T1055.012"),
+    "cross-process": ("high", "T1055"),
+    "yara-hit": ("high", "T1071"),
+}
+
+SENSITIVE_PROCESS_NAMES = {
+    "lsass.exe", "lsaiso.exe", "csrss.exe", "winlogon.exe", "services.exe",
+    "samss.exe", "smss.exe", "securityhealthservice.exe", "msmpeng.exe",
+    "windefend.exe", "senseir.exe", "sensece.exe", "chrome.exe", "msedge.exe",
+    "firefox.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
+}
+
+
+def _normalize_path(raw_path: str) -> str:
+    """Normalize kernel/device path prefixes so location checks compare like with like."""
+    p = (raw_path or "").strip().lower().replace("/", "\\")
+    p = re.sub(r"^\\\?\?\\", "", p)
+    p = re.sub(r"^\\\\\?\\", "", p)
+    p = re.sub(r"^\\device\\harddiskvolume\d+", "", p)
+    p = re.sub(r"^\\systemroot\b", r"\\windows", p)
+    p = re.sub(r"^%systemroot%", r"\\windows", p)
+    p = re.sub(r"^%windir%", r"\\windows", p)
+    if re.match(r"^[a-z]:", p):
+        p = p[2:]
+    return p
+
+
+def _addr_scope(addr: str) -> str:
+    """Classify a remote address: local (loopback/unspecified), private (RFC1918/link-local), public."""
+    a = (addr or "").strip().lower().strip("[]")
+    if not a or a == "*" or a.startswith(("127.", "0.0.0.0", "::")):
+        return "local"
+    if a.startswith(("10.", "192.168.", "169.254.")) or re.match(r"172\.(1[6-9]|2\d|3[01])\.", a):
+        return "private"
+    if ":" in a and a.startswith(("fe80", "fc", "fd")):
+        return "private"
+    return "public"
+
+
+# --- Domain / DNS reputation helpers -----------------------------------------
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_INTERNAL_DOMAIN_SUFFIXES = (
+    ".local", ".lan", ".internal", ".intranet", ".corp", ".home", ".arpa",
+    ".localdomain", ".test", ".invalid", ".localhost",
+)
+# ccTLD second levels that act as the public suffix (foo.co.uk -> registrable "foo").
+_TWO_LEVEL_SLD = {"co", "com", "org", "net", "gov", "edu", "ac", "gob", "mil", "or", "ne", "go"}
+
+
+def _shannon_entropy(s: str) -> float:
+    """Shannon entropy (bits/char) of a string; 0.0 for empty input."""
+    if not s:
+        return 0.0
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
+
+
+def _normalize_host(host: str) -> str:
+    """Lowercase a hostname and strip quoting, brackets, a trailing dot, and :port."""
+    h = (host or "").strip().strip('"').strip("'").lower().strip("[]").rstrip(".")
+    return re.sub(r":\d+$", "", h)
+
+
+def _host_from_url(url: str) -> str:
+    """Extract the host component from a URL (scheme, credentials, path, port stripped)."""
+    u = (url or "").strip()
+    u = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", u, flags=re.IGNORECASE)
+    u = u.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in u:
+        u = u.rsplit("@", 1)[1]
+    return _normalize_host(u)
+
+
+def _domain_candidates(raw: dict[str, Any]) -> list[str]:
+    """Hostnames worth reputation-scoring from a network/download event's raw fields."""
+    out: list[str] = []
+    for key in ("QueryName", "DestinationHostname", "RemoteHostname"):
+        v = raw.get(key)
+        if v:
+            out.append(_normalize_host(str(v)))
+    for key in ("Url", "RemoteUrl"):
+        v = raw.get(key)
+        if v:
+            h = _host_from_url(str(v))
+            if h:
+                out.append(h)
+    return out
+
+
+def _split_domain(host: str) -> tuple[str, str, list[str]] | None:
+    """Return (registrable_label, effective_tld, labels) or None for a bare/single label."""
+    labels = host.split(".")
+    if len(labels) < 2 or any(not lbl for lbl in labels):
+        return None
+    if len(labels) >= 3 and labels[-2] in _TWO_LEVEL_SLD:
+        return labels[-3], labels[-1], labels
+    return labels[-2], labels[-1], labels
+
+
+def _check_domain_indicators(session, existing, event, raw, evidence, seen_domains, state) -> None:
+    """Score DNS query names / URL hosts for weak reputation signals (abuse-prone TLD,
+    DGA-like entropy, DNS-tunnelling shape, dynamic-DNS, punycode). Each distinct host
+    is scored at most once (seen_domains), and total emissions are capped so a case
+    full of algorithmic domains cannot flood the finding list."""
+    if state["emitted"] >= DOMAIN_FINDING_CAP:
+        return
+    is_dns = bool(raw.get("QueryName"))
+    proto_tech = "T1071.004" if is_dns else "T1071.001"
+    for host in _domain_candidates(raw):
+        if not host or "." not in host or ":" in host:
+            continue
+        if _IPV4_RE.match(host) or host.endswith(_INTERNAL_DOMAIN_SUFFIXES):
+            continue
+        if host in seen_domains:
+            continue
+        seen_domains.add(host)
+        if any(host == s or host.endswith("." + s) for s in DOMAIN_ANALYSIS_ALLOWLIST):
+            continue
+        split = _split_domain(host)
+        if not split:
+            continue
+        reg_label, eff_tld, labels = split
+
+        reasons: list[str] = []
+        techniques: set[str] = set()
+        top_sev: str | None = None
+
+        def add(sev: str, reason: str, tech: str) -> None:
+            nonlocal top_sev
+            reasons.append(reason)
+            techniques.add(tech)
+            if top_sev is None or SEVERITY_RANK[sev] > SEVERITY_RANK[top_sev]:
+                top_sev = sev
+
+        if any(host == s or host.endswith("." + s) for s in DYNAMIC_DNS_SUFFIXES):
+            add("low", "dynamic-DNS / quick-tunnel provider", "T1568")
+        if eff_tld in SUSPICIOUS_TLDS:
+            add("low", f"abuse-prone TLD .{eff_tld}", proto_tech)
+        if any(lbl.startswith("xn--") for lbl in labels):
+            add("low", "punycode/IDN label (possible homoglyph)", "T1036")
+        ent = _shannon_entropy(reg_label)
+        if len(reg_label) >= DGA_MIN_LABEL_LEN and ent >= DGA_MIN_ENTROPY:
+            add("low", f"high-entropy label '{reg_label}' ({ent:.1f} bits/char, DGA-like)", "T1568.002")
+        if is_dns and len(host) >= DNS_TUNNEL_MIN_QNAME_LEN and (
+            len(labels) >= DNS_TUNNEL_MIN_LABELS
+            or max(len(lbl) for lbl in labels) >= DNS_TUNNEL_MIN_LABEL_LEN
+        ):
+            add("medium", "long/segmented DNS query (possible DNS tunnelling/exfil)", "T1048")
+
+        if not reasons:
+            continue
+        severity = top_sev or "low"
+        # Two independent weak signals corroborate: promote low -> medium.
+        if severity == "low" and len(reasons) >= 2:
+            severity = "medium"
+        reason_text = "; ".join(reasons)
+        kind = "DNS query" if is_dns else "connection/URL"
+        _add_finding(
+            session, existing,
+            title=f"Suspicious domain indicator: {host[:120]}",
+            description=(
+                f"{kind} to {host}: {reason_text}. Individually a weak signal -- "
+                "corroborate with beaconing cadence, download provenance, or the "
+                "requesting process before actioning."
+            ),
+            severity=severity,
+            techniques=sorted(techniques),
+            evidence={**evidence, "domain": host, "reasons": reason_text},
+            source="network-domain",
+        )
+        _escalate_event(session, event, severity, f"Detection: suspicious domain indicator ({reason_text})")
+        state["emitted"] += 1
+        if state["emitted"] >= DOMAIN_FINDING_CAP:
+            return
+
+
+# Windows Event IDs are only unique per channel: EventID 4625 in the Application
+# channel is unrelated to failed logons. When a row carries channel information,
+# only apply well-known-ID heuristics in the channel that defines them.
+_EID_EXPECTED_CHANNELS: dict[str, tuple[str, ...]] = {
+    "1102": ("security",),
+    "4720": ("security",),
+    "4698": ("security",),
+    "4688": ("security",),
+    "4625": ("security",),
+    "4624": ("security",),
+    "4672": ("security",),
+    "4826": ("security",),
+    "7045": ("system",),
+    "106": ("microsoft-windows-taskscheduler/operational",),
+    "8": ("microsoft-windows-sysmon/operational",),
+    "10": ("microsoft-windows-sysmon/operational",),
+}
+
+
+def _eid_channel_ok(raw: dict[str, Any], eid: str) -> bool:
+    expected = _EID_EXPECTED_CHANNELS.get(eid)
+    if not expected:
+        return True
+    channel = _field(raw, "Channel").strip().lower()
+    if not channel:
+        return True  # sources without channel info keep legacy behavior
+    return channel in expected
+
+
+def _add_finding(
+    session,
+    existing: set[tuple[str, str]],
+    title: str,
+    description: str,
+    severity: str,
+    techniques: list[str],
+    evidence: dict[str, Any],
+    source: str,
+) -> None:
+    key = (title, str(evidence.get("entity") or evidence.get("pid") or evidence.get("summary", ""))[:200])
+    if key in existing:
+        return
+    existing.add(key)
+    session.add(
+        Finding(
+            title=title,
+            description=description,
+            severity=severity,
+            mitre_techniques=techniques,
+            evidence=evidence,
+            source=source,
+        )
+    )
+
+
+def _escalate_event(session, event: Event, severity: str, reason: str | None = None) -> None:
+    if SEVERITY_RANK.get(severity, 0) > SEVERITY_RANK.get(event.severity, 0):
+        event.severity = severity
+        if reason:
+            event.severity_reason = reason
+
+
+def _is_memprocfs_timeline_event(event: Event, raw: dict[str, Any]) -> bool:
+    source = (event.source or "").lower()
+    return _MEMPROCFS_TIMELINE_SOURCE in source or str(raw.get("memprocfs_csv") or "").lower().startswith("timeline")
+
+
+def _timeline_type(raw: dict[str, Any]) -> str:
+    return _field(raw, "Type", "TimelineType").strip().upper()
+
+
+def _timeline_action(raw: dict[str, Any]) -> str:
+    return _field(raw, "Action").strip().upper()
+
+
+def _timeline_text(event: Event, raw: dict[str, Any]) -> str:
+    return _field(raw, "Text", "Path", "Name", "Detail") or (event.summary or "")
+
+
+def _event_command_text(event: Event, raw: dict[str, Any]) -> str:
+    if _is_memprocfs_timeline_event(event, raw):
+        keys = ("CommandLine", "Cmdline", "CmdLine", "Args", "Parameters")
+        if _timeline_type(raw) in {"PROC", "SHTASK", "TASK"}:
+            keys = (*keys, "Text")
+        return " ".join(str(_field(raw, key)) for key in keys if _field(raw, key))
+    else:
+        keys = (
+            "CommandLine", "Cmdline", "CmdLine", "Args", "Parameters", "Text",
+            "ImagePath", "Path", "UserPath", "KernelPath", "ServiceFileName",
+        )
+        return " ".join(str(v) for v in [event.summary, *(_field(raw, key) for key in keys)] if v)
+
+
+def _timeline_action_word(action: str) -> str:
+    return {"CRE": "created", "MOD": "modified", "DEL": "deleted"}.get(action.upper(), action.lower())
+
+
+def _is_usn_journal_event(event: Event, raw: dict[str, Any]) -> bool:
+    source = (event.source or "").lower()
+    return bool(raw.get("usn_journal")) or (
+        any(hint in source for hint in ("usn", "$j", "journal"))
+        and bool(_field(raw, "Reason", "UpdateReason", "USNReason", "UsnReasonTokens"))
+    )
+
+
+def _usn_reason_tokens(raw: dict[str, Any]) -> set[str]:
+    tokens = raw.get("UsnReasonTokens")
+    if isinstance(tokens, list):
+        return {str(t).upper() for t in tokens if str(t).strip()}
+    reason = _field(raw, "Reason", "UpdateReason", "USNReason")
+    if not reason:
+        return set()
+    try:
+        number = int(reason, 16) if str(reason).lower().startswith("0x") else int(reason)
+    except ValueError:
+        number = None
+    if number is not None:
+        bit_names = {
+            0x00000100: "FILE_CREATE",
+            0x00000200: "FILE_DELETE",
+            0x00001000: "RENAME_OLD_NAME",
+            0x00002000: "RENAME_NEW_NAME",
+            0x80000000: "CLOSE",
+        }
+        return {name for bit, name in bit_names.items() if number & bit}
+    return {
+        token.upper()
+        for token in re.split(r"[^A-Za-z0-9_]+", reason)
+        if token and token.upper() not in {"USN", "REASON"}
+    }
+
+
+def _usn_path(event: Event, raw: dict[str, Any]) -> str:
+    return _field(
+        raw,
+        "UsnPath", "FullPath", "OSPath", "Path", "TargetFilename", "TargetPath",
+        "FilePath", "Name", "FileName", "Filename",
+    ) or (event.entity or "")
+
+
+def _usn_file_reference(raw: dict[str, Any]) -> str:
+    ref = _field(
+        raw,
+        "UsnFileReference", "FileReferenceNumber", "FileReference", "FileId",
+        "FileID", "FileIdentifier", "MFTReference", "MFTId", "MFTID", "FRN",
+    )
+    if not ref:
+        return ""
+    if ":" in ref:
+        return ref
+    seq = _field(raw, "Sequence", "SequenceNumber", "Seq", "MFTSequence")
+    return f"{ref}:{seq}" if seq else ref
+
+
+def _extension(path: str) -> str:
+    base = _basename(path)
+    m = re.search(r"(\.[A-Za-z0-9]{1,12})$", base)
+    return m.group(1).lower() if m else ""
+
+
+def _is_usn_executable_path(path: str) -> bool:
+    return bool(_USN_EXECUTABLE_ARTIFACT_RE.search(path or ""))
+
+
+def _is_user_writable_path(path: str) -> bool:
+    npath = _normalize_path(path)
+    return any(hint in npath for hint in _USN_USER_WRITABLE_HINTS)
+
+
+def _is_double_extension(path: str) -> bool:
+    base = _basename(path)
+    parts = base.lower().split(".")
+    if len(parts) < 3:
+        return False
+    return f".{parts[-2]}" in _USN_DECOY_EXTENSIONS and f".{parts[-1]}" in _USN_SCRIPT_EXTENSIONS
+
+
+def _is_powershell_policy_test_artifact(path: str) -> bool:
+    base = _basename(path).lower()
+    return base.startswith("__psscriptpolicytest_") and ".ps1" in base
+
+
+def _is_high_value_usn_rename(old_path: str, new_path: str) -> bool:
+    if not _is_usn_executable_path(new_path):
+        return False
+    old_ext = _extension(old_path)
+    new_ext = _extension(new_path)
+    if not new_ext or old_ext == new_ext:
+        return False
+    if old_ext in _USN_TEMPORARY_EXTENSIONS:
+        return False
+    if _is_double_extension(new_path):
+        return True
+    return old_ext in _USN_DECOY_EXTENSIONS and new_ext in _USN_SCRIPT_EXTENSIONS
+
+
+def _usn_create_severity(path: str) -> str | None:
+    if not _is_usn_executable_path(path) or not _is_user_writable_path(path):
+        return None
+    if _is_powershell_policy_test_artifact(path):
+        return None
+    if _is_double_extension(path):
+        return "low"
+    return None
+
+
+def _check_usn_journal_event(
+    session,
+    existing: set[tuple[str, str]],
+    event: Event,
+    raw: dict[str, Any],
+    evidence: dict[str, Any],
+) -> None:
+    if not _is_usn_journal_event(event, raw):
+        return
+    tokens = _usn_reason_tokens(raw)
+    path = _usn_path(event, raw)
+    if not path or not _is_usn_executable_path(path):
+        return
+    if "FILE_CREATE" in tokens:
+        severity = _usn_create_severity(path)
+        if not severity:
+            return
+        reason = (
+            "Context: $J USN journal recorded executable/script creation in a "
+            "user-writable path; kept for timeline and execution correlation"
+        )
+        _escalate_event(session, event, severity, reason)
+
+
+def _analyze_usn_rename_chains(
+    session,
+    existing: set[tuple[str, str]],
+    usn_events: list[Event],
+) -> None:
+    old_by_ref: dict[str, Event] = {}
+    fallback_old: list[Event] = []
+
+    def event_sort_key(event: Event) -> tuple[str, int]:
+        ts = event.timestamp.isoformat() if event.timestamp else ""
+        return (ts, event.id or 0)
+
+    for event in sorted(usn_events, key=event_sort_key):
+        raw = event.raw or {}
+        tokens = _usn_reason_tokens(raw)
+        if not (tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}):
+            continue
+        ref = _usn_file_reference(raw)
+        path = _usn_path(event, raw)
+        if "RENAME_OLD_NAME" in tokens:
+            if ref:
+                old_by_ref[ref] = event
+            elif len(fallback_old) < 200:
+                fallback_old.append(event)
+            continue
+        if "RENAME_NEW_NAME" not in tokens:
+            continue
+        old_event = old_by_ref.get(ref) if ref else (fallback_old.pop() if fallback_old else None)
+        if old_event is None:
+            continue
+        old_raw = old_event.raw or {}
+        old_path = _usn_path(old_event, old_raw)
+        if not path or not old_path:
+            continue
+        new_exec = _is_usn_executable_path(path)
+        old_exec = _is_usn_executable_path(old_path)
+        if not new_exec and not old_exec:
+            continue
+        ext_changed = _extension(path) != _extension(old_path)
+        suspicious_path = _is_user_writable_path(path) or _is_user_writable_path(old_path)
+        double_ext = _is_double_extension(path)
+        high_value_rename = _is_high_value_usn_rename(old_path, path)
+        if not high_value_rename:
+            continue
+        severity = "medium"
+        signals = []
+        if ref:
+            signals.append("same FileReferenceNumber links old and new names")
+        if double_ext:
+            signals.append("new name uses a decoy/double extension")
+        elif ext_changed:
+            signals.append("rename changed a decoy document/archive/media extension into a script extension")
+        if suspicious_path:
+            signals.append("rename occurred in a user-writable or staging path")
+        _add_finding(
+            session,
+            existing,
+            title="USN Journal: file renamed to executable/script extension",
+            description=(
+                f"The NTFS $UsnJrnl:$J journal links a rename from {old_path[:300]} "
+                f"to {path[:300]}. This is useful because the journal preserves old/new "
+                "names for the same file reference, exposing extension flips that normal "
+                "directory listings miss. Treat as a medium-confidence lead until execution "
+                "or download evidence corroborates it. Signals: " + "; ".join(signals) + "."
+            ),
+            severity=severity,
+            techniques=["T1036", "T1204"],
+            evidence={
+                "entity": path,
+                "old_path": old_path[:700],
+                "new_path": path[:700],
+                "file_reference": ref or None,
+                "old_event_id": old_event.id,
+                "new_event_id": event.id,
+                "signals": signals,
+            },
+            source=f"event:{event.source}",
+        )
+        _escalate_event(
+            session,
+            old_event,
+            severity,
+            "Detection: $J USN journal rename chain old name for executable/script extension flip",
+        )
+        _escalate_event(
+            session,
+            event,
+            severity,
+            "Detection: $J USN journal rename chain new name is executable/script artifact",
+        )
+
+
+def _parse_memprocfs_task_text(text: str) -> dict[str, Any] | None:
+    m = _TASK_ACTION_RE.match(text or "")
+    if not m:
+        return None
+    action = m.group("action").strip()
+    if "::" in action:
+        exe, args = [part.strip() for part in action.split("::", 1)]
+        action = f"{exe} {args}".strip()
+    return {
+        "name": m.group("name").strip(),
+        "action": action,
+        "run_as": m.group("meta").strip("- "),
+        "run_level": "",
+        "schedule": "",
+        "high_freq": False,
+    }
+
+
+def _check_memprocfs_timeline_event(
+    session,
+    existing: set[tuple[str, str]],
+    event: Event,
+    raw: dict[str, Any],
+    evidence: dict[str, Any],
+    task_records: list[dict[str, Any]],
+    persistence_artifacts: list[tuple[str, str, str, str]],
+) -> None:
+    mem_csv = str(raw.get("memprocfs_csv") or "").lower()
+    if mem_csv == "tasks.csv":
+        action = " ".join(
+            str(v) for v in [_field(raw, "CommandLine"), _field(raw, "Parameters")] if v and v != "---"
+        ).strip()
+        task_name = _field(raw, "TaskPath", "TaskName", "GUID")
+        task_record = {
+            "name": task_name,
+            "action": action,
+            "run_as": _field(raw, "User"),
+            "run_level": "",
+            "schedule": "",
+            "high_freq": False,
+            "origin": "MemProcFS tasks.csv",
+            "event": event,
+        }
+        if action or task_name:
+            task_records.append(task_record)
+        top = _check_cmdline(session, existing, action, evidence, f"event:{event.source}")
+        if top:
+            _escalate_event(
+                session, event, top,
+                f"Detection: scheduled-task action matched suspicious command-line patterns ({top})",
+            )
+        return
+
+    if not _is_memprocfs_timeline_event(event, raw):
+        return
+    typ = _timeline_type(raw)
+    action = _timeline_action(raw)
+    text = _timeline_text(event, raw)
+    lower = text.lower()
+    if typ == "PROC":
+        top = _check_cmdline(session, existing, text, evidence, f"event:{event.source}")
+        if top:
+            _escalate_event(
+                session, event, top,
+                f"Detection: process command line matched suspicious patterns ({top})",
+            )
+
+    if typ == "REG":
+        for fragment, technique, desc in PERSISTENCE_REGISTRY_PATHS:
+            if fragment in lower:
+                if not _memprocfs_registry_persistence_is_specific(fragment, lower):
+                    break
+                _add_finding(
+                    session, existing,
+                    title=f"MemProcFS timeline: {desc}",
+                    description=f"Registry timeline row touched a persistence location: {text[:500]}",
+                    severity="high",
+                    techniques=[technique],
+                    evidence={**evidence, "timeline_type": typ, "timeline_action": action, "text": text[:700]},
+                    source=f"event:{event.source}",
+                )
+                _escalate_event(session, event, "high", f"Detection: {desc}")
+                for exe in set(_EXE_TOKEN_RE.findall(lower)):
+                    persistence_artifacts.append(
+                        (_basename(exe), "MemProcFS registry persistence", text[:200], technique)
+                    )
+                break
+
+    if typ in {"SHTASK", "TASK"}:
+        parsed = _parse_memprocfs_task_text(text)
+        if parsed:
+            parsed["origin"] = "MemProcFS timeline"
+            parsed["event"] = event
+            task_records.append(parsed)
+            action_base = _basename(_first_exe_token(parsed.get("action") or ""))
+            if action_base:
+                persistence_artifacts.append(
+                    (action_base, "MemProcFS scheduled task", text[:200], "T1053.005")
+                )
+        elif action in {"CRE", "MOD"}:
+            _add_finding(
+                session, existing,
+                title="MemProcFS timeline: scheduled-task artifact changed",
+                description=f"Scheduled-task timeline row changed: {text[:500]}",
+                severity="medium",
+                techniques=["T1053.005"],
+                evidence={**evidence, "timeline_type": typ, "timeline_action": action, "text": text[:700]},
+                source=f"event:{event.source}",
+            )
+            _escalate_event(
+                session, event, "medium",
+                "Detection: scheduled-task timeline artifact was created/modified",
+            )
+
+    if typ in {"NTFS", "FILE"} and action in {"CRE", "MOD"}:
+        npath = _normalize_path(text)
+        executable = bool(_EXECUTABLE_ARTIFACT_RE.search(npath))
+        suspicious_dir = any(d in npath for d in SUSPICIOUS_EXECUTION_DIRS)
+        task_artifact = any(hint in npath for hint in _TASK_ARTIFACT_HINTS)
+        if executable and suspicious_dir:
+            # Passive filesystem presence in temp/AppData is common on analyst and
+            # developer workstations. Keep it visible in timeline severity, but only
+            # make a Finding when correlated process execution points at the same path.
+            _escalate_event(
+                session, event, "low",
+                "Detection: executable created/modified in a user-writable/staging directory",
+            )
+        elif task_artifact:
+            _add_finding(
+                session, existing,
+                title="MemProcFS timeline: scheduled-task file changed",
+                description=(
+                    f"Scheduled-task filesystem artifact was {_timeline_action_word(action)}: "
+                    f"{text[:500]}"
+                ),
+                severity="medium",
+                techniques=["T1053.005"],
+                evidence={**evidence, "timeline_type": typ, "timeline_action": action, "path": text[:700]},
+                source=f"event:{event.source}",
+            )
+            _escalate_event(
+                session, event, "medium",
+                "Detection: scheduled-task filesystem artifact changed",
+            )
+
+
+def _check_cmdline_impl(session, existing, text, evidence, source, patterns, prefilter) -> str | None:
+    """Match `text` against a command-line pattern list, emitting a finding per
+    match and returning the highest severity seen. `prefilter` is a cheap literal
+    gate that must fire before the full list is scanned."""
+    if not text:
+        return None
+    if not prefilter.search(text):
+        return None
+    lower = text.lower()
+    top: str | None = None
+    for regex, technique, description, severity in patterns:
+        m = regex.search(lower)
+        if m:
+            matched = m.group(0).strip() or description  # lookahead-only rules match empty
+            _add_finding(
+                session, existing,
+                title=description,
+                description=f"Suspicious command line matched '{matched}': {text[:500]}",
+                severity=severity,
+                techniques=[technique],
+                evidence=evidence,
+                source=source,
+            )
+            if top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[top]:
+                top = severity
+    return top
+
+
+def _check_cmdline(session, existing, text: str, evidence: dict[str, Any], source: str) -> str | None:
+    """Returns highest severity matched, adds findings (Windows pattern set)."""
+    return _check_cmdline_impl(
+        session, existing, text, evidence, source,
+        SUSPICIOUS_CMDLINE_PATTERNS, _CMDLINE_PREFILTER_RE,
+    )
+
+
+def _check_linux_cmdline(session, existing, text: str, evidence: dict[str, Any], source: str) -> str | None:
+    """Returns highest severity matched, adds findings (Linux/Unix pattern set)."""
+    return _check_cmdline_impl(
+        session, existing, text, evidence, source,
+        LINUX_SUSPICIOUS_CMDLINE_PATTERNS, _LINUX_CMDLINE_PREFILTER_RE,
+    )
+
+
+def _scan_cmdline_severity(text: str) -> str | None:
+    """Highest severity any cmdline pattern matches, WITHOUT emitting findings.
+
+    Used when a matched pattern serves as one *signal* inside a larger graded
+    detection (e.g. scheduled-task analysis) so we don't double-emit findings.
+    """
+    if not text:
+        return None
+    if not _CMDLINE_PREFILTER_RE.search(text):
+        return None
+    lower = text.lower()
+    top: str | None = None
+    for regex, _tech, _desc, severity in SUSPICIOUS_CMDLINE_PATTERNS:
+        if regex.search(lower) and (top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[top]):
+            top = severity
+    return top
+
+
+def _aware(dt: datetime) -> datetime:
+    """Coerce naive datetimes (SQLite round-trips) to UTC so comparisons never raise."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _field(raw: dict[str, Any], *names: str) -> str:
+    """Fetch the first present raw field, tolerating case/space/underscore variants."""
+    for n in names:
+        v = raw.get(n)
+        if v not in (None, ""):
+            return str(v)
+    wanted = {n.lower().replace(" ", "").replace("_", "") for n in names}
+    for k, v in raw.items():
+        if isinstance(k, str) and k.lower().replace(" ", "").replace("_", "") in wanted and v not in (None, ""):
+            return str(v)
+    return ""
+
+
+def _parse_access_mask(value: str) -> int | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip().lower()
+    try:
+        return int(text, 16) if text.startswith("0x") else int(text)
+    except ValueError:
+        return None
+
+
+def _dangerous_process_access(access: int | None) -> bool:
+    if access is None:
+        return False
+    if access in (0x1F0FFF, 0x1FFFFF, 0x143A, 0x1410, 0x1FFFF):
+        return True
+    return bool(access & (0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0040 | 0x0800))
+
+
+def _process_text_is_sensitive(*values: str) -> bool:
+    text = " ".join(v or "" for v in values).lower().replace("/", "\\")
+    return any(name in text for name in SENSITIVE_PROCESS_NAMES)
+
+
+def _first_exe_token(command: str) -> str:
+    """First executable token of an action/command string (handles quoting)."""
+    c = (command or "").strip()
+    if not c:
+        return ""
+    if c[0] in "\"'":
+        end = c.find(c[0], 1)
+        return c[1:end].strip() if end > 0 else c[1:].strip()
+    m = re.match(r"(\S+(?:\.exe|\.bat|\.cmd|\.ps1|\.vbs|\.js|\.dll|\.sys|\.msi|\.scr|\.com))", c, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    first = c.split()[0]
+    # Unquoted path with spaces ("C:\Program Files\...\x.exe args"): only when the
+    # text clearly starts with a filesystem path, take the shortest prefix ending
+    # in an executable extension.
+    if ":" in first or "\\" in first:
+        m = re.match(r"([^\"<>|]*?\.(?:exe|bat|cmd|ps1|vbs|js|dll|com|sys|msi|scr))(?:\s|$)", c, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return first
+
+
+def _basename(path: str) -> str:
+    p = (path or "").strip().strip('"').replace("/", "\\").rstrip("\\")
+    return p.rsplit("\\", 1)[-1].strip().lower()
+
+
+def _startup_argv_execution(raw: dict[str, Any]) -> tuple[str, str] | None:
+    """Treat Velociraptor/.NET startup ARGV application logs as execution evidence."""
+    bits: list[str] = []
+    data = raw.get("Data")
+    if isinstance(data, list):
+        bits.extend(str(v) for v in data)
+    elif data:
+        bits.append(str(data))
+    for key in ("Message", "RenderedDescription"):
+        if raw.get(key):
+            bits.append(str(raw.get(key)))
+
+    text = "\n".join(bits)
+    if "startup argv" not in text.lower():
+        return None
+    m = re.search(r"ARGV:\s*(\[[\s\S]*?\])", text)
+    if not m:
+        return None
+    try:
+        argv = json.loads(m.group(1))
+    except Exception:
+        first = re.search(r'^\[\s*"([^"]+)"', m.group(1))
+        if not first:
+            return None
+        image = first.group(1).strip()
+        return (image, image) if image else None
+    if not isinstance(argv, list) or not argv:
+        return None
+    image = str(argv[0]).strip()
+    if not image:
+        return None
+    return image, " ".join(str(arg) for arg in argv)
+
+
+def _event_execution(raw: dict[str, Any], eid: str) -> tuple[str, str | None] | None:
+    if eid in {"1", "4688"}:
+        if not _eid_channel_ok(raw, eid):
+            return None
+        image = _field(raw, "Image", "NewProcessName")
+        return (image, _field(raw, "CommandLine", "Cmdline")) if image else None
+
+    if eid == "1000":
+        return _startup_argv_execution(raw)
+
+    channel = str(raw.get("Channel") or "")
+    if eid == "17" and "Program-Compatibility-Assistant" in channel:
+        image = _field(raw, "ExePath")
+        return (image, None) if image else None
+
+    return None
+
+
+_GUID_NAME_RE = re.compile(r"^\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?$")
+_HEX_NAME_RE = re.compile(r"^[0-9a-f]{12,}$")
+_VOWELS = set("aeiou")
+
+
+def _looks_machine_generated(name: str) -> str | None:
+    """Heuristic for machine-generated names (GUIDs, random strings, single letters).
+
+    Deliberately conservative: it contributes one *signal*, never a finding by itself.
+    """
+    n = (name or "").strip().lower()
+    if not n:
+        return None
+    if _GUID_NAME_RE.match(n):
+        return "GUID-like name"
+    if len(n) == 1 and n.isalpha():
+        return "single-letter name"
+    if n.isalnum():
+        letters = [c for c in n if c.isalpha()]
+        if len(n) >= 8 and letters and not any(c in _VOWELS for c in letters):
+            return "vowel-less random-looking string"
+        if _HEX_NAME_RE.match(n):
+            return "long hex string"
+        run = best = 0
+        for c in n:
+            if c.isalpha() and c not in _VOWELS:
+                run += 1
+                best = max(best, run)
+            else:
+                run = 0
+        if len(n) >= 8 and best >= 7:
+            return "improbable consonant sequence"
+    return None
+
+
+# Tolerates the quoted-path form ('"C:\...\schtasks.exe" /create'): a closing
+# quote/apostrophe may sit between the extension and the whitespace.
+_SCHTASKS_CREATE_RE = re.compile(r"schtasks(?:\.exe)?[\"']?\s+.{0,100}/create\b", re.IGNORECASE)
+# Remote payload source in a task action (/tr value or 4698 Command+Arguments):
+# an HTTP(S) URL or a UNC path.
+_REMOTE_ACTION_RE = re.compile(r"https?://|\\\\", re.IGNORECASE)
+
+
+def _parse_schtasks_create(text: str) -> dict[str, Any] | None:
+    """Extract task name/action/run-as/schedule from a `schtasks /create` command line."""
+    if not text or not _SCHTASKS_CREATE_RE.search(text):
+        return None
+
+    def grab(flag: str) -> str:
+        # Values may be double- or single-quoted ('/tr "mshta.exe https://..."').
+        m = re.search(rf"/{flag}\b[:\s]+(\"[^\"]*\"|'[^']*'|\S+)", text, re.IGNORECASE)
+        return m.group(1).strip("\"'") if m else ""
+
+    sc = grab("sc").lower()
+    mo = grab("mo")
+    ri = grab("ri")
+    high_freq = False
+    if sc == "minute":
+        try:
+            high_freq = int(mo or "1") < 15
+        except ValueError:
+            high_freq = True
+    if ri:
+        try:
+            high_freq = high_freq or 0 < int(ri) < 15
+        except ValueError:
+            logger.debug("Ignoring non-numeric scheduled-task repetition interval %r", ri)
+    schedule = " ".join(x for x in (f"/sc {sc}" if sc else "", f"/mo {mo}" if mo else "", f"/ri {ri}" if ri else "") if x)
+    return {
+        "name": grab("tn"),
+        "action": grab("tr"),
+        "run_as": grab("ru"),
+        "run_level": grab("rl"),
+        "schedule": schedule,
+        "high_freq": high_freq,
+    }
+
+
+def _parse_task_xml(xml: str) -> dict[str, Any]:
+    """Extract action/run-as/repetition from scheduled-task XML (4698 TaskContent)."""
+    x = xml or ""
+
+    def tag(t: str) -> str:
+        m = re.search(rf"<{t}>\s*([^<]*?)\s*</{t}>", x, re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    command = tag("command")
+    args = tag("arguments")
+    action = (command + " " + args).strip()
+    high_freq = False
+    schedule = ""
+    m = re.search(r"<interval>\s*pt([0-9hms.]+)\s*</interval>", x.lower())
+    if m:
+        spec = m.group(1)
+        h = re.search(r"(\d+)h", spec)
+        mi = re.search(r"(\d+)m", spec)
+        s = re.search(r"(\d+)s", spec)
+        total_s = (int(h.group(1)) * 3600 if h else 0) + (int(mi.group(1)) * 60 if mi else 0) + (int(s.group(1)) if s else 0)
+        schedule = f"repetition interval PT{spec.upper()}"
+        high_freq = 0 < total_s < 15 * 60
+    return {
+        "name": "",
+        "action": action,
+        "run_as": tag("userid"),
+        "run_level": tag("runlevel"),
+        "schedule": schedule,
+        "high_freq": high_freq,
+    }
+
+
+# System-ish roots: a SYSTEM-privileged task action living under these is normal.
+_SYSTEMISH_PREFIXES = ("\\windows\\", "\\program files")
+
+
+def _task_signals(rec: dict[str, Any]) -> tuple[list[str], bool]:
+    """Independent suspicion signals for one (merged) scheduled-task record.
+
+    Returns (signals, strong): `strong` marks a remote-payload action, which has
+    no routine-administration analogue and justifies a high-severity finding on
+    its own (the graded 1-signal -> medium rule does not apply to it).
+    """
+    signals: list[str] = []
+    strong = False
+    action = rec.get("action") or ""
+    exe = _first_exe_token(action)
+    npath = _normalize_path(exe)
+    base = _basename(exe)
+    base_noext = re.sub(r"\.(exe|bat|cmd|ps1|vbs|js|com)$", "", base)
+
+    if npath and "\\" in npath and any(d in npath for d in SUSPICIOUS_EXECUTION_DIRS):
+        signals.append(f"action executable resides in a user-writable/staging directory ({exe})")
+
+    if base_noext in SCHEDULED_TASK_SCRIPT_HOSTS:
+        sev = _scan_cmdline_severity(action)
+        if sev and SEVERITY_RANK[sev] >= SEVERITY_RANK["medium"]:
+            signals.append(
+                f"action is a script host/LOLBin ({base or base_noext}) with a suspicious "
+                f"command line (component severity: {sev})"
+            )
+
+    # STRONG signal: the action re-fetches its payload from a remote host (URL or
+    # UNC source). Legitimate updaters run local binaries; a task whose action
+    # pulls code over the network at trigger time is persistence with remote
+    # payload staging (T1053.005 + T1105).
+    if _REMOTE_ACTION_RE.search(action):
+        strong = True
+        signals.append(
+            f"task action references a remote payload source (URL/UNC): {action[:200]}"
+        )
+
+    run_as = (rec.get("run_as") or "").lower()
+    run_level = (rec.get("run_level") or "").lower()
+    privileged = "system" in run_as or "s-1-5-18" in run_as or "highest" in run_level
+    if privileged and npath and "\\" in npath and not npath.startswith(_SYSTEMISH_PREFIXES):
+        signals.append(
+            f"runs as SYSTEM/highest privilege while the action lives outside system paths ({exe})"
+        )
+
+    tname = rec.get("name") or ""
+    tbase = tname.replace("/", "\\").rstrip("\\").rsplit("\\", 1)[-1].strip().lower()
+    reason = _looks_machine_generated(tbase)
+    if reason:
+        signals.append(f"task name '{tname}' looks machine-generated ({reason})")
+    else:
+        for fragment, expected_dir in TASK_UPDATER_MASQUERADES:
+            if fragment not in tbase or expected_dir in npath:
+                continue
+            if npath and "\\" in npath:
+                signals.append(
+                    f"task name '{tname}' masquerades as a vendor updater but the action "
+                    f"'{exe}' is outside the vendor directory (expected '{expected_dir}')"
+                )
+                break
+            # Bare action ("mshta.exe https://...") carries no path to check against
+            # the vendor directory; a script host or remote source is still a mismatch.
+            if base_noext in SCHEDULED_TASK_SCRIPT_HOSTS or _REMOTE_ACTION_RE.search(action):
+                signals.append(
+                    f"task name '{tname}' masquerades as a vendor updater but the action "
+                    f"is a script host / remote payload, not the vendor's updater "
+                    f"({(action or exe)[:160]})"
+                )
+                break
+
+    if rec.get("high_freq"):
+        signals.append(
+            f"high-frequency schedule ({rec.get('schedule') or 'repetition under 15 minutes'}) "
+            "- beacon-like persistence cadence"
+        )
+    return signals, strong
+
+
+def _analyze_scheduled_tasks(
+    session,
+    existing: set[tuple[str, str]],
+    task_records: list[dict[str, Any]],
+    persistence_artifacts: list[tuple[str, str, str, str]],
+) -> None:
+    """Grade scheduled-task creations by number of independent suspicion signals.
+
+    0 signals -> no finding (normal admin activity). 1 -> medium lead. >=2 -> high.
+    Records from event logs (4698/106) and from schtasks /create command lines are
+    merged by task name, so corroboration across sources raises confidence without
+    producing duplicate findings.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for rec in task_records:
+        name = (rec.get("name") or "").strip()
+        key = name.lower().lstrip("\\") or ("action:" + (rec.get("action") or "").strip().lower()[:120])
+        if not key or key == "action:":
+            continue
+        slot = merged.setdefault(key, {
+            "name": name, "action": "", "run_as": "", "run_level": "",
+            "schedule": "", "high_freq": False, "origins": set(), "events": [],
+        })
+        for f in ("name", "action", "run_as", "run_level", "schedule"):
+            if not slot[f] and rec.get(f):
+                slot[f] = rec[f]
+        slot["high_freq"] = slot["high_freq"] or bool(rec.get("high_freq"))
+        slot["origins"].add(rec.get("origin") or "unknown")
+        if rec.get("event") is not None:
+            slot["events"].append(rec["event"])
+
+    for key, rec in merged.items():
+        signals, strong = _task_signals(rec)
+        if not signals:
+            continue  # ordinary task creation: normal admin activity, no finding
+        display = rec["name"] or _first_exe_token(rec["action"]) or key
+        corroborated = {"event log", "process"} <= rec["origins"]
+        techniques = ["T1053.005"] + (["T1105"] if strong else [])
+        if len(signals) == 1 and not strong:
+            title = f"Scheduled task with suspicious property: {display}"
+            severity = "medium"
+            desc_head = (
+                "One suspicious property observed on this scheduled task. A single property "
+                "also occurs in legitimate software deployment and admin scripting; treat as "
+                "a lead and corroborate before escalating."
+            )
+        else:
+            title = f"Anomalous scheduled task: {display}"
+            severity = "high"
+            if strong and len(signals) == 1:
+                desc_head = (
+                    "The task action fetches its payload from a remote source at trigger "
+                    "time. That property alone has no routine-administration analogue and "
+                    "is consistent with scheduled-task persistence staging a remote payload "
+                    "(T1053.005 + T1105)."
+                )
+            else:
+                desc_head = (
+                    f"{len(signals)} independent suspicious properties observed on one scheduled "
+                    "task. In combination they are consistent with scheduled-task persistence "
+                    "(T1053.005) rather than routine administration."
+                )
+        evidence: dict[str, Any] = {
+            "entity": display,
+            "task_name": rec["name"],
+            "action": (rec["action"] or "")[:500],
+            "run_as": rec["run_as"],
+            "schedule": rec["schedule"],
+            "signals": signals,
+            "observed_via": sorted(rec["origins"]),
+        }
+        description = desc_head + " Signals: " + "; ".join(signals) + "."
+        if corroborated:
+            evidence["corroboration"] = (
+                "corroborated by process + event log: a task-creation event and a "
+                "schtasks /create command line reference the same task name"
+            )
+            description += (
+                " Creation is corroborated by both a process command line and an "
+                "event-log record for the same task name, raising confidence."
+            )
+        _add_finding(
+            session, existing,
+            title=title,
+            description=description,
+            severity=severity,
+            techniques=techniques,
+            evidence=evidence,
+            source="task-heuristics",
+        )
+        action_base = _basename(_first_exe_token(rec["action"]))
+        if action_base:
+            persistence_artifacts.append(
+                (action_base, "scheduled task", f"{display} -> {rec['action'][:200]}", "T1053.005")
+            )
+        for e in rec["events"]:
+            _escalate_event(session, e, severity, f"Detection: {title}")
+
+
+# Accounts whose special-privilege logons (4672) are routine, plus prefixes for
+# per-session window-manager/font-driver accounts.
+_WELLKNOWN_PRIV_ACCOUNTS = {
+    "system", "local service", "network service", "anonymous logon",
+    "window manager", "font driver host", "-",
+}
+
+# Basenames too generic to pair a persistence artifact with a flagged process:
+# every case has flagged powershell/cmd processes, so matching on these would
+# manufacture correlations.
+_PAIRING_GENERIC_HOSTS = {
+    "powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe",
+    "mshta.exe", "rundll32.exe", "regsvr32.exe", "svchost.exe", "explorer.exe",
+    "conhost.exe", "reg.exe", "schtasks.exe", "sc.exe", "net.exe", "net1.exe",
+    "wmic.exe", "msiexec.exe",
+}
+
+_WEVTUTIL_CL_RE = re.compile(r"wevtutil(?:\.exe)?\s+cl\b")
+_EXE_TOKEN_RE = re.compile(r"[\w][\w\-.]{0,80}\.exe\b")
+_BASE64_BLOB_RE = re.compile(r"[a-z0-9+/]{80,}={0,2}")
+_SERVICE_INTERPRETER_RE = re.compile(r"\b(?:powershell|pwsh|cmd\.exe|rundll32)\b|comspec")
+
+_CMDLINE_PREFILTER_RE = re.compile(
+    "|".join(
+        re.escape(term)
+        for term in (
+            "-enc", "-encodedcommand", "-nop", "-noprofile", "executionpolicy", "bypass",
+            "downloadstring", "downloadfile", "iex", "invoke-expression", "invoke-webrequest",
+            "frombase64string", "mimikatz", "sekurlsa", "lsass", "procdump", "comsvcs",
+            "minidump", "nanodump", "out-minidump", "createdump", ".dmp", "vssadmin",
+            "delete shadows", "wbadmin", "delete catalog", "bcdedit", "wevtutil",
+            "clear-eventlog", "net user", "net1 user", "localgroup", "administrators",
+            "reg add", "currentversion\\run", "attrib", "+h", "icacls", "/grant", "/deny",
+            "/setowner", "/reset", "/inheritance", "/remove", "javascript:", "scrobj.dll",
+            "-urlcache", "certutil", "-decode", "schtasks", "/create", "mshta",
+            "regsvr32", "/i:http", "activexobject", "wscript.shell",
+            "shell.application", "hidden", "wmic", "process call create", "/node:", "psexec",
+            "ntdsutil", "ntds.dit", "reg save", "hklm\\sam", "hklm\\system", "dcsync",
+            "kerberos::golden", "golden ticket", "golden-ticket", "golden_ticket",
+            "kerberoast", "rubeus", "bloodhound", "sharphound", "cobalt strike",
+            "cobalt-strike", "cobalt_strike", "beacon.dll", "meterpreter", "empire",
+            "covenant", "gruntstager", "grunthttp", "nishang", "powersploit", "lazagne",
+            "chisel", "ngrok", "plink", "set-mppreference", "add-mppreference",
+            "-disable", "-exclusion", "windefend", "sense", "wscsvc",
+            "securityhealthservice", "mpssvc", "wuauserv", "net stop", "auditpol",
+            "/clear", "/success:disable", "/failure:disable", "fsutil", "usn deletejournal",
+            "netsh", "advfirewall", "state off", "sdelete", "cipher", "/w", "eventfilter",
+            "commandlineeventconsumer", "bitsadmin", "/transfer",
+            # backconnect / tunneling / C2 / RAT tool names
+            "tcpclient", "powercat", "ncat", "nc.exe", "portproxy", "frpc", "revsocks",
+            "stowaway", "ligolo", "regeorg", "pystinger", "poshc2", "nimplant", "koadic",
+            "brute ratel", "bruteratel", "pupy", "asyncrat", "njrat", "dcrat", "nanocore",
+            "xworm", "remcos",
+            # defense evasion / credential access
+            "amsiutils", "amsiinitfailed", "amsiscanbuffer", "etweventwrite", "wdigest",
+            "uselogoncredential", "win32_shadowcopy", "mavinject", "certoc", "--headless",
+            "nslookup", "resolve-dnsname",
+            # supply chain / git
+            "npm install", "npm ci", "npm exec", "pip install", "pip3 install",
+            "git clone", "core.hookspath",
+        )
+    ),
+    re.IGNORECASE,
+)
+
+# Cheap literal gate for the Linux command-line rules. Every pattern in
+# LINUX_SUSPICIOUS_CMDLINE_PATTERNS must have one of its literals here, otherwise
+# the pattern is unreachable (guarded by test_linux_detections_corpus).
+_LINUX_CMDLINE_PREFILTER_RE = re.compile(
+    "|".join(
+        re.escape(term)
+        for term in (
+            "curl", "wget", "chmod", "base64", "/dev/tcp", "nc -e", "ncat",
+            "-e /bin/", "mkfifo", "python", "perl", "socat", "history -c",
+            "histfile", "histsize", ".bash_history", "authorized_keys",
+            "/etc/crontab", "/etc/cron.d", "/etc/sudoers", "ld.so.preload",
+            "useradd", "adduser", "usermod", "systemctl enable",
+            # backconnect / reverse shells / tunneling
+            "php", "ruby", "/inet/tcp", "ssh", "chisel", "frpc", "ngrok",
+            # supply chain / git
+            "pip install", "pip3 install", "npm install", "npm ci", "npm exec", "npx",
+            "git clone", "core.hookspath",
+            # defense evasion / persistence
+            "setenforce", "iptables", "ufw disable", "firewalld", "chattr", "crontab",
+            ".bashrc", ".bash_profile", ".bash_login", ".profile", ".zshrc", ".zshenv",
+            "ld_preload",
+            # credential access / cloud / container
+            "/etc/shadow", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+            "mimipenguin", "unshadow", "lazagne", "nsenter", "docker run",
+        )
+    ),
+    re.IGNORECASE,
+)
+
+# Group names whose membership grants root-equivalent or high-value access.
+_LINUX_PRIV_GROUPS = {"sudo", "wheel", "root", "admin", "adm", "docker"}
+
+
+def _check_linux_persistence(session, existing, event, raw, evidence) -> None:
+    """Flag Linux persistence-file writes observed via auditd PATH records or a
+    crontab modification event."""
+    candidates: list[str] = []
+    paths = raw.get("Paths")
+    write_ish = bool(raw.get("Key"))
+    if isinstance(paths, list):
+        for p in paths:
+            if isinstance(p, dict):
+                name = str(p.get("name") or "")
+                if name:
+                    candidates.append(name.lower())
+                if str(p.get("nametype") or "").upper() in ("CREATE", "DELETE"):
+                    write_ish = True
+    if not write_ish or not candidates:
+        return
+    for fragment, technique, description, severity in LINUX_PERSISTENCE_PATHS:
+        if any(fragment in name for name in candidates):
+            _add_finding(
+                session, existing,
+                title=description,
+                description=f"Linux persistence location written: {event.summary[:400]}",
+                severity=severity,
+                techniques=[technique],
+                evidence=evidence,
+                source=f"event:{event.source}",
+            )
+            _escalate_event(session, event, severity, f"Detection: {description}")
+
+
+def _check_linux_event(session, existing, event, raw, evidence, auth_fail, auth_success) -> None:
+    """Per-event Linux/Entra heuristics: feed the auth brute-force trackers, flag
+    root logins, account/group changes, risky Entra sign-ins, and persistence
+    writes. Called only for events carrying Linux/Entra markers."""
+    proto = _field(raw, "AuthProto")
+    if proto:
+        outcome = _field(raw, "AuthOutcome")
+        ip = _field(raw, "SrcIp")
+        user = _field(raw, "AuthUser")
+        key = (proto, ip.lower(), user.lower())
+        if outcome == "failure":
+            st = auth_fail[key]
+            st["count"] += 1
+            if event.timestamp and (st["first"] is None or _aware(event.timestamp) < _aware(st["first"])):
+                st["first"] = event.timestamp
+            if event.timestamp and (st["last"] is None or _aware(event.timestamp) > _aware(st["last"])):
+                st["last"] = event.timestamp
+            if len(st["events"]) < 200:
+                st["events"].append(event)
+        elif outcome == "success":
+            auth_success[key].append(event)
+            if proto != "entra" and (raw.get("RootLogin") or user.lower() == "root"):
+                scope = _addr_scope(ip)
+                sev = "high" if scope == "public" else "medium"
+                combo = f"root@{ip or 'unknown-source'}"
+                _add_finding(
+                    session, existing,
+                    title=f"Root login: {combo}",
+                    description=(
+                        f"Successful {proto} login as root from {ip or 'an unknown source'}. "
+                        "Direct root logins are usually disabled by policy; an interactive root "
+                        "session, especially from a public address, warrants review."
+                    ),
+                    severity=sev,
+                    techniques=["T1021.004", "T1078.003"],
+                    evidence={**evidence, "source_ip": ip or None, "scope": scope},
+                    source="logon-heuristics",
+                )
+                _escalate_event(session, event, sev, f"Detection: root login from {ip or 'unknown'}")
+
+    risk = _field(raw, "RiskLevelDuringSignIn").lower()
+    risk_state = _field(raw, "RiskState").lower()
+    if risk == "high" or risk_state in ("atrisk", "confirmedcompromised"):
+        user = _field(raw, "AuthUser")
+        _add_finding(
+            session, existing,
+            title=f"Risky Entra sign-in: {user or 'unknown user'}",
+            description=(
+                f"Entra ID flagged this sign-in for {user or 'an account'} as risky "
+                f"(risk level {risk or 'n/a'}, state {risk_state or 'n/a'}). "
+                "Consistent with credential compromise or impossible-travel signals."
+            ),
+            severity="high",
+            techniques=["T1078.004"],
+            evidence=evidence,
+            source="identity-heuristics",
+        )
+        _escalate_event(session, event, "high", "Detection: risky Entra ID sign-in")
+
+    action = _field(raw, "LinuxAccountAction")
+    if action == "new_user":
+        name = _field(raw, "AccountName") or "unknown"
+        _add_finding(
+            session, existing,
+            title=f"Linux user account created: {name}",
+            description=f"A new local account was created: {event.summary[:300]}",
+            severity="medium",
+            techniques=["T1136.001"],
+            evidence=evidence,
+            source=f"event:{event.source}",
+        )
+        _escalate_event(session, event, "medium", "Detection: Linux account created")
+    elif action == "group_add":
+        group = _field(raw, "GroupName").lower()
+        if group in _LINUX_PRIV_GROUPS:
+            name = _field(raw, "AccountName") or "unknown"
+            _add_finding(
+                session, existing,
+                title=f"User added to privileged group: {name} -> {group}",
+                description=(
+                    f"Account '{name}' was added to the privileged group '{group}', granting "
+                    f"root-equivalent or high-value access: {event.summary[:300]}"
+                ),
+                severity="high",
+                techniques=["T1098"],
+                evidence=evidence,
+                source=f"event:{event.source}",
+            )
+            _escalate_event(session, event, "high", f"Detection: user added to '{group}'")
+
+    if raw.get("CronAction", "").upper() in ("REPLACE", "EDIT"):
+        _add_finding(
+            session, existing,
+            title="Cron job modified",
+            description=f"A crontab was modified: {event.summary[:300]}",
+            severity="medium",
+            techniques=["T1053.003"],
+            evidence=evidence,
+            source=f"event:{event.source}",
+        )
+        _escalate_event(session, event, "medium", "Detection: crontab modified")
+
+    _check_linux_persistence(session, existing, event, raw, evidence)
+
+
+def _mem_result_technique(plugin: str, summary: str) -> list[str]:
+    text = f"{plugin} {summary}".lower()
+    techniques: list[str] = []
+    if "yara" in text or "cobalt" in text or "empire" in text or "beacon" in text:
+        techniques.append("T1071")
+    if "malfind" in text or "injection" in text or "shellcode" in text:
+        techniques.append("T1055")
+    if "hollow" in text:
+        techniques.append("T1055.012")
+    if not techniques:
+        techniques.append("T1055")
+    return sorted(set(techniques))
+
+
+def _memprocfs_registry_persistence_is_specific(fragment: str, text: str) -> bool:
+    if "image file execution options" in fragment:
+        return any(token in text for token in (
+            r"\debugger", r"\globalflag", r"\silentprocessexit", r"\monitorprocess",
+        ))
+    if "currentversion\\run" in fragment:
+        normalized = text.rstrip("\\")
+        return not normalized.endswith((
+            r"currentversion\run",
+            r"currentversion\runonce",
+            r"policies\explorer\run",
+        ))
+    if "shellserviceobjectdelayload" in fragment:
+        return not text.rstrip("\\").endswith(r"shellserviceobjectdelayload")
+    return True
+
+
+def _memory_result_promotable(result: MemoryResult) -> bool:
+    plugin = (result.plugin or "").lower()
+    if plugin != "memprocfs_findevil":
+        return result.severity in ("high", "critical")
+    data = result.data or {}
+    row = data.get("row") if isinstance(data, dict) else {}
+    row_type = str((row or {}).get("Type") or "").upper()
+    # MemProcFS findevil is intentionally noisy: entropy, private executable
+    # memory, patched-image and debug flags are common on developer/security
+    # workstations. Treat them as timeline/context unless another detector
+    # independently corroborates the process.
+    if row_type in _WEAK_MEMPROCFS_FINDEVIL_TYPES:
+        return False
+    return result.severity == "critical"
+
+
+def _promote_memory_results(session, existing: set[tuple[str, str]]) -> None:
+    for result in session.scalars(
+        select(MemoryResult).where(MemoryResult.severity.in_(["high", "critical"]))
+    ):
+        if not _memory_result_promotable(result):
+            continue
+        plugin = result.plugin or "memory"
+        entity = result.process_name or (f"pid {result.pid}" if result.pid is not None else plugin)
+        title = f"Memory forensic indicator: {plugin}"
+        if result.process_name:
+            title += f" on {result.process_name}"
+        _add_finding(
+            session, existing,
+            title=title,
+            description=(result.summary or "")[:1000],
+            severity=result.severity,
+            techniques=_mem_result_technique(plugin, result.summary or ""),
+            evidence={
+                "entity": entity,
+                "pid": result.pid,
+                "plugin": plugin,
+                "memory_result_id": result.id,
+                "summary": (result.summary or "")[:500],
+                "data": result.data or {},
+            },
+            source=f"memory:{plugin}",
+        )
+
+
+def _check_cross_process_event(
+    session,
+    existing: set[tuple[str, str]],
+    event: Event,
+    raw: dict[str, Any],
+    evidence: dict[str, Any],
+) -> str | None:
+    eid = str(_field(raw, "EventID", "Event Id", "event_id"))
+    if eid and not _eid_channel_ok(raw, eid):
+        eid = ""
+    source_image = _field(raw, "SourceImage", "Source Image", "SourceProcessName", "Process")
+    target_image = _field(raw, "TargetImage", "Target Image", "TargetProcessName", "Target")
+    source_pid = _field(raw, "SourceProcessId", "SourceProcessID", "SourcePID")
+    target_pid = _field(raw, "TargetProcessId", "TargetProcessID", "TargetPID")
+
+    if eid == "8":
+        start_address = _field(raw, "StartAddress", "Start Address")
+        severity = "critical" if _process_text_is_sensitive(target_image) else "high"
+        _add_finding(
+            session, existing,
+            title="Remote thread creation",
+            description=(
+                f"Sysmon Event 8 shows {source_image or event.entity or 'a process'} creating a "
+                f"thread in {target_image or 'another process'}"
+                + (f" at {start_address}" if start_address else "")
+                + ". This is direct process-injection telemetry; confirm whether the source is an "
+                "expected debugger, EDR, accessibility tool, or developer utility before concluding compromise."
+            ),
+            severity=severity,
+            techniques=["T1055.002"],
+            evidence={
+                **evidence,
+                "source_image": source_image,
+                "target_image": target_image,
+                "source_pid": source_pid or None,
+                "target_pid": target_pid or None,
+                "start_address": start_address or None,
+            },
+            source=f"event:{event.source}",
+        )
+        return severity
+
+    if eid == "10":
+        access_raw = _field(raw, "GrantedAccess", "Granted Access", "AccessMask")
+        access = _parse_access_mask(access_raw)
+        sensitive = _process_text_is_sensitive(target_image)
+        dangerous = _dangerous_process_access(access)
+        if not (sensitive or dangerous):
+            return None
+        severity = "critical" if sensitive and dangerous else "high"
+        reasons = []
+        if sensitive:
+            reasons.append("target process is sensitive")
+        if dangerous:
+            reasons.append("access mask permits memory/thread/handle manipulation")
+        _add_finding(
+            session, existing,
+            title="Suspicious process access",
+            description=(
+                f"Sysmon Event 10 shows {source_image or event.entity or 'a process'} opening "
+                f"{target_image or 'another process'} with access {access_raw or 'unknown'}. "
+                + "; ".join(reasons)
+                + ". Process access is common on workstations, so this is only raised when the "
+                "target/access combination can support credential theft, dumping, or injection."
+            ),
+            severity=severity,
+            techniques=["T1055", "T1003"],
+            evidence={
+                **evidence,
+                "source_image": source_image,
+                "target_image": target_image,
+                "source_pid": source_pid or None,
+                "target_pid": target_pid or None,
+                "granted_access": access_raw or None,
+                "sensitive_target": sensitive,
+                "dangerous_access": dangerous,
+            },
+            source=f"event:{event.source}",
+        )
+        return severity
+
+    if event.category == "handle" and str(raw.get("risk") or "").lower() in {"high", "critical"}:
+        severity = str(raw.get("risk"))
+        _add_finding(
+            session, existing,
+            title="Suspicious cross-process handle",
+            description=(
+                f"{raw.get('Process') or event.entity or 'A process'} holds a "
+                f"{raw.get('Type') or 'process'} handle to "
+                f"{raw.get('TargetProcess') or raw.get('Name') or 'another target'}"
+                + (f" with access {raw.get('Access')}" if raw.get("Access") else "")
+                + ". " + "; ".join(raw.get("risk_reasons") or ["high-risk handle relationship"])
+            ),
+            severity=severity,
+            techniques=["T1055"],
+            evidence={**evidence, **{k: v for k, v in raw.items() if k != "plugin"}},
+            source=f"event:{event.source}",
+        )
+        return severity
+
+    return None
+
+
+# Tokens too generic to correlate artifacts by name (platform/arch/installer noise).
+_CORR_TOKEN_STOP = {
+    "amd64", "x86", "x64", "arm64", "win32", "win64", "setup", "install",
+    "installer", "signed", "release", "windows", "microsoft", "update",
+    "service", "driver", "temp", "portable", "latest", "download",
+}
+
+
+def _corr_tokens(text: str) -> set[str]:
+    """Distinctive name tokens for cross-artifact correlation ('go-winpmem_amd64
+    _1.0-rc1_signed.exe' -> {'winpmem'})."""
+    return {
+        t for t in re.split(r"[^a-z0-9]+", (text or "").lower())
+        if len(t) >= 5 and not t.isdigit() and t not in _CORR_TOKEN_STOP
+    }
+
+
+_ZONE_HOST_URL_RE = re.compile(r"HostUrl=(\S+)", re.IGNORECASE)
+_ZONE_REFERRER_URL_RE = re.compile(r"ReferrerUrl=(\S+)", re.IGNORECASE)
+_DOWNLOAD_PAYLOAD_RE = re.compile(
+    r"\.(?:exe|msi|dll|sys|ps1|bat|cmd|vbs|js|scr|com|zip|7z|rar|gz|iso|cab)$",
+    re.IGNORECASE,
+)
+# A download older than this cannot credibly be "the origin" of a service install.
+_DOWNLOAD_CORRELATION_WINDOW_S = 72 * 3600
+
+# Generic installer/payload names too common to correlate on basename alone.
+_COMMON_DOWNLOAD_NAMES = {
+    "setup.exe", "install.exe", "installer.exe", "uninstall.exe", "update.exe",
+    "updater.exe", "download.exe", "file.exe", "tmp.exe", "temp.exe", "test.exe",
+    "new.exe", "main.exe", "run.exe", "start.exe", "launcher.exe", "app.exe",
+    "program.exe", "installer.msi", "setup.msi", "install.msi", "update.msi",
+}
+
+
+# File-path columns a download row may carry. FullPath/OSPath are what
+# Velociraptor's Windows.Detection.EvidenceOfDownload emits; the others cover
+# Zone.Identifier / KAPE / EVTX shapes. Only consulted once a row already looks
+# like download evidence (see _download_evidence), so generic file rows with a
+# FullPath are not mistaken for downloads.
+_DOWNLOAD_PATH_FIELDS = (
+    "DownloadedFilePath", "Download Path", "TargetPath", "FullPath", "OSPath",
+)
+# URL columns various download artifacts use for the origin.
+_DOWNLOAD_URL_FIELDS = (
+    "HostUrl", "DownloadUrl", "SourceUrl", "URL", "Url", "Uri", "ReferrerUrl", "Referrer",
+)
+
+
+def _download_origin(raw: dict[str, Any]) -> str | None:
+    """Origin URL of a download: a direct URL/Referrer column when present
+    (Velociraptor EvidenceOfDownload), else parsed from a Zone.Identifier blob."""
+    url = _field(raw, *_DOWNLOAD_URL_FIELDS)
+    if url:
+        return url[:300]
+    zone = str(raw.get("_ZoneIdentifierContent") or raw.get("ZoneIdentifierContent") or "")
+    m = _ZONE_HOST_URL_RE.search(zone) or _ZONE_REFERRER_URL_RE.search(zone)
+    return m.group(1)[:300] if m else None
+
+
+def _download_evidence(event: Event, raw: dict[str, Any]) -> tuple[str, str | None]:
+    """(path, origin_url) if a row is download-provenance evidence, else ('', None).
+
+    A row qualifies when its source names a download artifact, or it carries a
+    Zone.Identifier blob or a URL/Referrer column -- then the on-disk path is
+    taken from any of the download path columns. This recognizes Velociraptor
+    EvidenceOfDownload (FullPath + URL) as well as the older DownloadedFilePath
+    shape and raw Zone.Identifier rows.
+    """
+    source = (event.source or "").lower()
+    zone = raw.get("_ZoneIdentifierContent") or raw.get("ZoneIdentifierContent")
+    url = _field(raw, *_DOWNLOAD_URL_FIELDS)
+    if not ("download" in source or zone or url):
+        return "", None
+    path = _field(raw, *_DOWNLOAD_PATH_FIELDS)
+    if not path:
+        return "", None
+    return path, _download_origin(raw)
+
+
+def _event_needed_for_provenance(event: Event, raw: dict[str, Any]) -> bool:
+    eid = str(raw.get("EventID") or "")
+    if eid and _eid_channel_ok(raw, eid) and eid in {"11", "12", "13", "4697", "7045"}:
+        return True
+    if _download_evidence(event, raw)[0]:
+        return True
+    if _is_usn_journal_event(event, raw):
+        tokens = _usn_reason_tokens(raw)
+        # RENAME_OLD_NAME and FILE_DELETE are kept too, so download->execution
+        # provenance can follow a file across renames and notice a post-execution
+        # self-delete. They never become "artifacts" (that path only takes
+        # create/rename-new), so this only widens what provenance can correlate.
+        return bool(
+            tokens & {"FILE_CREATE", "RENAME_NEW_NAME", "RENAME_OLD_NAME", "FILE_DELETE"}
+            and _is_usn_executable_path(_usn_path(event, raw))
+        )
+    if _event_execution(raw, eid):
+        return True
+    return False
+
+
+def _artifact_path_key(path: str) -> str:
+    p = (path or "").strip().strip('"').replace("/", "\\")
+    p = re.sub(r"^\\\\\.\\", "", p)
+    p = re.sub(r"^\\\?\\", "", p)
+    return _normalize_path(p)
+
+
+def _artifact_match_confidence(artifact_path: str, exec_path: str) -> str | None:
+    if not artifact_path or not exec_path:
+        return None
+    artifact_key = _artifact_path_key(artifact_path)
+    exec_key = _artifact_path_key(exec_path)
+    if artifact_key and exec_key and artifact_key == exec_key:
+        return "exact-path"
+    if _basename(artifact_path) != _basename(exec_path):
+        return None
+    tokens = _corr_tokens(_basename(artifact_path))
+    if tokens and tokens & _corr_tokens(_basename(exec_path)):
+        return "distinctive-basename"
+    # Looser fallback: an identical basename that is not a generic installer name
+    # (short names like "rat.exe" carry no >=5-char distinctive token but are still
+    # a meaningful match). Bounded by the correlation time window and, for
+    # non-strong matches, the medium-severity gate at the call site.
+    base = _basename(artifact_path).lower()
+    if base and base not in _COMMON_DOWNLOAD_NAMES:
+        return "basename"
+    return None
+
+
+def _collect_file_artifacts(events: list[Event]) -> list[dict[str, Any]]:
+    artifacts: list[dict[str, Any]] = []
+    seen: set[tuple[int | None, str, str]] = set()
+    for event in events:
+        raw = event.raw or {}
+        path = ""
+        kind = ""
+        origin = None
+        dl_path, dl_origin = _download_evidence(event, raw)
+        if dl_path:
+            path = dl_path
+            kind = "download"
+            origin = dl_origin
+        elif _is_usn_journal_event(event, raw):
+            tokens = _usn_reason_tokens(raw)
+            if not (tokens & {"FILE_CREATE", "RENAME_NEW_NAME"}):
+                continue
+            path = _usn_path(event, raw)
+            kind = "USN rename" if "RENAME_NEW_NAME" in tokens else "USN create"
+            if not _is_user_writable_path(path):
+                continue
+        if not path:
+            continue
+        base = _basename(path)
+        if base in _PAIRING_GENERIC_HOSTS or not _DOWNLOAD_PAYLOAD_RE.search(base):
+            continue
+        key = (event.id, kind, _artifact_path_key(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        artifacts.append({
+            "event": event,
+            "path": path,
+            "base": base,
+            "kind": kind,
+            "origin": origin,
+            "host": event.host,
+        })
+    return artifacts
+
+
+def _collect_usn_renames(events: list[Event]) -> list[dict[str, Any]]:
+    """Pair RENAME_OLD_NAME/RENAME_NEW_NAME USN rows (by FileReferenceNumber) so a
+    downloaded file can be followed to the name/path it was executed under."""
+    old_by_ref: dict[str, Event] = {}
+    fallback_old: list[Event] = []
+    renames: list[dict[str, Any]] = []
+
+    def sort_key(event: Event) -> tuple[str, int]:
+        return (event.timestamp.isoformat() if event.timestamp else "", event.id or 0)
+
+    for event in sorted(events, key=sort_key):
+        raw = event.raw or {}
+        if not _is_usn_journal_event(event, raw):
+            continue
+        tokens = _usn_reason_tokens(raw)
+        if not (tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}):
+            continue
+        ref = _usn_file_reference(raw)
+        path = _usn_path(event, raw)
+        if "RENAME_OLD_NAME" in tokens:
+            if ref:
+                old_by_ref[ref] = event
+            elif len(fallback_old) < 200:
+                fallback_old.append(event)
+            continue
+        old_event = old_by_ref.get(ref) if ref else (fallback_old.pop() if fallback_old else None)
+        if old_event is None:
+            continue
+        old_path = _usn_path(old_event, old_event.raw or {})
+        if not path or not old_path:
+            continue
+        renames.append({
+            "old_path": old_path, "old_base": _basename(old_path),
+            "new_path": path, "new_base": _basename(path),
+            "frn": ref, "timestamp": event.timestamp, "event": event,
+        })
+    return renames
+
+
+def _collect_usn_deletes(events: list[Event]) -> list[dict[str, Any]]:
+    """FILE_DELETE USN rows for executable/script paths, to spot a file removed
+    after it was executed (cleanup / anti-forensics)."""
+    deletes: list[dict[str, Any]] = []
+    for event in events:
+        raw = event.raw or {}
+        if not _is_usn_journal_event(event, raw):
+            continue
+        if "FILE_DELETE" not in _usn_reason_tokens(raw):
+            continue
+        path = _usn_path(event, raw)
+        if not path:
+            continue
+        deletes.append({
+            "path": path, "base": _basename(path),
+            "frn": _usn_file_reference(raw), "timestamp": event.timestamp, "event": event,
+        })
+    return deletes
+
+
+def _collect_defender_renames(events: list[Event]) -> list[dict[str, Any]]:
+    """Defender DeviceFileEvents FileRenamed rows carry old+new paths in a single
+    row (unlike the two-row USN journal), so pair them directly. Returns the same
+    dict shape as _collect_usn_renames; gated on Defender file rows only, so the
+    USN rename path is untouched."""
+    renames: list[dict[str, Any]] = []
+    for event in events:
+        raw = event.raw or {}
+        if raw.get("_defender_table") != "devicefileevents":
+            continue
+        if "RENAME_NEW_NAME" not in _usn_reason_tokens(raw):
+            continue
+        old_path = str(raw.get("PreviousFileFullPath") or "").strip()
+        new_path = _usn_path(event, raw)
+        if not old_path or not new_path:
+            continue
+        renames.append({
+            "old_path": old_path, "old_base": _basename(old_path),
+            "new_path": new_path, "new_base": _basename(new_path),
+            "frn": _usn_file_reference(raw), "timestamp": event.timestamp, "event": event,
+        })
+    return renames
+
+
+def _candidate_event_in_window(candidate: dict[str, Any], ts: datetime | None) -> bool:
+    start = candidate["event"].timestamp
+    if not start or not ts:
+        return True
+    gap = (_aware(ts) - _aware(start)).total_seconds()
+    return 0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S
+
+
+def _segment_active_at(segment: dict[str, Any], ts: datetime | None) -> bool:
+    if not ts:
+        return True
+    ats = _aware(ts)
+    if segment["start"] and ats < _aware(segment["start"]):
+        return False
+    if segment["end"] and ats > _aware(segment["end"]):
+        return False
+    return True
+
+
+def _candidate_matches_rename(candidate: dict[str, Any], rn: dict[str, Any]) -> bool:
+    if candidate.get("frn") and rn.get("frn") and candidate["frn"] == rn["frn"]:
+        return True
+    current = candidate["segments"][-1]
+    old_key = _artifact_path_key(rn["old_path"])
+    current_key = _artifact_path_key(current["path"])
+    if old_key and current_key and old_key == current_key:
+        return True
+    base = rn["old_base"]
+    return (
+        not candidate.get("frn")
+        and base == current["base"]
+        and base not in _COMMON_DOWNLOAD_NAMES
+        and base not in _PAIRING_GENERIC_HOSTS
+    )
+
+
+def _candidate_matches_delete(candidate: dict[str, Any], delete: dict[str, Any]) -> bool:
+    if candidate.get("frn") and delete.get("frn") and candidate["frn"] == delete["frn"]:
+        return True
+    delete_key = _artifact_path_key(delete["path"])
+    for segment in candidate["segments"]:
+        segment_key = _artifact_path_key(segment["path"])
+        if (
+            delete_key
+            and segment_key
+            and delete_key == segment_key
+            and _segment_active_at(segment, delete["timestamp"])
+        ):
+            return True
+    current = candidate["segments"][-1]
+    return (
+        not candidate.get("frn")
+        and delete["base"] == current["base"]
+        and delete["base"] not in _COMMON_DOWNLOAD_NAMES
+        and delete["base"] not in _PAIRING_GENERIC_HOSTS
+    )
+
+
+def _artifact_lifecycles(
+    artifacts: list[dict[str, Any]],
+    renames: list[dict[str, Any]],
+    deletes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Advance each artifact through USN rename/delete state until execution."""
+    candidates: list[dict[str, Any]] = []
+    for idx, artifact in enumerate(artifacts):
+        candidates.append({
+            **artifact,
+            "_lifecycle_index": idx,
+            "frn": None,
+            "renames": [],
+            "deletes": [],
+            "segments": [{
+                "path": artifact["path"],
+                "base": artifact["base"],
+                "start": artifact["event"].timestamp,
+                "end": None,
+            }],
+        })
+
+    by_frn: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_current_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_current_base: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_segment_path: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    def add_index(index: dict[str, list[dict[str, Any]]], key: str, candidate: dict[str, Any]) -> None:
+        if key:
+            index[key].append(candidate)
+
+    def remove_index(index: dict[str, list[dict[str, Any]]], key: str, candidate: dict[str, Any]) -> None:
+        if not key:
+            return
+        bucket = index.get(key)
+        if not bucket:
+            return
+        try:
+            bucket.remove(candidate)
+        except ValueError:
+            return
+        if not bucket:
+            index.pop(key, None)
+
+    def current_path_key(candidate: dict[str, Any]) -> str:
+        return _artifact_path_key(candidate["segments"][-1]["path"])
+
+    def current_base(candidate: dict[str, Any]) -> str:
+        return candidate["segments"][-1]["base"]
+
+    def index_candidate(candidate: dict[str, Any]) -> None:
+        add_index(by_frn, candidate.get("frn") or "", candidate)
+        add_index(by_current_path, current_path_key(candidate), candidate)
+        add_index(by_current_base, current_base(candidate), candidate)
+        add_index(by_segment_path, current_path_key(candidate), candidate)
+
+    def unindex_current_candidate(candidate: dict[str, Any]) -> None:
+        remove_index(by_frn, candidate.get("frn") or "", candidate)
+        remove_index(by_current_path, current_path_key(candidate), candidate)
+        remove_index(by_current_base, current_base(candidate), candidate)
+
+    def matching_candidates(*buckets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[int] = set()
+        matches: list[dict[str, Any]] = []
+        for bucket in buckets:
+            for candidate in bucket:
+                cid = candidate["_lifecycle_index"]
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                matches.append(candidate)
+        matches.sort(key=lambda c: c["_lifecycle_index"])
+        return matches
+
+    for candidate in candidates:
+        index_candidate(candidate)
+
+    for rn in sorted(
+        renames,
+        key=lambda r: (r["timestamp"].isoformat() if r["timestamp"] else "", r["event"].id or 0),
+    ):
+        old_key = _artifact_path_key(rn["old_path"])
+        candidate_pool = matching_candidates(
+            by_frn.get(rn.get("frn") or "", []),
+            by_current_path.get(old_key, []),
+            by_current_base.get(rn["old_base"], []),
+        )
+        for candidate in candidate_pool:
+            if not _candidate_event_in_window(candidate, rn["timestamp"]):
+                continue
+            if not _candidate_matches_rename(candidate, rn):
+                continue
+            unindex_current_candidate(candidate)
+            candidate["frn"] = candidate.get("frn") or rn.get("frn") or None
+            candidate["renames"].append(rn)
+            candidate["segments"][-1]["end"] = rn["timestamp"]
+            candidate["segments"].append({
+                "path": rn["new_path"],
+                "base": rn["new_base"],
+                "start": rn["timestamp"],
+                "end": None,
+            })
+            index_candidate(candidate)
+
+    for delete in sorted(
+        deletes,
+        key=lambda d: (d["timestamp"].isoformat() if d["timestamp"] else "", d["event"].id or 0),
+    ):
+        delete_key = _artifact_path_key(delete["path"])
+        candidate_pool = matching_candidates(
+            by_frn.get(delete.get("frn") or "", []),
+            by_segment_path.get(delete_key, []),
+            by_current_base.get(delete["base"], []),
+        )
+        for candidate in candidate_pool:
+            if not _candidate_event_in_window(candidate, delete["timestamp"]):
+                continue
+            if _candidate_matches_delete(candidate, delete):
+                old_frn = candidate.get("frn") or ""
+                candidate["frn"] = candidate.get("frn") or delete.get("frn") or None
+                if candidate.get("frn") and not old_frn:
+                    add_index(by_frn, candidate["frn"], candidate)
+                candidate["deletes"].append(delete)
+    return candidates
+
+
+def _execution_candidates(events: list[Event], processes: list[Process]) -> dict[str, list[dict[str, Any]]]:
+    executions_by_base: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen_exec: set[tuple[str, int | None, str]] = set()
+
+    for proc in processes:
+        exec_path = proc.path or proc.name or ""
+        if not exec_path or _basename(exec_path) in _PAIRING_GENERIC_HOSTS:
+            continue
+        key = (proc.session_id, proc.pid, _artifact_path_key(exec_path) or _basename(exec_path))
+        if key in seen_exec:
+            continue
+        seen_exec.add(key)
+        entry = {
+            "path": exec_path,
+            "base": _basename(exec_path),
+            "timestamp": proc.start_time,
+            "severity": proc.severity,
+            "pid": proc.pid,
+            "process": proc.name,
+            "cmdline": proc.cmdline,
+            "session_id": proc.session_id,
+            "host": (proc.extra or {}).get("host"),
+            "event": None,
+        }
+        executions_by_base[entry["base"]].append(entry)
+
+    for event in events:
+        raw = event.raw or {}
+        execution_info = _event_execution(raw, str(raw.get("EventID") or ""))
+        if not execution_info:
+            continue
+        image, cmdline = execution_info
+        if not image or _basename(image) in _PAIRING_GENERIC_HOSTS:
+            continue
+        key = ("event", event.id, _artifact_path_key(image) or _basename(image))
+        if key in seen_exec:
+            continue
+        seen_exec.add(key)
+        entry = {
+            "path": image,
+            "base": _basename(image),
+            "timestamp": event.timestamp,
+            "severity": event.severity,
+            "pid": _field(raw, "ProcessId", "NewProcessId") or None,
+            "process": _basename(image),
+            "cmdline": cmdline,
+            "session_id": None,
+            "host": event.host,
+            "event": event,
+        }
+        executions_by_base[entry["base"]].append(entry)
+
+    return executions_by_base
+
+
+def _match_candidate_execution(
+    candidate: dict[str, Any],
+    executions_by_base: dict[str, list[dict[str, Any]]],
+) -> tuple[float, str, dict[str, Any], int] | None:
+    artifact_ts = candidate["event"].timestamp
+    artifact_host = candidate.get("host")
+    best: tuple[float, str, dict[str, Any], int] | None = None
+    best_score: float | None = None
+    for segment_index, segment in enumerate(candidate["segments"]):
+        for execution in executions_by_base.get(segment["base"], []):
+            # Multi-host sources (e.g. Defender) must not link a download on one
+            # device to a same-named execution on another. Only enforced when both
+            # hosts are known, so single-host collections are unaffected.
+            exec_host = execution.get("host")
+            if artifact_host and exec_host and artifact_host != exec_host:
+                continue
+            confidence = _artifact_match_confidence(segment["path"], execution["path"])
+            if not confidence:
+                continue
+            if not _segment_active_at(segment, execution["timestamp"]):
+                continue
+            if artifact_ts and execution["timestamp"]:
+                gap = (_aware(execution["timestamp"]) - _aware(artifact_ts)).total_seconds()
+                if not (0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S):
+                    continue
+            else:
+                gap = _DOWNLOAD_CORRELATION_WINDOW_S
+            rank = 0 if confidence == "exact-path" else 1
+            # Prefer exact-path matches (rank 0) over basename matches, and the
+            # smallest time gap within a rank. Compare against the stored best's
+            # *score*, not its bare gap -- mixing the two lets a large window
+            # constant pin selection to whichever candidate happened to be seen
+            # first (an exact-path hit could never displace an earlier basename).
+            score = gap + (rank * _DOWNLOAD_CORRELATION_WINDOW_S)
+            if best_score is None or score < best_score:
+                best = (gap, confidence, execution, segment_index)
+                best_score = score
+    return best
+
+
+def _candidate_delete_after(candidate: dict[str, Any], execution: dict[str, Any]) -> dict[str, Any] | None:
+    if not execution["timestamp"]:
+        return None
+    exec_ts = _aware(execution["timestamp"])
+    after = [
+        d for d in candidate["deletes"]
+        if d["timestamp"] and _aware(d["timestamp"]) > exec_ts
+    ]
+    after.sort(key=lambda d: (_aware(d["timestamp"]), d["event"].id or 0))
+    return after[0] if after else None
+
+
+def _correlate_file_execution_provenance(
+    session,
+    existing: set[tuple[str, str]],
+    events: list[Event],
+    processes: list[Process],
+) -> None:
+    artifacts = _collect_file_artifacts(events)
+    if not artifacts:
+        return
+    executions_by_base = _execution_candidates(events, processes)
+    renames = _collect_usn_renames(events) + _collect_defender_renames(events)
+    deletes = _collect_usn_deletes(events)
+    candidates = _artifact_lifecycles(artifacts, renames, deletes)
+
+    for artifact in candidates:
+        event = artifact["event"]
+        best = _match_candidate_execution(artifact, executions_by_base)
+        if not best:
+            continue
+        gap, confidence, execution, segment_index = best
+        rename_chain = artifact["renames"][:segment_index]
+        del_rec = _candidate_delete_after(artifact, execution)
+
+        exec_rank = SEVERITY_RANK.get(execution["severity"], 0)
+        artifact_rank = SEVERITY_RANK.get(event.severity, 0)
+        # A rename-before-execution or a delete-after-execution is itself strong
+        # evidence, so (like an exact-path match) it bypasses the low-severity gate.
+        strong = confidence == "exact-path" or bool(rename_chain) or del_rec is not None
+        # A browser/download provenance row with a URL plus the same non-generic
+        # executable basename is also enough context to keep for analyst review.
+        if (
+            artifact["kind"] == "download"
+            and artifact["origin"]
+            and confidence in {"distinctive-basename", "basename"}
+        ):
+            strong = True
+        if not strong and max(exec_rank, artifact_rank) < SEVERITY_RANK["medium"]:
+            continue
+        severity = "high" if max(exec_rank, artifact_rank) >= SEVERITY_RANK["high"] else "medium"
+        gap_txt = "unknown time after" if gap == _DOWNLOAD_CORRELATION_WINDOW_S else (
+            f"{gap/60:.0f} minutes after" if gap < 5400 else f"{gap/3600:.1f} hours after"
+        )
+        match_confidence = "usn-rename-chain" if rename_chain else confidence
+
+        # Entity-map edges: URL -> downloaded file -> (renamed file) -> process,
+        # and a "then deleted" edge when the file was removed post-execution.
+        # Basenames are used so file/process nodes coincide with process-table nodes.
+        exec_base = execution["base"]
+        chain_edges: list[dict[str, str]] = []
+        if artifact["origin"]:
+            chain_edges.append({
+                "src_type": "url", "src": artifact["origin"],
+                "verb": "served", "dst_type": "file", "dst": artifact["base"],
+            })
+        prev_base = artifact["base"]
+        for rn in rename_chain:
+            chain_edges.append({
+                "src_type": "file", "src": prev_base,
+                "verb": "renamed to", "dst_type": "file", "dst": rn["new_base"],
+            })
+            prev_base = rn["new_base"]
+        if rename_chain:
+            chain_edges.append({
+                "src_type": "file", "src": prev_base,
+                "verb": "later executed", "dst_type": "process", "dst": exec_base,
+            })
+        else:
+            chain_edges.append({
+                "src_type": "file", "src": artifact["base"],
+                "verb": f"{artifact['kind']}, later executed",
+                "dst_type": "process", "dst": exec_base,
+            })
+        if del_rec:
+            chain_edges.append({
+                "src_type": "process", "src": exec_base,
+                "verb": "then deleted", "dst_type": "file", "dst": del_rec["base"],
+            })
+
+        description = (
+            f"A {artifact['kind']} artifact ({artifact['path'][:300]}) was later executed as "
+            f"{execution['path'][:300]} ({gap_txt} the artifact timestamp). Match confidence: "
+            f"{match_confidence}."
+        )
+        if rename_chain:
+            rename_summary = "; ".join(
+                f"{rn['old_path'][:120]} -> {rn['new_path'][:120]}"
+                for rn in rename_chain[:4]
+            )
+            description += (
+                f" The NTFS $UsnJrnl:$J journal tracks the same candidate through "
+                f"{len(rename_chain)} rename(s) before execution: {rename_summary}."
+            )
+        if del_rec:
+            ddesc = "shortly"
+            if del_rec["timestamp"] and execution["timestamp"]:
+                dgap = (_aware(del_rec["timestamp"]) - _aware(execution["timestamp"])).total_seconds()
+                ddesc = f"{dgap/60:.0f} minutes" if dgap < 5400 else f"{dgap/3600:.1f} hours"
+            description += (
+                f" The file was then deleted (per $J) {ddesc} after execution -- consistent with "
+                "cleanup / anti-forensics."
+            )
+        description += (
+            " This links filesystem/download evidence to execution, but still requires analyst "
+            "review for expected installers, developer tooling, or admin utilities."
+        )
+
+        _add_finding(
+            session,
+            existing,
+            title=f"File artifact later executed: {artifact['base']}"
+            + (" (renamed)" if rename_chain else "") + (" then deleted" if del_rec else ""),
+            description=description,
+            severity=severity,
+            techniques=["T1204", "T1105"] + (["T1036.003"] if rename_chain else []) + (["T1070.004"] if del_rec else []),
+            evidence={
+                "entity": execution["path"],
+                "artifact_path": artifact["path"][:700],
+                "artifact_kind": artifact["kind"],
+                "artifact_event_id": event.id,
+                "execution_path": execution["path"][:700],
+                "execution_pid": execution["pid"],
+                "execution_session_id": execution["session_id"],
+                "execution_event_id": execution["event"].id if execution["event"] else None,
+                "match_confidence": match_confidence,
+                "gap_seconds": None if gap == _DOWNLOAD_CORRELATION_WINDOW_S else round(gap, 1),
+                "origin_url": artifact["origin"],
+                "renamed_from": rename_chain[0]["old_path"][:700] if rename_chain else None,
+                "renamed_to": rename_chain[-1]["new_path"][:700] if rename_chain else None,
+                "rename_chain": [
+                    {
+                        "old_path": rn["old_path"][:700],
+                        "new_path": rn["new_path"][:700],
+                        "file_reference": rn["frn"] or None,
+                        "event_id": rn["event"].id,
+                    }
+                    for rn in rename_chain
+                ],
+                "file_reference": artifact.get("frn") or None,
+                "deleted_after_execution": bool(del_rec),
+                "delete_event_id": del_rec["event"].id if del_rec else None,
+                "chain_edges": chain_edges,
+            },
+            source="correlation",
+        )
+        _escalate_event(
+            session,
+            event,
+            severity,
+            f"Correlated: {artifact['kind']} artifact later executed as {execution['base']}"
+            + (" (via USN rename)" if rename_chain else "")
+            + ("; file deleted afterwards" if del_rec else ""),
+        )
+        for rn in rename_chain:
+            _escalate_event(
+                session, rn["event"], severity,
+                f"Correlated: USN rename of downloaded file to {rn['new_base']} before execution",
+            )
+        if del_rec:
+            _escalate_event(
+                session, del_rec["event"], severity,
+                f"Correlated: {execution['base']} deleted after execution (cleanup / anti-forensics)",
+            )
+        if execution["event"] is not None:
+            _escalate_event(
+                session,
+                execution["event"],
+                severity,
+                f"Correlated: process execution matched prior {artifact['kind']} artifact",
+            )
+
+
+def _correlate_service_provenance(
+    session,
+    existing: set[tuple[str, str]],
+    events: list[Event],
+    processes: list[Process],
+) -> None:
+    """Trace each installed service back to its origin: the process that dropped
+    the binary, the process that registered/installed it, and the download the
+    binary most plausibly came from. Emits one finding per service with the full
+    chain, and records the chain as graph edges for the entity map."""
+    # --- group service installs by service name ---
+    installs: dict[str, dict[str, Any]] = {}
+    # --- correlation source indexes ---
+    downloads: list[tuple[Event, str, set[str]]] = []  # (event, path, tokens)
+    # basename -> (event, creator/provenance label, source label)
+    file_creates: dict[str, list[tuple[Event, str, str]]] = defaultdict(list)
+    reg_writes: list[tuple[Event, str, str]] = []  # (event, target_object_lower, writer image)
+    proc_creates: list[tuple[Event, str, str]] = []  # (event, image, cmdline)
+
+    for e in events:
+        raw = e.raw or {}
+        eid = str(raw.get("EventID") or "")
+        if eid and not _eid_channel_ok(raw, eid):
+            continue
+        if eid in ("7045", "4697"):
+            svc = _field(raw, "ServiceName", "Service Name").strip()
+            if not svc:
+                continue
+            slot = installs.setdefault(svc.lower(), {
+                "name": svc, "events": [], "images": [], "client_pids": set(),
+            })
+            slot["events"].append(e)
+            image = _field(raw, "ImagePath", "Image Path", "ServiceFileName", "PathName")
+            if image and image not in slot["images"]:
+                slot["images"].append(image)
+            client_pid = _parse_access_mask(_field(raw, "ClientProcessId")) if eid == "4697" else None
+            if client_pid:
+                slot["client_pids"].add(client_pid)
+            continue
+        dl_path, _dl_origin = _download_evidence(e, raw)
+        if dl_path:
+            base = _basename(dl_path)
+            # Only executable/archive downloads can plausibly originate a service;
+            # media/source files sharing a vendor token are coincidence.
+            if _DOWNLOAD_PAYLOAD_RE.search(base):
+                downloads.append((e, dl_path, _corr_tokens(base)))
+            continue
+        if _is_usn_journal_event(e, raw):
+            tokens = _usn_reason_tokens(raw)
+            usn_path = _usn_path(e, raw)
+            usn_base = _basename(usn_path)
+            if (
+                usn_path
+                and _DOWNLOAD_PAYLOAD_RE.search(usn_base)
+                and (tokens & {"FILE_CREATE", "RENAME_NEW_NAME"})
+            ):
+                file_creates[usn_base].append((e, "NTFS $J journal", "USN journal"))
+            continue
+        if eid == "11":
+            target = _field(raw, "TargetFilename", "Target Filename")
+            if target:
+                file_creates[_basename(target)].append((e, _field(raw, "Image"), "Sysmon file-create"))
+        elif eid in ("12", "13"):
+            target = _field(raw, "TargetObject").lower()
+            if "\\services\\" in target:
+                reg_writes.append((e, target, _field(raw, "Image")))
+        elif eid in ("1", "4688"):
+            image = _field(raw, "Image", "NewProcessName")
+            if image:
+                proc_creates.append((e, image, _field(raw, "CommandLine", "Cmdline")))
+
+    if not installs:
+        return
+
+    proc_by_pid: dict[int, Process] = {}
+    for p in processes:
+        proc_by_pid.setdefault(p.pid, p)
+
+    for key, slot in installs.items():
+        svc_events: list[Event] = slot["events"]
+        times = sorted(e.timestamp for e in svc_events if e.timestamp)
+        first_ts = _aware(times[0]) if times else None
+        svc_tokens = _corr_tokens(slot["name"])
+        for img in slot["images"]:
+            svc_tokens |= _corr_tokens(_basename(_first_exe_token(img)))
+        chain_bits: list[str] = []
+        chain_edges: list[dict[str, str]] = []
+        correlated_ids: list[int] = []
+        install_sev = max(
+            (e.severity for e in svc_events),
+            key=lambda s: SEVERITY_RANK.get(s, 0), default="medium",
+        )
+
+        # 1. dropper: who wrote the service binary to disk (Sysmon 11)
+        droppers: dict[str, list[str]] = defaultdict(list)
+        dropper_sources: dict[str, set[str]] = defaultdict(set)
+        for img in slot["images"]:
+            base = _basename(_first_exe_token(img))
+            for fc_event, creator, source_label in file_creates.get(base, []):
+                if creator and _basename(creator) != "system":
+                    droppers[creator].append(base)
+                    dropper_sources[creator].add(source_label)
+                    correlated_ids.append(fc_event.id)
+        for creator, bases in list(droppers.items())[:3]:
+            source_txt = ", ".join(sorted(dropper_sources.get(creator) or {"file telemetry"}))
+            chain_bits.append(
+                f"the service binary ({', '.join(sorted(set(bases))[:3])}) was written to disk "
+                f"by/observed through {creator} ({source_txt})"
+            )
+            chain_edges.append({
+                "src_type": "process", "src": creator,
+                "verb": "dropped binary for", "dst_type": "service", "dst": slot["name"],
+            })
+
+        # 2. registry writer on the service key (excluding services.exe, which is
+        # the SCM acting on behalf of the real caller and carries no attribution)
+        for rw_event, target, writer in reg_writes:
+            if f"\\services\\{key}" in target and writer and _basename(writer) != "services.exe":
+                chain_bits.append(f"its registry key was written by {writer}")
+                chain_edges.append({
+                    "src_type": "process", "src": writer,
+                    "verb": "registered", "dst_type": "service", "dst": slot["name"],
+                })
+                correlated_ids.append(rw_event.id)
+                break
+
+        # 3. installer process: 4697 names the client PID directly; otherwise the
+        # nearest earlier process creation sharing a distinctive name token
+        for pid in sorted(slot["client_pids"])[:3]:
+            p = proc_by_pid.get(pid)
+            if p:
+                chain_bits.append(
+                    f"installed by {p.name} (pid {pid}, per Event 4697 ClientProcessId)"
+                )
+                chain_edges.append({
+                    "src_type": "process", "src": p.path or p.name,
+                    "verb": "installed", "dst_type": "service", "dst": slot["name"],
+                })
+        if svc_tokens and not slot["client_pids"]:
+            best: tuple[float, Event, str, str] | None = None
+            for pc_event, image, cmdline in proc_creates:
+                if not pc_event.timestamp or not first_ts:
+                    continue
+                gap = (first_ts - _aware(pc_event.timestamp)).total_seconds()
+                if not (0 <= gap <= 3600):
+                    continue
+                if svc_tokens & (_corr_tokens(_basename(image)) | _corr_tokens(cmdline)):
+                    if best is None or gap < best[0]:
+                        best = (gap, pc_event, image, cmdline)
+            if best:
+                gap, pc_event, image, cmdline = best
+                parent = _field(pc_event.raw or {}, "ParentImage", "ParentProcessName")
+                chain = (f"{_basename(parent)} -> " if parent else "") + _basename(image)
+                chain_bits.append(
+                    f"likely initiated by {chain} started {gap:.0f}s before the install"
+                    + (f" (cmdline: {cmdline[:160]})" if cmdline else "")
+                )
+                chain_edges.append({
+                    "src_type": "process", "src": image,
+                    "verb": "installed", "dst_type": "service", "dst": slot["name"],
+                })
+                correlated_ids.append(pc_event.id)
+
+        # 4. origin download: name-token match on downloaded files preceding install
+        dl_match: tuple[float, Event, str] | None = None
+        for dl_event, dl_path, dl_tokens in downloads:
+            if not (svc_tokens & dl_tokens):
+                continue
+            if not (first_ts and dl_event.timestamp):
+                continue
+            gap = (first_ts - _aware(dl_event.timestamp)).total_seconds()
+            if not (0 <= gap <= _DOWNLOAD_CORRELATION_WINDOW_S):
+                continue
+            if dl_match is None or gap < dl_match[0]:
+                dl_match = (gap, dl_event, dl_path)
+        if dl_match:
+            gap, dl_event, dl_path = dl_match
+            origin = _download_origin(dl_event.raw or {})
+            gap_txt = f"{gap/60:.0f} minutes" if gap < 5400 else f"{gap/3600:.1f} hours"
+            chain_bits.append(
+                f"the matching file {_basename(dl_path)} was downloaded {gap_txt} before "
+                f"the first install"
+                + (f" from {origin}" if origin else "")
+            )
+            chain_edges.append({
+                "src_type": "file", "src": dl_path.lstrip("\\\\.\\"),
+                "verb": "origin of", "dst_type": "service", "dst": slot["name"],
+            })
+            correlated_ids.append(dl_event.id)
+            _escalate_event(
+                session, dl_event, install_sev,
+                f"Correlated: this download ({_basename(dl_path)}) is the likely origin of "
+                f"service '{slot['name']}', first installed {gap_txt} later"
+                + (f"; source URL {origin}" if origin else ""),
+            )
+
+        if not chain_bits:
+            continue
+
+        span = ""
+        if times:
+            span = f" between {times[0].isoformat()} and {times[-1].isoformat()}" if len(times) > 1 else f" at {times[0].isoformat()}"
+        _add_finding(
+            session, existing,
+            title=f"Service provenance traced: {slot['name']}",
+            description=(
+                f"Service '{slot['name']}' was installed {len(svc_events)} time(s){span} "
+                f"(image(s): {'; '.join(slot['images'][:4])}). Provenance correlation: "
+                + "; ".join(chain_bits) + "."
+            ),
+            severity=install_sev,
+            techniques=["T1543.003", "T1105"],
+            evidence={
+                "entity": slot["name"],
+                "service_name": slot["name"],
+                "install_count": len(svc_events),
+                "image_paths": slot["images"][:8],
+                "chain": chain_bits,
+                "chain_edges": chain_edges,
+                "correlated_event_ids": correlated_ids[:20],
+            },
+            source="correlation",
+        )
+
+
+# Prefix marking severities set by the taint-propagation pass. Events carrying it
+# never become taint *sources* on later runs, so severity cannot cascade
+# name-by-name across the whole case.
+_PROPAGATION_MARKER = "Flagged-entity match"
+_FILE_TOKEN_RE = re.compile(
+    r"[\w][\w\-.]{2,80}\.(?:exe|dll|sys|ps1|bat|cmd|vbs|js|scr|com)\b", re.IGNORECASE
+)
+
+
+def _taint_matches_in_value(value: Any, pattern: re.Pattern[str], max_rank: int,
+                            tainted: dict[str, tuple[int, str]]) -> set[str]:
+    matches: set[str] = set()
+
+    def visit(v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, str):
+            matches.update(m.lower() for m in pattern.findall(v))
+        elif isinstance(v, dict):
+            for k, child in v.items():
+                if visit(k) or visit(child):
+                    return True
+        elif isinstance(v, (list, tuple)):
+            for child in v:
+                if visit(child):
+                    return True
+        else:
+            return False
+        return bool(matches) and max(tainted[m][0] for m in matches) >= max_rank
+
+    visit(value)
+    return matches
+
+
+def _taint_candidate_events(session, names: list[str]):
+    raw_text = cast(Event.raw, Text)
+    seen: set[int] = set()
+    chunk_size = 20
+    for i in range(0, len(names), chunk_size):
+        conditions = []
+        for name in names[i:i + chunk_size]:
+            like = f"%{name}%"
+            conditions.extend([
+                Event.summary.like(like),
+                Event.entity.like(like),
+                raw_text.like(like),
+            ])
+        for event in session.scalars(
+            select(Event)
+            .where(or_(*conditions))
+            .execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)
+        ):
+            if event.id in seen:
+                continue
+            seen.add(event.id)
+            yield event
+
+
+def _propagate_flagged_entities(session, events: list[Event] | None, processes: list[Process]) -> int:
+    """Severity taint propagation across the case timeline.
+
+    Collects every process/DLL/file name that anything already flagged low or
+    above (the process table, memory-analysis results, or detection-escalated
+    events), then raises any event that mentions one of those names to the same
+    severity, recording on the event where the severity came from.
+    """
+    tainted: dict[str, tuple[int, str]] = {}  # basename -> (severity rank, origin text)
+
+    def taint(name: str, severity: str, origin: str) -> None:
+        base = _basename(name)
+        rank = SEVERITY_RANK.get(severity, 0)
+        # Generic host binaries (powershell/cmd/svchost/...) appear in nearly every
+        # event; propagating on their name alone would repaint the entire timeline.
+        if not base or len(base) < 4 or base in _PAIRING_GENERIC_HOSTS:
+            return
+        if rank < SEVERITY_RANK["low"]:
+            return
+        cur = tainted.get(base)
+        if cur is None or rank > cur[0]:
+            tainted[base] = (rank, origin)
+
+    for p in processes:
+        if SEVERITY_RANK.get(p.severity, 0) < SEVERITY_RANK["low"]:
+            continue
+        flags = ", ".join(p.flags or []) or "no flags recorded"
+        origin = (
+            f"process {p.name} (pid {p.pid}) was flagged {p.severity} "
+            f"by process/memory detections ({flags})"
+        )
+        taint(p.name or "", p.severity, origin)
+        taint(_basename(_normalize_path(p.path or "")), p.severity, origin)
+
+    for r in session.scalars(
+        select(MemoryResult).where(MemoryResult.severity.in_(["low", "medium", "high", "critical"]))
+    ):
+        summary = (r.summary or "")[:160]
+        pid_part = f" (pid {r.pid})" if r.pid is not None else ""
+        if r.process_name:
+            taint(
+                r.process_name, r.severity,
+                f"memory analysis ({r.plugin}) flagged process "
+                f"{r.process_name}{pid_part} as {r.severity}: {summary}",
+            )
+        for tok in set(_FILE_TOKEN_RE.findall(r.summary or "")):
+            taint(
+                tok, r.severity,
+                f"memory analysis ({r.plugin}) flagged {r.severity} activity "
+                f"referencing {_basename(tok)}{pid_part}: {summary}",
+            )
+
+    source_events = events
+    if source_events is None:
+        source_events = list(session.scalars(
+            select(Event)
+            .where(Event.severity.in_(["low", "medium", "high", "critical"]))
+            .execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)
+        ))
+
+    for e in source_events:
+        if SEVERITY_RANK.get(e.severity, 0) < SEVERITY_RANK["low"]:
+            continue
+        if (e.severity_reason or "").startswith(_PROPAGATION_MARKER):
+            continue
+        for tok in set(_FILE_TOKEN_RE.findall(e.entity or "")):
+            taint(
+                tok, e.severity,
+                f"a {e.severity}-severity event from {e.source} involved "
+                f"{_basename(tok)}: {(e.summary or '')[:140]}",
+            )
+
+    if not tainted:
+        return 0
+
+    names = sorted(tainted, key=len, reverse=True)
+    max_taint_rank = max(rank for rank, _origin in tainted.values())
+    pattern = re.compile(
+        r"(?<![\w-])(?:" + "|".join(re.escape(n) for n in names) + r")(?![\w-])",
+        re.IGNORECASE,
+    )
+    changed = 0
+    target_events = events if events is not None else _taint_candidate_events(session, names)
+    for e in target_events:
+        matches = _taint_matches_in_value(
+            [e.summary, e.entity],
+            pattern,
+            max_taint_rank,
+            tainted,
+        )
+        if not matches or max(tainted[m][0] for m in matches) < max_taint_rank:
+            matches.update(_taint_matches_in_value(e.raw or {}, pattern, max_taint_rank, tainted))
+        if not matches:
+            continue
+        best = max(matches, key=lambda n: tainted[n][0])
+        rank, origin = tainted[best]
+        if rank <= SEVERITY_RANK.get(e.severity, 0):
+            continue
+        others = sorted(matches - {best})
+        reason = f"{_PROPAGATION_MARKER}: this event references '{best}' — {origin}"
+        if others:
+            reason += f" (also references flagged: {', '.join(others[:4])})"
+        _escalate_event(session, e, _RANK_TO_SEVERITY[rank], reason)
+        changed += 1
+    return changed
+
+
+_CORROBORATION_CAP = SEVERITY_RANK["high"]
+
+
+def _finding_entity_tokens(f: Finding) -> set[str]:
+    """Entity tokens a finding concerns: distinctive basenames + a pid key.
+
+    Generic host binaries (svchost/cmd/powershell/...) and very short names are
+    excluded so corroboration links on a *specific* implant/file/service, not on
+    a name that appears everywhere.
+    """
+    ev = f.evidence or {}
+    tokens: set[str] = set()
+    for key in ("entity", "image_path", "path", "normalized_path",
+                "execution_path", "artifact_path", "service_name"):
+        val = ev.get(key)
+        if not val:
+            continue
+        base = _basename(str(val))
+        if base and len(base) >= 4 and base not in _PAIRING_GENERIC_HOSTS:
+            tokens.add("name:" + base)
+    pid = ev.get("pid")
+    if pid is not None:
+        tokens.add(f"pid:{ev.get('session_id')}:{pid}")
+    return tokens
+
+
+_CORROBORATION_NOTE = " Corroboration:"
+
+
+def _corroboration_base(f: Finding) -> str:
+    """The engine-assigned severity of a finding, ignoring any prior corroboration.
+
+    Stored the first time a finding is escalated so repeated (non-rebuild)
+    detection runs recompute from the same base instead of compounding the bump.
+    """
+    return (f.evidence or {}).get("corroboration_base", f.severity)
+
+
+def _strip_corroboration_note(f: Finding) -> None:
+    desc = f.description or ""
+    idx = desc.find(_CORROBORATION_NOTE)
+    if idx != -1:
+        f.description = desc[:idx].rstrip()
+
+
+def _reset_corroboration(f: Finding, base: str) -> None:
+    """Return a finding to its engine base severity, clearing corroboration marks."""
+    ev = dict(f.evidence or {})
+    had = "corroboration_base" in ev
+    ev.pop("corroboration_base", None)
+    ev.pop("corroborated_by", None)
+    if had:
+        f.evidence = ev
+    if f.severity != base:
+        f.severity = base
+    _strip_corroboration_note(f)
+
+
+def _corroborate_findings(session, processes, disabled: set[str], benign: set[str]) -> int:
+    """Grade single findings conservatively, escalate corroborated ones.
+
+    When two findings from *different* rules concern the same entity -- or two
+    entities in a direct parent/child relationship -- the combination is stronger
+    evidence than either alone, so each involved finding is raised one rank
+    (capped at 'high'; corroboration never mints a critical on its own). This is
+    what turns e.g. a low process finding plus a low finding on the service it
+    dropped into a single medium-confidence lead. Suppressed findings (benign or
+    disabled-rule) neither escalate nor lend corroboration.
+
+    Idempotent across repeated runs: each finding is recomputed from its stored
+    engine base severity, so re-running detections on a case (e.g. after a second
+    upload, without wiping findings) never compounds the escalation.
+    """
+    active: list[tuple[Finding, str]] = []
+    for f in session.scalars(select(Finding)):
+        if is_suppressed(f.title, f.source, f.evidence, disabled, benign):
+            continue  # left entirely to apply_overrides
+        base = _corroboration_base(f)
+        if SEVERITY_RANK.get(base, 0) < SEVERITY_RANK["low"]:
+            continue
+        active.append((f, base))
+
+    if len(active) < 2:
+        for f, base in active:
+            _reset_corroboration(f, base)  # a lone finding falls back to its base
+        return 0
+
+    # Union-find over entity tokens; directly-related process names are pre-linked
+    # so a parent and its child (or a dropper and the file it wrote) share a group.
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: str, b: str) -> None:
+        parent[find(a)] = find(b)
+
+    proc_by_pid = {(p.session_id, p.pid): p for p in processes}
+    for p in processes:
+        if not p.ppid:
+            continue
+        par = proc_by_pid.get((p.session_id, p.ppid))
+        if not par:
+            continue
+        cb, pb = _basename(p.name or ""), _basename(par.name or "")
+        if (cb and pb and len(cb) >= 4 and len(pb) >= 4
+                and cb not in _PAIRING_GENERIC_HOSTS and pb not in _PAIRING_GENERIC_HOSTS):
+            union("name:" + cb, "name:" + pb)
+
+    # group id -> list of (finding, rule_id)
+    groups: dict[str, list[tuple[Finding, str]]] = defaultdict(list)
+    finding_tokens: list[tuple[Finding, str, str, set[str]]] = []
+    for f, base in active:
+        rid = rule_id_for(f.title, f.source)
+        toks = _finding_entity_tokens(f)
+        finding_tokens.append((f, base, rid, toks))
+        for g in {find(t) for t in toks}:
+            groups[g].append((f, rid))
+
+    changed = 0
+    for f, base, rid, toks in finding_tokens:
+        partners: list[str] = []
+        for g in {find(t) for t in toks}:
+            for other, other_rid in groups.get(g, ()):
+                if other.id != f.id and other_rid != rid and other.title not in partners:
+                    partners.append(other.title)
+
+        base_rank = SEVERITY_RANK.get(base, 0)
+        if not partners or base_rank >= _CORROBORATION_CAP:
+            _reset_corroboration(f, base)
+            continue
+
+        new_sev = _RANK_TO_SEVERITY[min(base_rank + 1, _CORROBORATION_CAP)]
+        ev = dict(f.evidence or {})
+        ev["corroboration_base"] = base
+        ev["corroborated_by"] = partners[:5]
+        f.evidence = ev
+        f.severity = new_sev
+        _strip_corroboration_note(f)
+        f.description = (f.description or "") + (
+            _CORROBORATION_NOTE + " the same entity is independently flagged by "
+            f"{len(partners)} other rule(s) ({', '.join(partners[:3])}); raised one "
+            "severity rank because corroborated signals are stronger than any alone."
+        )
+        changed += 1
+    return changed
+
+
+def run_detections_sync(case_id: str) -> int:
+    """Run all detection heuristics for a case. Returns number of findings added."""
+    session = case_store.get_session(case_id)
+    try:
+        total_started = time.perf_counter()
+        phase_started = total_started
+
+        def mark_phase(phase: str, **counts: Any) -> None:
+            nonlocal phase_started
+            now = time.perf_counter()
+            suffix = ""
+            if counts:
+                suffix = " " + " ".join(f"{k}={v}" for k, v in counts.items())
+            logger.info(
+                "detections phase complete case_id=%s phase=%s seconds=%.3f%s",
+                case_id, phase, now - phase_started, suffix,
+            )
+            phase_started = now
+
+        existing: set[tuple[str, str]] = set()
+        for f in session.scalars(select(Finding)):
+            existing.add((f.title, str(f.evidence.get("entity") or f.evidence.get("pid") or f.evidence.get("summary", ""))[:200]))
+        before = len(existing)
+
+        # User overrides (persisted in case_meta, survive this rebuild).
+        disabled_rules = get_disabled_rules(session)
+        benign_keys = get_benign_keys(session)
+
+        processes = list(session.scalars(select(Process)))
+        proc_by_pid: dict[tuple[str, int], Process] = {}
+        proc_names_by_pid: dict[int, str] = {}
+        for p in processes:
+            proc_by_pid[(p.session_id, p.pid)] = p
+            proc_names_by_pid.setdefault(p.pid, p.name)
+
+        # Scheduled-task creations observed anywhere in the case (4698/106 events,
+        # schtasks /create command lines); analyzed and cross-corroborated at the end.
+        task_records: list[dict[str, Any]] = []
+        # Persistence artifacts (task actions, service images, run-key targets) for the
+        # persistence + execution pairing pass: (exe basename, kind, detail, technique).
+        persistence_artifacts: list[tuple[str, str, str, str]] = []
+
+        # --- Process heuristics ---
+        cmdline_rank: dict[tuple[str, int], int] = {}
+        for proc in processes:
+            name = (proc.name or "").lower()
+            path = _normalize_path(proc.path or "")
+            cmdline = proc.cmdline or ""
+            flags = list(proc.flags or [])
+            evidence = {
+                "pid": proc.pid, "ppid": proc.ppid, "entity": proc.name,
+                "path": proc.path, "cmdline": (cmdline or "")[:500],
+            }
+
+            # LOLBin usage with non-trivial command line
+            if name in LOLBINS and cmdline and len(cmdline.split()) > 1:
+                technique, desc = LOLBINS[name]
+                _add_finding(
+                    session, existing,
+                    title=f"LOLBin activity: {proc.name}",
+                    description=f"{desc}. Command line: {cmdline[:500]}",
+                    severity="low" if name in LOW_SIGNAL_LOLBINS else "medium",
+                    techniques=[technique],
+                    evidence=evidence,
+                    source="process-heuristics",
+                )
+                flags.append("lolbin")
+
+            # Suspicious command line patterns
+            top = _check_cmdline(session, existing, cmdline, evidence, "process-heuristics")
+            if top:
+                flags.append("suspicious-cmdline")
+                cmdline_rank[(proc.session_id, proc.pid)] = SEVERITY_RANK[top]
+                if SEVERITY_RANK[top] > SEVERITY_RANK.get(proc.severity, 0):
+                    proc.severity = top
+
+            # schtasks /create in a process command line feeds the scheduled-task
+            # analysis (and corroborates 4698 events for the same task name).
+            if cmdline and name.startswith("schtasks"):
+                parsed = _parse_schtasks_create(cmdline)
+                if parsed:
+                    parsed["origin"] = "process"
+                    parsed["event"] = None
+                    task_records.append(parsed)
+
+            # Masquerading: system process from wrong path. Path is normalized (device
+            # paths, \??\, \SystemRoot) and placeholder/bare-name paths never fire.
+            if name in SYSTEM_PROCESS_PATHS and path and "\\" in path:
+                expected = SYSTEM_PROCESS_PATHS[name]
+                if expected not in path:
+                    _add_finding(
+                        session, existing,
+                        title=f"System process masquerade: {proc.name}",
+                        description=(
+                            f"{proc.name} running from '{proc.path}' instead of expected "
+                            f"location containing '{expected}'. Consistent with masquerading "
+                            "tradecraft; verify the image path source before concluding."
+                        ),
+                        severity="high",
+                        techniques=["T1036.005"],
+                        evidence={**evidence, "normalized_path": path},
+                        source="process-heuristics",
+                    )
+                    flags.append("masquerade")
+                    if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
+                        proc.severity = "high"
+
+            # Execution from suspicious directories. Weak single signal on its own
+            # (installers, updaters and portable apps run from these too), so it is
+            # graded "low" and relies on corroboration to rise.
+            if path and any(d in path for d in SUSPICIOUS_EXECUTION_DIRS):
+                _add_finding(
+                    session, existing,
+                    title=f"Execution from suspicious directory: {proc.name}",
+                    description=f"Process executing from user-writable/staging path: {proc.path}",
+                    severity="low",
+                    techniques=["T1204"],
+                    evidence=evidence,
+                    source="process-heuristics",
+                )
+                flags.append("suspicious-path")
+                if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["low"]:
+                    proc.severity = "low"
+
+            path_base = _basename(path)
+            root_name = re.sub(r"\.exe$", "", path_base)
+            if path and _WINDOWS_ROOT_EXEC_RE.match(path) and _looks_machine_generated(root_name):
+                _add_finding(
+                    session, existing,
+                    title=f"Random-looking executable in Windows root: {proc.name}",
+                    description=(
+                        f"{proc.name} ran directly from the Windows directory ({proc.path}). "
+                        "Legitimate Windows binaries usually live under System32/SysWOW64 or "
+                        "well-known component folders; a random-looking executable at this "
+                        "level is consistent with staged malware."
+                    ),
+                    severity="high",
+                    techniques=["T1036.005", "T1204"],
+                    evidence={**evidence, "normalized_path": path},
+                    source="process-heuristics",
+                )
+                flags.extend(["suspicious-path", "masquerade"])
+                if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
+                    proc.severity = "high"
+
+            # Parent/child anomalies
+            parent = proc_by_pid.get((proc.session_id, proc.ppid)) if proc.ppid else None
+            if parent:
+                pname = (parent.name or "").lower()
+                parent_flags = set(parent.flags or [])
+                if pname == "services.exe" and path and _WINDOWS_ROOT_EXEC_RE.match(path):
+                    _add_finding(
+                        session, existing,
+                        title=f"Service-hosted executable in Windows root: {proc.name}",
+                        description=(
+                            f"services.exe launched {proc.name} (pid {proc.pid}) directly from "
+                            f"{proc.path}. A service binary in the Windows root, outside "
+                            "System32/SysWOW64 and standard component directories, combines an "
+                            "unusual image location with SYSTEM service execution."
+                        ),
+                        severity="high",
+                        techniques=["T1543.003", "T1036.005"],
+                        evidence={
+                            **evidence, "parent": parent.name, "parent_pid": parent.pid,
+                            "normalized_path": path,
+                        },
+                        source="process-heuristics",
+                    )
+                    flags.extend(["suspicious-path", "service-execution"])
+                    if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
+                        proc.severity = "high"
+                # PPID reuse: a "parent" that started after the child cannot be the real
+                # parent -- the original parent exited and its PID was recycled.
+                pid_reused = bool(
+                    parent.start_time and proc.start_time and parent.start_time > proc.start_time
+                )
+                parent_gone = bool(parent_flags & {"terminated", "exited"})
+                parent_evidence = {
+                    **evidence, "parent": parent.name, "parent_pid": parent.pid,
+                    "parent_start_time": parent.start_time.isoformat() if parent.start_time else None,
+                    "child_start_time": proc.start_time.isoformat() if proc.start_time else None,
+                    "pid_reuse_suspected": pid_reused,
+                }
+                # Known-bad pairs (skip when the parent PID was demonstrably reused)
+                if not pid_reused:
+                    bad_pair = SUSPICIOUS_PARENT_CHILD_MAP.get((pname, name))
+                    if bad_pair is not None:
+                        technique, desc = bad_pair
+                        _add_finding(
+                            session, existing,
+                            title=f"Suspicious process chain: {parent.name} -> {proc.name}",
+                            description=f"{desc}. Child cmdline: {(cmdline or 'n/a')[:400]}",
+                            severity="high",
+                            techniques=[technique],
+                            evidence=parent_evidence,
+                            source="process-heuristics",
+                        )
+                        flags.append("bad-parent-child")
+                        if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
+                            proc.severity = "high"
+                # Broken expected parentage for core system processes
+                if name in EXPECTED_PARENTS and pname and pname not in EXPECTED_PARENTS[name]:
+                    if pid_reused:
+                        _add_finding(
+                            session, existing,
+                            title=f"Unresolved parentage for {proc.name}",
+                            description=(
+                                f"{proc.name} (pid {proc.pid}) records ppid {parent.pid} ({parent.name}), "
+                                f"but that process started after the child. The PPID was likely reused "
+                                "after the real parent exited; not treated as injection evidence."
+                            ),
+                            severity="low",
+                            techniques=["T1055"],
+                            evidence=parent_evidence,
+                            source="process-heuristics",
+                        )
+                    elif parent_gone:
+                        pass  # parent terminated: parentage is unknown, not anomalous
+                    else:
+                        _add_finding(
+                            session, existing,
+                            title=f"Anomalous parent for {proc.name}",
+                            description=(
+                                f"{proc.name} (pid {proc.pid}) spawned by {parent.name} (pid {parent.pid}); "
+                                f"expected parent: {', '.join(EXPECTED_PARENTS[name])}. "
+                                "Start times are consistent with a live parent (PID reuse ruled out "
+                                "where timestamps exist); candidate for process injection or hollowing."
+                            ),
+                            severity="high",
+                            techniques=["T1055"],
+                            evidence=parent_evidence,
+                            source="process-heuristics",
+                        )
+                        flags.append("anomalous-parent")
+                        if SEVERITY_RANK.get(proc.severity, 0) < SEVERITY_RANK["high"]:
+                            proc.severity = "high"
+
+            proc.flags = sorted(set(flags))
+
+        # --- Correlation pass: independent signal classes stacking on one process ---
+        # >= 2 distinct classes (engine flags and/or memory-pipeline flags) produce one
+        # composite finding at a severity one rank above the strongest component.
+        for proc in processes:
+            signals = sorted(s for s in (proc.flags or []) if s in CORRELATION_FLAGS)
+            if len(signals) < 2:
+                continue
+            base = max(SEVERITY_RANK[CORRELATION_FLAGS[s][0]] for s in signals)
+            if "suspicious-cmdline" in signals:
+                base = max(base, cmdline_rank.get((proc.session_id, proc.pid), 0))
+            severity = _RANK_TO_SEVERITY[min(base + 1, SEVERITY_RANK["critical"])]
+            _add_finding(
+                session, existing,
+                title=f"Correlated indicators on {proc.name} (pid {proc.pid})",
+                description=(
+                    f"{proc.name} (pid {proc.pid}) accumulated {len(signals)} independent signal "
+                    f"classes: {', '.join(signals)}. Each signal alone has benign explanations; "
+                    "in combination they are consistent with an actively compromised process."
+                ),
+                severity=severity,
+                techniques=sorted({CORRELATION_FLAGS[s][1] for s in signals}),
+                evidence={
+                    "pid": proc.pid, "entity": proc.name, "session_id": proc.session_id,
+                    "signals": signals,
+                    "component_max_severity": _RANK_TO_SEVERITY[base],
+                },
+                source="correlation",
+            )
+            if SEVERITY_RANK[severity] > SEVERITY_RANK.get(proc.severity, 0):
+                proc.severity = severity
+
+        session.commit()
+        mark_phase("process heuristics", processes=len(processes), findings=len(existing) - before)
+
+        # --- MemoryResult bridge ---
+        # Memory analysis can produce high-confidence indicators even when no
+        # event-log fields exist to match, so promote those rows into Findings.
+        _promote_memory_results(session, existing)
+        session.commit()
+        mark_phase("memory promotion", findings=len(existing) - before)
+
+        # --- Event heuristics ---
+        event_stream = session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE))
+        provenance_events: list[Event] = []
+        beacon_tracker: dict[str, list[Event]] = defaultdict(list)
+        # Each distinct DNS/URL host is reputation-scored once; state caps emissions.
+        domain_seen: set[str] = set()
+        domain_state: dict[str, int] = {"emitted": 0}
+        web_ip_tracker: dict[str, dict[str, Any]] = defaultdict(
+            lambda: {"total": 0, "errors": 0, "auth_fail": 0, "auth_ok": set(), "events": []}
+        )
+        # Logon trackers (4624/4625/4672). No-ops when the fields aren't ingested.
+        logon_fail: dict[tuple[str, str], dict[str, Any]] = defaultdict(
+            lambda: {"count": 0, "first": None, "events": []}
+        )
+        logon_success: dict[tuple[str, str], list[Event]] = defaultdict(list)
+        rdp_logons: dict[str, dict[str, Any]] = {}
+        priv_logons: dict[str, dict[str, Any]] = {}
+        # Linux/Entra auth trackers, keyed (proto, ip, user). Parallel to the
+        # 4624/4625 trackers above: Windows logon semantics/wording don't apply.
+        linux_auth_fail: dict[tuple[str, str, str], dict[str, Any]] = defaultdict(
+            lambda: {"count": 0, "first": None, "last": None, "events": []}
+        )
+        linux_auth_success: dict[tuple[str, str, str], list[Event]] = defaultdict(list)
+        # Log-clear events (1102 / wevtutil cl) for the intrusion-window correlation.
+        log_clear_marks: list[tuple[Event, str]] = []
+        # NTFS $UsnJrnl:$J rename rows are correlated by FileReferenceNumber after
+        # this event pass, so old/new names become one timeline lead.
+        usn_events: list[Event] = []
+        remcom_handles: dict[int, dict[str, Any]] = defaultdict(
+            lambda: {"process": "", "events": [], "pipes": set()}
+        )
+
+        for event in event_stream:
+            raw = event.raw or {}
+            source_l = (event.source or "").lower()
+            if "handle" in source_l or event.category == "handle":
+                try:
+                    handle_pid = int(str(raw.get("PID") or raw.get("Pid") or ""), 0)
+                except (TypeError, ValueError):
+                    handle_pid = None
+                handle_name = str(raw.get("Name") or raw.get("Description") or "")
+                device = str(raw.get("Device") or "")
+                if device.lower() == "namedpipe" and handle_name:
+                    handle_name = "\\NamedPipe" + (
+                        handle_name if handle_name.startswith("\\") else "\\" + handle_name
+                    )
+                if handle_pid is not None and "remcom_" in handle_name.lower():
+                    group = remcom_handles[handle_pid]
+                    group["process"] = str(
+                        raw.get("Process") or event.entity or proc_names_by_pid.get(handle_pid) or f"pid-{handle_pid}"
+                    )
+                    group["events"].append(event)
+                    group["pipes"].add(handle_name)
+                    _escalate_event(
+                        session, event, "medium",
+                        "Detection: RemCom remote-execution named-pipe handle",
+                    )
+            is_usn_event = _is_usn_journal_event(event, raw)
+            if is_usn_event:
+                tokens = _usn_reason_tokens(raw)
+                path = _usn_path(event, raw)
+                if (
+                    tokens & {"FILE_CREATE", "RENAME_NEW_NAME", "RENAME_OLD_NAME", "FILE_DELETE"}
+                    and _is_usn_executable_path(path)
+                ):
+                    provenance_events.append(event)
+                if tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}:
+                    usn_events.append(event)
+                if _is_usn_executable_path(path) and (
+                    "FILE_CREATE" in tokens or tokens & {"RENAME_OLD_NAME", "RENAME_NEW_NAME"}
+                ):
+                    evidence = {
+                        "event_id": event.id, "entity": event.entity,
+                        "source": event.source, "summary": event.summary[:300],
+                    }
+                    _check_usn_journal_event(session, existing, event, raw, evidence)
+                continue
+
+            if _event_needed_for_provenance(event, raw):
+                provenance_events.append(event)
+            # Memory-pipeline events carry our own descriptive summaries (e.g. "Hidden
+            # process detected: lsass.exe ..."); scanning those re-triggers patterns on
+            # text that merely describes a finding. Only scan real embedded command lines.
+            if (event.source or "").startswith("memory:") or event.category == "memory":
+                summary_text = " ".join(
+                    str(v) for v in [raw.get("CommandLine"), raw.get("Cmdline")] if v
+                )
+            else:
+                summary_text = _event_command_text(event, raw)
+            evidence = {
+                "event_id": event.id, "entity": event.entity,
+                "source": event.source, "summary": event.summary[:300],
+            }
+
+            cross_process_severity = _check_cross_process_event(session, existing, event, raw, evidence)
+            if cross_process_severity:
+                _escalate_event(
+                    session, event, cross_process_severity,
+                    "Detection: cross-process injection/access telemetry (remote thread, "
+                    "dangerous process access, or high-risk handle)",
+                )
+
+            # Linux events run only the Linux pattern set (and vice-versa) so free-text
+            # syslog prose can't trip Windows rules and Windows cmdlines can't trip
+            # Linux rules.
+            is_linux = bool(raw.get("linux_log"))
+            if is_linux:
+                top = _check_linux_cmdline(session, existing, summary_text, evidence, f"event:{event.source}")
+            else:
+                top = _check_cmdline(session, existing, summary_text, evidence, f"event:{event.source}")
+            if top:
+                _escalate_event(
+                    session, event, top,
+                    f"Detection: embedded command line matched suspicious patterns ({top})",
+                )
+
+            if is_linux or raw.get("AuthProto") or raw.get("LinuxAccountAction"):
+                _check_linux_event(
+                    session, existing, event, raw, evidence,
+                    linux_auth_fail, linux_auth_success,
+                )
+
+            _check_memprocfs_timeline_event(
+                session, existing, event, raw, evidence, task_records, persistence_artifacts
+            )
+
+            # wevtutil cl in an embedded command line: track for the log-clear window pass
+            if _WEVTUTIL_CL_RE.search(summary_text.lower()):
+                log_clear_marks.append((event, "Event log clearing"))
+
+            # schtasks /create embedded in an event (e.g. 4688 process creation)
+            parsed_task = _parse_schtasks_create(summary_text)
+            if parsed_task:
+                parsed_task["origin"] = "process"
+                parsed_task["event"] = event
+                task_records.append(parsed_task)
+
+            # Persistence registry paths
+            key_path = str(raw.get("KeyPath") or raw.get("Key") or raw.get("Name") or "").lower()
+            if event.category == "persistence" or "registry" in event.source.lower():
+                matched_runkey = False
+                for fragment, technique, desc in PERSISTENCE_REGISTRY_PATHS:
+                    if fragment in key_path or fragment in summary_text.lower():
+                        _add_finding(
+                            session, existing,
+                            title=desc,
+                            description=f"Persistence location touched: {event.summary[:400]}",
+                            severity="high",
+                            techniques=[technique],
+                            evidence=evidence,
+                            source=f"event:{event.source}",
+                        )
+                        _escalate_event(session, event, "high", f"Detection: {desc}")
+                        matched_runkey = True
+                if matched_runkey:
+                    for exe in set(_EXE_TOKEN_RE.findall(summary_text.lower())):
+                        persistence_artifacts.append(
+                            (_basename(exe), "registry autorun", event.summary[:200], "T1547.001")
+                        )
+
+            # Security event log signals
+            eid = str(raw.get("EventID") or "")
+            if eid and not _eid_channel_ok(raw, eid):
+                eid = ""
+            if eid == "1102":
+                _add_finding(
+                    session, existing,
+                    title="Security event log cleared",
+                    description=f"Event 1102 (audit log cleared): {event.summary[:300]}",
+                    severity="critical",
+                    techniques=["T1070.001"],
+                    evidence=evidence,
+                    source=f"event:{event.source}",
+                )
+                _escalate_event(
+                    session, event, "critical",
+                    "Detection: security event log cleared (Event 1102, anti-forensics)",
+                )
+                log_clear_marks.append((event, "Security event log cleared"))
+            elif eid == "4720":
+                _add_finding(
+                    session, existing,
+                    title="New user account created",
+                    description=f"Event 4720: {event.summary[:300]}",
+                    severity="medium",
+                    techniques=["T1136.001"],
+                    evidence=evidence,
+                    source=f"event:{event.source}",
+                )
+                _escalate_event(
+                    session, event, "medium",
+                    "Detection: new user account created (Event 4720)",
+                )
+            elif eid == "4698":
+                # Task creation itself is routine admin activity; instead of an
+                # unconditional finding, feed the graded scheduled-task analysis.
+                parsed = _parse_task_xml(
+                    _field(raw, "TaskContent", "TaskContentNew", "Content", "TaskXml", "Xml")
+                )
+                parsed["name"] = _field(raw, "TaskName", "Task Name") or (event.entity or "")
+                parsed["run_as"] = parsed.get("run_as") or _field(raw, "RunAsUser", "User")
+                parsed["origin"] = "event log"
+                parsed["event"] = event
+                task_records.append(parsed)
+            elif eid == "106" and _field(raw, "TaskName", "Task Name"):
+                # Task Scheduler operational log: task registered (name + user only)
+                task_records.append({
+                    "name": _field(raw, "TaskName", "Task Name"),
+                    "run_as": _field(raw, "UserContext", "User", "UserName"),
+                    "origin": "event log",
+                    "event": event,
+                })
+            elif eid == "7045":
+                svc_name = _field(raw, "ServiceName", "Service Name") or ""
+                image = _field(raw, "ImagePath", "Image Path", "ServiceFileName", "PathName") or ""
+                image_l = image.lower()
+                npath = _normalize_path(_first_exe_token(image))
+                reasons: list[str] = []
+                techniques = ["T1543.003"]
+                if npath and "\\" in npath and any(d in npath for d in SUSPICIOUS_EXECUTION_DIRS):
+                    reasons.append(
+                        f"service binary in a user-writable/staging path ({image[:200]})"
+                    )
+                if image_l and _SERVICE_INTERPRETER_RE.search(image_l):
+                    reasons.append(
+                        "service image invokes a shell/script interpreter "
+                        "(powershell/cmd/rundll32/%COMSPEC%) instead of a dedicated binary"
+                    )
+                if image_l and _BASE64_BLOB_RE.search(image_l):
+                    reasons.append(
+                        "service image contains a long base64-like blob (possible encoded payload)"
+                    )
+                svc_l = svc_name.lower()
+                if svc_l == "psexesvc":
+                    reasons.append("service name PSEXESVC: PsExec remote-execution service")
+                    techniques.append("T1570")
+                elif svc_l and (
+                    _looks_machine_generated(svc_l)
+                    # PsExec-style random short names contain a digit ("a1b2"); a bare
+                    # vowel-less short name is not enough on its own (it flagged legit
+                    # services like "dhcp"), so require a digit for the 4-char branch.
+                    or (len(svc_l) == 4 and svc_l.isalnum() and any(c.isdigit() for c in svc_l))
+                ):
+                    reasons.append(
+                        f"service name '{svc_name}' looks machine-generated "
+                        "(random/PsExec-style short name)"
+                    )
+                # Service installs are routine (software, drivers, updates), so a plain
+                # install is not a finding on its own. Only surface one when the install
+                # has a concretely suspicious property; the service is still recorded as
+                # a persistence artifact below for the execution-pairing pass.
+                if reasons:
+                    # Conservative base severity: a single suspicious property is
+                    # "low", two or more (or corroboration with the dropping process,
+                    # applied later) push it up. Routine installs produce nothing.
+                    svc_severity = "medium" if len(reasons) >= 2 else "low"
+                    description = (
+                        f"Event 7045 (service installation): {event.summary[:300]}"
+                        " Flagged because: " + "; ".join(reasons) + ". "
+                        "Service installs are routine for software deployment; these "
+                        "properties are what make this one consistent with malicious "
+                        "service persistence."
+                    )
+                    _add_finding(
+                        session, existing,
+                        title="New service installed",
+                        description=description,
+                        severity=svc_severity,
+                        techniques=techniques,
+                        evidence={
+                            **evidence,
+                            "entity": svc_name or evidence.get("entity"),
+                            "service_name": svc_name, "image_path": image[:500],
+                            "escalation_reasons": reasons,
+                        },
+                        source=f"event:{event.source}",
+                    )
+                    _escalate_event(
+                        session, event, svc_severity,
+                        "Detection: suspicious service installed (Event 7045) — "
+                        + "; ".join(reasons),
+                    )
+                image_base = _basename(_first_exe_token(image))
+                if image_base:
+                    persistence_artifacts.append(
+                        (image_base, "service installation (7045)",
+                         f"{svc_name or 'unnamed service'} -> {image[:200]}", "T1543.003")
+                    )
+            elif eid == "4826":
+                kernel_debug = str(raw.get("KernelDebug") or "").lower()
+                test_signing = str(raw.get("TestSigning") or "").lower()
+                integrity = str(raw.get("DisableIntegrityChecks") or "").lower()
+                flagged = []
+                if "enabled" in kernel_debug or kernel_debug == "on":
+                    flagged.append("Kernel debugging ENABLED")
+                if "enabled" in test_signing or test_signing == "on":
+                    flagged.append("Test Signing ENABLED (unsigned drivers allowed)")
+                if "enabled" in integrity or integrity == "on" or "disabled by" in integrity:
+                    flagged.append("Code integrity checks DISABLED")
+                if flagged:
+                    _add_finding(
+                        session, existing,
+                        title="Boot config weakens driver signing (Event 4826)",
+                        description=(
+                            "Event 4826 (Boot Configuration Data loaded) shows a security-relevant "
+                            "boot policy: " + "; ".join(flagged) + ". This lets an attacker load "
+                            "unsigned/malicious kernel drivers (rootkits, BYOVD) and evade defenses. "
+                            f"Host: {event.host or raw.get('Computer', 'unknown')}, time: "
+                            f"{event.timestamp.isoformat() if event.timestamp else 'n/a'}."
+                        ),
+                        severity="high",
+                        techniques=["T1553.006", "T1014"],
+                        evidence={**evidence, "KernelDebug": raw.get("KernelDebug"),
+                                  "TestSigning": raw.get("TestSigning"),
+                                  "DisableIntegrityChecks": raw.get("DisableIntegrityChecks")},
+                        source=f"event:{event.source}",
+                    )
+                    _escalate_event(
+                        session, event, "high",
+                        "Detection: boot configuration weakens driver signing (Event 4826)",
+                    )
+            elif eid == "4625":
+                _escalate_event(session, event, "low", "Detection: failed logon (Event 4625)")
+                ip = _field(raw, "IpAddress", "IPAddress", "SourceNetworkAddress",
+                            "Source Network Address", "WorkstationName")
+                user = _field(raw, "TargetUserName", "Target User Name", "AccountName")
+                if ip in ("-", "::1", "127.0.0.1"):
+                    ip = ""
+                if ip or user:
+                    stat = logon_fail[(ip.lower(), user.lower())]
+                    stat["count"] += 1
+                    if event.timestamp and (
+                        stat["first"] is None or _aware(event.timestamp) < _aware(stat["first"])
+                    ):
+                        stat["first"] = event.timestamp
+                    if len(stat["events"]) < 200:
+                        stat["events"].append(event)
+            elif eid == "4624":
+                ip = _field(raw, "IpAddress", "IPAddress", "SourceNetworkAddress",
+                            "Source Network Address", "WorkstationName")
+                user = _field(raw, "TargetUserName", "Target User Name", "AccountName")
+                ltype = _field(raw, "LogonType", "Logon Type")
+                if ip in ("-", "::1", "127.0.0.1"):
+                    ip = ""
+                if ip or user:
+                    logon_success[(ip.lower(), user.lower())].append(event)
+                # Type-10 (RemoteInteractive/RDP) logons are recorded but only surfaced
+                # when the account is also referenced by another finding (correlation-gated)
+                ul = user.lower()
+                if (
+                    ltype == "10" and user and not user.endswith("$")
+                    and ul not in _WELLKNOWN_PRIV_ACCOUNTS
+                    and not ul.startswith(("dwm-", "umfd-"))
+                ):
+                    rdp = rdp_logons.setdefault(ul, {"display": user, "count": 0, "ips": set(), "events": []})
+                    rdp["count"] += 1
+                    if ip:
+                        rdp["ips"].add(ip)
+                    if len(rdp["events"]) < 50:
+                        rdp["events"].append(event)
+            elif eid == "4672":
+                user = _field(raw, "SubjectUserName", "Subject User Name", "AccountName")
+                ul = user.lower()
+                if (
+                    user and not user.endswith("$")
+                    and ul not in _WELLKNOWN_PRIV_ACCOUNTS
+                    and not ul.startswith(("dwm-", "umfd-"))
+                ):
+                    pv = priv_logons.setdefault(ul, {"display": user, "count": 0, "events": []})
+                    pv["count"] += 1
+                    if len(pv["events"]) < 50:
+                        pv["events"].append(event)
+
+            # Web access-log attack detection
+            if event.category == "weblog":
+                _check_weblog(session, existing, event, raw, web_ip_tracker)
+
+            # Beaconing-shaped network events: same remote endpoint many times
+            if event.category == "network" and event.timestamp:
+                raddr = str(raw.get("Raddr") or raw.get("raddr") or raw.get("RemoteAddress") or "")
+                if raddr and _addr_scope(raddr) != "local":
+                    beacon_tracker[raddr].append(event)
+
+            # DNS query names / URL hosts: abuse-prone TLD, DGA entropy, tunnelling, etc.
+            if event.category == "network" or raw.get("Url") or raw.get("RemoteUrl"):
+                _check_domain_indicators(
+                    session, existing, event, raw, evidence, domain_seen, domain_state
+                )
+
+        mark_phase(
+            "event scan",
+            provenance_events=len(provenance_events),
+            usn_events=len(usn_events),
+            task_records=len(task_records),
+        )
+        _analyze_usn_rename_chains(session, existing, usn_events)
+        mark_phase("usn rename analysis", usn_events=len(usn_events))
+
+        for pid, group in remcom_handles.items():
+            pipes = sorted(group["pipes"])
+            events_for_pid = group["events"]
+            has_control = any("remcom_communicaton" in pipe.lower() for pipe in pipes)
+            stdio_count = sum(
+                any(marker in pipe.lower() for marker in ("remcom_stdin", "remcom_stdout", "remcom_stderr"))
+                for pipe in pipes
+            )
+            severity = "high" if has_control and stdio_count >= 2 else "medium"
+            process_name = group["process"]
+            _add_finding(
+                session, existing,
+                title=f"RemCom named-pipe activity by {process_name} (pid {pid})",
+                description=(
+                    f"{process_name} (pid {pid}) holds {len(pipes)} RemCom-style named-pipe "
+                    f"handle(s), including {', '.join(pipes[:5])}. A communication pipe plus "
+                    "stdin/stdout/stderr channels is consistent with RemCom remote command "
+                    "execution; verify whether this was authorized administration."
+                ),
+                severity=severity,
+                techniques=["T1021.002", "T1059"],
+                evidence={
+                    "entity": process_name, "pid": pid, "pipe_names": pipes[:20],
+                    "event_ids": [event.id for event in events_for_pid[:20]],
+                    "handle_count": len(events_for_pid),
+                },
+                source="memory-handles",
+            )
+        mark_phase("named-pipe handle analysis", processes=len(remcom_handles))
+
+        # Beacon candidates: >= 5 connections to same endpoint with regular-ish spacing
+        # over a meaningful window (a burst within one second is not a beacon).
+        for raddr, evts in beacon_tracker.items():
+            if len(evts) < 5:
+                continue
+            times = sorted(e.timestamp for e in evts if e.timestamp)
+            if len(times) < 5:
+                continue
+            deltas = [(t2 - t1).total_seconds() for t1, t2 in zip(times, times[1:])]
+            deltas = [d for d in deltas if d > 0]
+            if not deltas:
+                continue
+            mean = sum(deltas) / len(deltas)
+            if mean <= 0:
+                continue
+            variance = sum((d - mean) ** 2 for d in deltas) / len(deltas)
+            cv = (variance ** 0.5) / mean
+            span = (times[-1] - times[0]).total_seconds()
+            if cv < 0.35 and 5 <= mean <= 3600 and span >= max(60.0, mean * 4):
+                scope = _addr_scope(raddr)
+                internal = scope == "private"
+                severity = "medium" if internal else "high"
+                _add_finding(
+                    session, existing,
+                    title=(
+                        f"Possible internal C2 relay beaconing to {raddr}" if internal
+                        else f"Possible C2 beaconing to {raddr}"
+                    ),
+                    description=(
+                        f"{len(evts)} connections to {raddr} with regular interval "
+                        f"(~{mean:.0f}s, coefficient of variation {cv:.2f}, over {span:.0f}s). "
+                        "Regular-cadence traffic is consistent with C2 beaconing"
+                        + (
+                            "; the address is private/link-local, so polling of an internal "
+                            "service is a plausible benign explanation."
+                            if internal
+                            else "; scheduled application polling can produce the same shape."
+                        )
+                    ),
+                    severity=severity,
+                    techniques=["T1071", "T1573"],
+                    evidence={
+                        "entity": raddr, "count": len(evts), "mean_interval_s": round(mean, 1),
+                        "interval_cv": round(cv, 2), "span_s": round(span, 1), "scope": scope,
+                        "first_seen": times[0].isoformat(), "last_seen": times[-1].isoformat(),
+                    },
+                    source="network-heuristics",
+                )
+                for e in evts:
+                    _escalate_event(
+                        session, e, severity,
+                        f"Detection: beaconing-shaped traffic to {raddr} "
+                        f"(~{mean:.0f}s interval over {len(evts)} connections)",
+                    )
+
+        # Aggregate web-log signals per client IP: scanning and brute force
+        for ip, stat in web_ip_tracker.items():
+            total = stat["total"]
+            # Scanning: many requests, high error ratio
+            if total >= 30 and stat["errors"] >= 20 and stat["errors"] / max(total, 1) >= 0.4:
+                _add_finding(
+                    session, existing,
+                    title=f"Web scanning / enumeration from {ip}",
+                    description=(
+                        f"{ip} made {total} requests with {stat['errors']} error responses "
+                        f"({stat['errors'] / total * 100:.0f}% errors). High-volume 4xx/5xx traffic "
+                        "is characteristic of automated vulnerability scanning or content discovery."
+                    ),
+                    severity="medium",
+                    techniques=["T1595", "T1190"],
+                    evidence={"entity": ip, "total_requests": total, "errors": stat["errors"]},
+                    source="weblog-heuristics",
+                )
+            # Brute force: many auth failures
+            if stat["auth_fail"] >= 5:
+                succeeded = bool(stat["auth_ok"])
+                _add_finding(
+                    session, existing,
+                    title=f"{'Successful ' if succeeded else ''}brute force against web app from {ip}",
+                    description=(
+                        f"{ip} triggered {stat['auth_fail']} HTTP 401/403 auth failures"
+                        + (
+                            f", then obtained authenticated access as {', '.join(sorted(stat['auth_ok']))} "
+                            "(200/302 after failures). Likely successful credential brute force."
+                            if succeeded
+                            else ". Repeated authentication failures indicate a brute-force attempt."
+                        )
+                    ),
+                    severity="critical" if succeeded else "high",
+                    techniques=["T1110"] + (["T1078"] if succeeded else []),
+                    evidence={"entity": ip, "auth_failures": stat["auth_fail"],
+                              "authenticated_users": sorted(stat["auth_ok"])},
+                    source="weblog-heuristics",
+                )
+                for e in stat["events"][:200]:
+                    _escalate_event(
+                        session, e, "high",
+                        f"Detection: web brute-force activity from {ip} "
+                        f"({stat['auth_fail']} auth failures)",
+                    )
+
+        # --- Scheduled-task analysis (merged 4698/106/schtasks records, graded) ---
+        _analyze_scheduled_tasks(session, existing, task_records, persistence_artifacts)
+
+        # --- Windows logon brute force (4625 volume, optionally capped by a 4624) ---
+        for (ip, user), stat in logon_fail.items():
+            if stat["count"] < 10:
+                continue
+            combo = f"{user or 'unknown-user'}@{ip or 'unknown-source'}"
+            successes: list[Event] = []
+            for (sip, suser), evs in logon_success.items():
+                if suser == user and (sip == ip or not sip or not ip):
+                    successes.extend(evs)
+            succ_after = [
+                e for e in successes
+                if not e.timestamp or not stat["first"]
+                or _aware(e.timestamp) >= _aware(stat["first"])
+            ]
+            base_evidence = {
+                "entity": combo, "source_ip": ip or None, "target_user": user or None,
+                "failed_attempts": stat["count"],
+                "first_failure": stat["first"].isoformat() if stat["first"] else None,
+            }
+            if succ_after:
+                succ_ts = [e.timestamp for e in succ_after if e.timestamp]
+                _add_finding(
+                    session, existing,
+                    title=f"Brute force followed by successful logon: {combo}",
+                    description=(
+                        f"{stat['count']} failed logons (4625) for {combo} were followed by a "
+                        f"successful logon (4624) for the same account/source combination. "
+                        "Failure volume alone can be a misconfigured service or a typo storm; "
+                        "the subsequent success for the very same pairing is what makes this "
+                        "consistent with a completed credential brute force."
+                    ),
+                    severity="critical",
+                    techniques=["T1110", "T1078"],
+                    evidence={
+                        **base_evidence,
+                        "successful_logons": len(succ_after),
+                        "first_success": min(_aware(t) for t in succ_ts).isoformat() if succ_ts else None,
+                    },
+                    source="logon-heuristics",
+                )
+                for e in stat["events"]:
+                    _escalate_event(
+                        session, e, "high",
+                        f"Detection: brute force followed by successful logon for {combo}",
+                    )
+                for e in succ_after[:50]:
+                    _escalate_event(
+                        session, e, "high",
+                        f"Detection: successful logon after brute-force failures for {combo}",
+                    )
+            else:
+                _add_finding(
+                    session, existing,
+                    title=f"Authentication brute force attempts: {combo}",
+                    description=(
+                        f"{stat['count']} failed logons (4625) for {combo} with no matching "
+                        "success observed. Consistent with a brute-force/password-spray "
+                        "attempt; a locked-out account, an expired service credential, or a "
+                        "misconfigured scheduled job can produce the same pattern."
+                    ),
+                    severity="medium",
+                    techniques=["T1110"],
+                    evidence=base_evidence,
+                    source="logon-heuristics",
+                )
+                for e in stat["events"]:
+                    _escalate_event(
+                        session, e, "medium",
+                        f"Detection: authentication brute-force attempts for {combo}",
+                    )
+
+        # --- Linux / Entra logon brute force (SSH, pam, auditd, Entra sign-ins) ---
+        for (proto, ip, user), stat in linux_auth_fail.items():
+            if stat["count"] < 10:
+                continue
+            label = "Entra ID sign-in" if proto == "entra" else f"{proto.upper()} login"
+            combo = f"{user or 'unknown-user'}@{ip or 'unknown-source'}"
+            successes: list[Event] = []
+            for (sproto, sip, suser), evs in linux_auth_success.items():
+                if sproto == proto and suser == user and (sip == ip or not sip or not ip):
+                    successes.extend(evs)
+            succ_after = [
+                e for e in successes
+                if stat["last"] is None
+                or (e.timestamp is not None and _aware(e.timestamp) >= _aware(stat["last"]))
+            ]
+            base_evidence = {
+                "entity": combo, "protocol": proto, "source_ip": ip or None,
+                "target_user": user or None, "failed_attempts": stat["count"],
+                "first_failure": stat["first"].isoformat() if stat["first"] else None,
+                "last_failure": stat["last"].isoformat() if stat["last"] else None,
+            }
+            if succ_after:
+                succ_ts = [e.timestamp for e in succ_after if e.timestamp]
+                _add_finding(
+                    session, existing,
+                    title=f"Brute force followed by successful login: {combo}",
+                    description=(
+                        f"{stat['count']} failed {label} attempts for {combo} were followed by a "
+                        "successful authentication for the same account/source. The subsequent "
+                        "success for the very same pairing is what makes this consistent with a "
+                        "completed credential brute force rather than a typo storm."
+                    ),
+                    severity="critical",
+                    techniques=["T1110", "T1078"],
+                    evidence={
+                        **base_evidence, "successful_logins": len(succ_after),
+                        "first_success": min(_aware(t) for t in succ_ts).isoformat() if succ_ts else None,
+                    },
+                    source="logon-heuristics",
+                )
+                for e in stat["events"][:50]:
+                    _escalate_event(session, e, "high",
+                                    f"Detection: brute force followed by successful login for {combo}")
+                for e in succ_after[:50]:
+                    _escalate_event(session, e, "high",
+                                    f"Detection: successful login after brute-force failures for {combo}")
+            else:
+                _add_finding(
+                    session, existing,
+                    title=f"Authentication brute force attempts: {combo}",
+                    description=(
+                        f"{stat['count']} failed {label} attempts for {combo} with no matching "
+                        "success observed. Consistent with a brute-force / password-spray attempt."
+                    ),
+                    severity="medium",
+                    techniques=["T1110"],
+                    evidence=base_evidence,
+                    source="logon-heuristics",
+                )
+                for e in stat["events"][:50]:
+                    _escalate_event(session, e, "medium",
+                                    f"Detection: authentication brute-force attempts for {combo}")
+
+        # --- Persistence + execution pairing: artifact action executed as a flagged process ---
+        flagged_by_base: dict[str, list[Process]] = defaultdict(list)
+        for proc in processes:
+            if set(proc.flags or []) & set(CORRELATION_FLAGS):
+                flagged_by_base[_basename(proc.name or "")].append(proc)
+        artifacts_by_base: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+        for base, kind, detail, tech in persistence_artifacts:
+            if base and base not in _PAIRING_GENERIC_HOSTS:
+                artifacts_by_base[base].append((kind, detail, tech))
+        for base, links in artifacts_by_base.items():
+            procs = flagged_by_base.get(base)
+            if not procs:
+                continue
+            all_flags = sorted({f for p in procs for f in (p.flags or []) if f in CORRELATION_FLAGS})
+            _add_finding(
+                session, existing,
+                title=f"Persistence artifact executed: {base}",
+                description=(
+                    f"A persistence artifact ({'; '.join(f'{k}: {d}' for k, d, _t in links[:3])}) "
+                    f"points at '{base}', and a process with that basename is present in the "
+                    f"process table carrying independent suspicious signals ({', '.join(all_flags)}). "
+                    "Persistence installation plus matching flagged execution is consistent with "
+                    "an implant that is both installed and running, not a dormant leftover."
+                ),
+                severity="high",
+                techniques=sorted({t for _k, _d, t in links}),
+                evidence={
+                    "entity": base,
+                    "persistence_links": [f"{k}: {d}" for k, d, _t in links[:5]],
+                    "pids": [p.pid for p in procs[:20]],
+                    "process_signals": all_flags,
+                },
+                source="correlation",
+            )
+
+        # --- Correlation-gated logon findings: only when the account already appears
+        # --- in another finding for this case (no baseline available, so standalone
+        # --- RDP/special-privilege logons stay silent).
+        if rdp_logons or priv_logons:
+            session.flush()  # make this run's pending findings visible to the queries below
+            gated_prefixes = (
+                "rdp logon by account", "special-privilege logon by account",
+            )
+            finding_blobs: list[tuple[str, str]] = []
+            for f in session.scalars(select(Finding)):
+                tl = (f.title or "").lower()
+                if tl.startswith(gated_prefixes):
+                    continue
+                blob = " ".join([
+                    tl, str((f.evidence or {}).get("entity") or ""), (f.description or "")[:300],
+                ]).lower()
+                finding_blobs.append((f.title, blob))
+
+            def _referencing_titles(account: str) -> list[str]:
+                if len(account) < 4:  # short names substring-match everything
+                    return []
+                pat = re.compile(rf"(?<![\w]){re.escape(account)}(?![\w])")
+                return [t for t, blob in finding_blobs if pat.search(blob)][:5]
+
+            for ul, rdp in rdp_logons.items():
+                titles = _referencing_titles(ul)
+                if not titles:
+                    continue
+                _add_finding(
+                    session, existing,
+                    title=f"RDP logon by account referenced in other findings: {rdp['display']}",
+                    description=(
+                        f"{rdp['count']} RemoteInteractive (logon type 10) logon(s) by "
+                        f"'{rdp['display']}'"
+                        + (f" from {', '.join(sorted(rdp['ips'])[:5])}" if rdp["ips"] else "")
+                        + ". RDP logons are routine administration on their own; this is "
+                        "recorded only because the account also appears in other findings "
+                        "for this case, where interactive access may indicate hands-on-"
+                        "keyboard activity."
+                    ),
+                    severity="low",
+                    techniques=["T1021.001", "T1078"],
+                    evidence={
+                        "entity": rdp["display"], "logon_count": rdp["count"],
+                        "source_ips": sorted(rdp["ips"])[:10],
+                        "correlated_findings": titles,
+                    },
+                    source="logon-heuristics",
+                )
+            for ul, pv in priv_logons.items():
+                titles = _referencing_titles(ul)
+                if not titles:
+                    continue
+                _add_finding(
+                    session, existing,
+                    title=f"Special-privilege logon by account referenced in other findings: {pv['display']}",
+                    description=(
+                        f"{pv['count']} special-privilege logon(s) (4672) by '{pv['display']}', "
+                        "an account outside the well-known service identities. On its own this "
+                        "is normal admin activity; it is recorded because the account also "
+                        "appears in other findings for this case, so its privileged sessions "
+                        "define where elevated access was available to the activity under "
+                        "investigation."
+                    ),
+                    severity="low",
+                    techniques=["T1078"],
+                    evidence={
+                        "entity": pv["display"], "logon_count": pv["count"],
+                        "correlated_findings": titles,
+                    },
+                    source="logon-heuristics",
+                )
+
+        mark_phase("aggregate heuristics", findings=len(existing) - before)
+
+        # --- Service provenance: trace installed services back to the dropping /
+        # --- installing process and the download the binary came from.
+        _correlate_service_provenance(session, existing, provenance_events, processes)
+        mark_phase("service provenance", provenance_events=len(provenance_events))
+        _correlate_file_execution_provenance(session, existing, provenance_events, processes)
+        mark_phase("file provenance", provenance_events=len(provenance_events))
+
+        # --- Severity taint propagation: events mentioning a flagged process/DLL/file
+        # --- name inherit its severity, with provenance recorded on the event.
+        session.flush()
+        _propagate_flagged_entities(session, None, processes)
+        mark_phase("propagation")
+
+        # --- Log-clear-after-activity: a 1102/wevtutil-cl that postdates high/critical
+        # --- activity likely caps an active intrusion window (timestamps required).
+        if log_clear_marks:
+            session.flush()  # the 1102/wevtutil findings may still be pending
+            clear_event_ids = {e.id for e, _t in log_clear_marks}
+            hi_events = list(session.scalars(
+                select(Event)
+                .where(Event.severity.in_(["high", "critical"]))
+                .execution_options(yield_per=EVENT_STREAM_BATCH_SIZE)
+            ))
+            hi_events = [e for e in hi_events if e.timestamp and e.id not in clear_event_ids]
+            hi_procs = [
+                p for p in processes
+                if p.start_time and SEVERITY_RANK.get(p.severity, 0) >= SEVERITY_RANK["high"]
+            ]
+            for clear_event, finding_title in log_clear_marks:
+                if not clear_event.timestamp:
+                    continue
+                ct = _aware(clear_event.timestamp)
+                prior = [
+                    f"event: {e.summary[:120]}" for e in hi_events if _aware(e.timestamp) < ct
+                ] + [
+                    f"process: {p.name} (pid {p.pid}, flags: {', '.join(p.flags or []) or 'n/a'})"
+                    for p in hi_procs if _aware(p.start_time) < ct
+                ]
+                if not prior:
+                    continue
+                for f in session.scalars(select(Finding).where(Finding.title == finding_title)):
+                    ev = dict(f.evidence or {})
+                    ev["intrusion_window_capped"] = True
+                    ev["prior_activity"] = prior[:10]
+                    f.evidence = ev
+                    if "caps an active intrusion window" not in (f.description or ""):
+                        f.description = (f.description or "") + (
+                            f" Correlation: this log clear occurred AFTER {len(prior)} "
+                            "high/critical-severity activities in the case timeline, so it "
+                            "likely caps an active intrusion window (anti-forensics closing "
+                            "out an operation) rather than routine log maintenance."
+                        )
+
+        session.flush()
+        # Conservative-by-default: raise a finding's severity only when a second,
+        # independent rule corroborates it on the same/related entity.
+        _corroborate_findings(session, processes, disabled_rules, benign_keys)
+        mark_phase("corroboration")
+        # Re-materialise analyst-created findings, wiped with the rest of the table
+        # on a rebuild, before overrides so a benign mark on one still applies.
+        apply_manual_findings(session)
+        # User overrides last: disabled-rule and benign findings are forced to info
+        # regardless of anything above (and survive this rebuild via case_meta).
+        apply_overrides(session)
+        mark_phase("overrides")
+        session.commit()
+
+        after = len(existing)
+        logger.info(
+            "detections complete case_id=%s seconds=%.3f findings_added=%s findings_total=%s",
+            case_id, time.perf_counter() - total_started, after - before, after,
+        )
+        return after - before
+    finally:
+        session.close()
+
+
+def _check_weblog(session, existing, event, raw, web_ip_tracker) -> None:
+    """Detect web attacks in a single access-log event and accumulate per-IP stats."""
+    ip = str(raw.get("client_ip") or event.entity or "unknown")
+    request = str(raw.get("request") or "")
+    status = str(raw.get("status") or "")
+    user = raw.get("user")
+    user_agent = str(raw.get("user_agent") or "")
+    req_lower = request.lower()
+    ua_lower = user_agent.lower()
+
+    stat = web_ip_tracker[ip]
+    stat["total"] += 1
+    stat["events"].append(event)
+    if status and status[0] in ("4", "5"):
+        stat["errors"] += 1
+    if status in ("401", "403"):
+        stat["auth_fail"] += 1
+    # Successful authenticated access to the Tomcat manager after failures
+    if user and status in ("200", "302") and "/manager" in req_lower:
+        stat["auth_ok"].add(str(user))
+
+    evidence = {
+        "entity": ip, "request": request[:400], "status": status,
+        "user": user, "user_agent": user_agent[:300] or None, "event_id": event.id,
+    }
+    matched_top: str | None = None
+
+    def record(technique: str, desc: str, severity: str) -> None:
+        nonlocal matched_top
+        _add_finding(
+            session, existing,
+            title=f"Web attack: {desc}",
+            description=f"{desc} from {ip}: \"{request[:300]}\" (HTTP {status})",
+            severity=severity,
+            techniques=[technique],
+            evidence=evidence,
+            source="weblog-heuristics",
+        )
+        if matched_top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[matched_top]:
+            matched_top = severity
+
+    # These are overwhelmingly plain-substring checks, for which `in` is already
+    # C-fast; a literal prefilter gate here measured *slower* than the loop itself
+    # (unlike the all-regex cmdline path, which a prefilter genuinely accelerates).
+    for pattern, technique, desc, severity in WEB_ATTACK_PATTERNS:
+        hit = pattern.search(req_lower) if isinstance(pattern, re.Pattern) else pattern in req_lower
+        if hit:
+            # /manager/html on its own is very noisy; only flag when authenticated
+            if pattern == "/manager/html" and not user:
+                continue
+            record(technique, desc, severity)
+
+    # Scanner/attack-tool signatures identify themselves in the User-Agent header.
+    for pattern, technique, desc, severity in WEB_USER_AGENT_PATTERNS:
+        if ua_lower and pattern in ua_lower:
+            record(technique, desc, severity)
+
+    if matched_top:
+        _escalate_event(
+            session, event, matched_top,
+            f"Detection: web attack pattern in request from {ip}",
+        )
