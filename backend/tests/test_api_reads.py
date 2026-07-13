@@ -1,0 +1,303 @@
+from __future__ import annotations
+
+# ruff: noqa: E402
+#
+# Phase-4 read-layer changes:
+#   - get_case_stats collapses 3 COUNT round trips into 1.
+#   - search_events replaces a get()-per-hit N+1 with one SELECT ... IN,
+#     preserving FTS rank order; count_search_events counts all matches.
+#   - GET /events total now respects the category/severity/q filters. The
+#     substance of that fix is the filtered COUNT query, exercised here.
+
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+class _BaseModel:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    @classmethod
+    def model_validate(cls, data):
+        return cls(**data)
+
+    def model_dump_json(self, indent=None):
+        return "{}"
+
+
+sys.modules.setdefault("keyring", types.SimpleNamespace(
+    get_password=lambda *_a, **_k: None,
+    set_password=lambda *_a, **_k: None,
+    delete_password=lambda *_a, **_k: None,
+    errors=types.SimpleNamespace(PasswordDeleteError=Exception),
+))
+sys.modules.setdefault("pydantic", types.SimpleNamespace(
+    BaseModel=_BaseModel,
+    Field=lambda default=None, default_factory=None, **_k: default_factory() if default_factory else default,
+))
+
+from sqlalchemy import func, select
+from app.store import cases
+from app.store import database
+from app.store.database import Event, Finding, Process
+from app.detect import overrides
+
+
+class ApiReadTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.patches = [
+            patch.object(cases, "get_cases_dir", return_value=self.root),
+            patch.object(cases, "case_db_path", side_effect=lambda cid: self.root / cid / "case.db"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self) -> None:
+        database.dispose_all_db_engines()
+        for p in reversed(self.patches):
+            p.stop()
+        self.tmp.cleanup()
+
+    def _seed(self, cid: str) -> None:
+        s = cases.get_session(cid)
+        try:
+            for i in range(60):
+                cases.add_event(
+                    s,
+                    timestamp=None, host=None, source="sysmon",
+                    category=("process" if i % 2 else "network"),
+                    entity=f"evil{i}.exe",
+                    severity=("high" if i % 3 == 0 else "info"),
+                    summary=f"malware{i} ran evil{i}.exe from tmp",
+                    raw={"i": i},
+                )
+            for i in range(5):
+                s.add(Finding(title=f"f{i}", description="d", severity="high",
+                              mitre_techniques=["T1059"], evidence={}, source="t"))
+            for i in range(7):
+                s.add(Process(pid=100 + i, ppid=None, name=f"p{i}.exe", session_id="live"))
+            s.commit()
+        finally:
+            s.close()
+
+    def test_get_case_stats_single_query_matches_counts(self) -> None:
+        case = cases.create_case("stats")
+        self._seed(case["id"])
+        stats = cases.get_case_stats(case["id"])
+
+        s = cases.get_session(case["id"])
+        try:
+            ev = s.scalar(select(func.count()).select_from(Event))
+            fi = s.scalar(select(func.count()).select_from(Finding))
+            pr = s.scalar(select(func.count()).select_from(Process))
+        finally:
+            s.close()
+        self.assertEqual(
+            stats,
+            {"event_count": ev, "finding_count": fi, "active_finding_count": fi, "process_count": pr},
+        )
+        self.assertEqual((ev, fi, pr), (60, 5, 7))
+
+    def test_active_finding_count_excludes_suppressed(self) -> None:
+        case = cases.create_case("suppressed-stats")
+        self._seed(case["id"])
+        # Mark two of the five findings benign; apply_overrides stashes the
+        # original severity in evidence['suppressed_from'], which the stats query
+        # uses to exclude them from the active count.
+        s = cases.get_session(case["id"])
+        try:
+            targets = list(s.scalars(select(Finding)))[:2]
+            for f in targets:
+                overrides.set_finding_benign(
+                    s, overrides.finding_key(f.title, f.evidence), True
+                )
+            overrides.apply_overrides(s)
+            s.commit()
+        finally:
+            s.close()
+
+        stats = cases.get_case_stats(case["id"])
+        self.assertEqual(stats["finding_count"], 5)
+        self.assertEqual(stats["active_finding_count"], 3)
+
+    def test_get_case_stats_missing_db(self) -> None:
+        self.assertEqual(
+            cases.get_case_stats("nonexistent"),
+            {"event_count": 0, "finding_count": 0, "active_finding_count": 0, "process_count": 0},
+        )
+
+    def test_search_events_order_and_objects(self) -> None:
+        case = cases.create_case("search")
+        self._seed(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            # Reference: FTS ids in rank order, then get() per id (old behavior).
+            from sqlalchemy import text
+            rows = s.execute(
+                text("SELECT fts.rowid AS id FROM events_fts fts WHERE events_fts "
+                     "MATCH :q ORDER BY rank LIMIT :limit"),
+                {"q": "evil5", "limit": 50},
+            ).mappings().all()
+            ref = [s.get(Event, r["id"]) for r in rows if r["id"]]
+
+            got = cases.search_events(s, "evil5", limit=50)
+            self.assertEqual([e.id for e in got], [e.id for e in ref])
+            self.assertTrue(all(isinstance(e, Event) for e in got))
+            self.assertEqual(cases.count_search_events(s, "evil5"), len(ref))
+        finally:
+            s.close()
+
+    def test_count_search_events_ignores_limit(self) -> None:
+        case = cases.create_case("count")
+        self._seed(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            # bare token "ran" appears in every summary -> 60 matches, page limit 10.
+            page = cases.search_events(s, "ran", limit=10)
+            total = cases.count_search_events(s, "ran")
+            self.assertEqual(len(page), 10)
+            self.assertEqual(total, 60)
+        finally:
+            s.close()
+
+    def test_events_filtered_count(self) -> None:
+        # Mirror the router's count_stmt: total must reflect category/severity.
+        case = cases.create_case("filtered")
+        self._seed(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            def count(category=None, severity=None):
+                stmt = select(func.count()).select_from(Event)
+                if category:
+                    stmt = stmt.where(Event.category == category)
+                if severity:
+                    stmt = stmt.where(Event.severity == severity)
+                return s.scalar(stmt)
+
+            self.assertEqual(count(), 60)
+            self.assertEqual(count(category="process"), 30)
+            self.assertEqual(count(category="network"), 30)
+            self.assertEqual(count(severity="high"), 20)   # i % 3 == 0 -> 0,3,..,57
+            self.assertEqual(count(category="process", severity="high"), 10)
+            # The unfiltered count (the old bug) would have reported 60 for all.
+            self.assertNotEqual(count(category="process"), count())
+        finally:
+            s.close()
+
+    def test_search_events_respects_category_and_severity(self) -> None:
+        # Text search must combine with the category/severity dropdowns, not
+        # ignore them (the reported bug: typing text dropped the type filter).
+        case = cases.create_case("searchfilter")
+        self._seed(case["id"])
+        s = cases.get_session(case["id"])
+        try:
+            # "ran" appears in all 60 summaries; filters must still narrow it.
+            self.assertEqual(cases.count_search_events(s, "ran"), 60)
+            self.assertEqual(cases.count_search_events(s, "ran", category="process"), 30)
+            self.assertEqual(cases.count_search_events(s, "ran", severity="high"), 20)
+            self.assertEqual(
+                cases.count_search_events(s, "ran", category="process", severity="high"), 10
+            )
+            got = cases.search_events(s, "ran", limit=100, category="process", severity="high")
+            self.assertEqual(len(got), 10)
+            self.assertTrue(all(e.category == "process" and e.severity == "high" for e in got))
+        finally:
+            s.close()
+
+    def test_events_contains_search_combines_with_category(self) -> None:
+        # The Events tab uses a plain case-insensitive "contains" match (LIKE),
+        # not FTS token/prefix matching, and it combines with the category filter.
+        # Mirrors get_events' query.
+        from sqlalchemy import or_
+
+        case = cases.create_case("contains")
+        s = cases.get_session(case["id"])
+        try:
+            cases.add_event(
+                s, timestamp=None, host=None, source="DeviceNetworkEvents",
+                category="network", entity="powershell.exe", severity="info",
+                summary="powershell.exe -> github.com:443 (Tcp)", raw={},
+            )
+            cases.add_event(
+                s, timestamp=None, host=None, source="DeviceFileEvents",
+                category="filesystem", entity="a.exe", severity="info",
+                summary="downloaded from https://raw.githubusercontent.com/x/y", raw={},
+            )
+            cases.add_event(
+                s, timestamp=None, host=None, source="DeviceProcessEvents",
+                category="process", entity="git.exe", severity="info",
+                summary="git.exe clone", raw={},
+            )
+            s.commit()
+
+            def like_count(q: str, category: str | None = None) -> int:
+                like = f"%{q}%"
+                stmt = select(func.count()).select_from(Event).where(
+                    or_(
+                        Event.summary.ilike(like), Event.entity.ilike(like),
+                        Event.source.ilike(like), Event.category.ilike(like),
+                        Event.severity_reason.ilike(like),
+                    )
+                )
+                if category:
+                    stmt = stmt.where(Event.category == category)
+                return s.scalar(stmt) or 0
+
+            # "github" is a substring of two summaries; the longer/more specific
+            # string matches fewer -- predictable substring behavior, unlike FTS.
+            self.assertEqual(like_count("github"), 2)
+            self.assertEqual(like_count("githubusercontent"), 1)
+            # combines with the category dropdown
+            self.assertEqual(like_count("github", category="network"), 1)
+        finally:
+            s.close()
+
+    def test_timeline_category_aggregation_and_filter(self) -> None:
+        # Mirror get_timeline's new category (type) aggregation + categories
+        # filter, which back the timeline's "Types" filter. Only timestamped
+        # events count (the timeline requires a timestamp).
+        from datetime import datetime, timezone
+
+        case = cases.create_case("tl")
+        s = cases.get_session(case["id"])
+        try:
+            for i in range(6):
+                cases.add_event(
+                    s, timestamp=datetime(2026, 1, 1, 0, i, tzinfo=timezone.utc),
+                    host="H", source="DeviceProcessEvents.json",
+                    category=("process" if i % 2 else "network"),
+                    entity=f"p{i}", severity="info", summary=f"s{i}", raw={},
+                )
+            # a null-timestamp event must be excluded from the timeline aggregation
+            cases.add_event(
+                s, timestamp=None, host="H", source="x", category="account",
+                entity="e", severity="info", summary="s", raw={},
+            )
+            s.commit()
+
+            cat_rows = s.execute(
+                select(Event.category, func.count())
+                .where(Event.timestamp.isnot(None))
+                .group_by(Event.category)
+            ).all()
+            self.assertEqual({r[0]: r[1] for r in cat_rows}, {"process": 3, "network": 3})
+
+            filtered = s.scalar(
+                select(func.count()).select_from(Event).where(
+                    Event.timestamp.isnot(None), Event.category.in_(["process"])
+                )
+            )
+            self.assertEqual(filtered, 3)
+        finally:
+            s.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
