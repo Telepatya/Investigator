@@ -173,6 +173,63 @@ SUSPICIOUS_CMDLINE_PATTERNS: list[tuple[re.Pattern[str], str, str, str]] = [
      "T1546.003", "WMI event subscription persistence (EventFilter + CommandLineEventConsumer)", "critical"),
     (re.compile(_exe("bitsadmin") + r"/transfer\b.{0,300}https?://"),
      "T1197", "BITS transfer download from URL", "high"),
+    # --- Backconnect / reverse shells (Windows) ---
+    # PowerShell TCPClient reverse shell: the socket class plus a stream/exec verb must
+    # co-occur so a benign script that merely references TcpClient does not fire.
+    (re.compile(r"(?=.*net\.sockets\.tcpclient)(?=.*(?:getstream|\.write\(|\biex\b|invoke-expression|\$sendbyte|2>&1))"),
+     "T1059.001", "PowerShell TCP reverse shell (TCPClient)", "high"),
+    (re.compile(r"\bpowercat\b"), "T1059.001", "Powercat reverse shell / port relay", "high"),
+    # netcat with -e is command execution; require the ncat/nc.exe basename (a bare "nc"
+    # is too short a token to gate on safely) plus an actual shell/exe payload target.
+    (re.compile(r"\b(?:ncat|nc\.exe)\b[^\n]{0,80}-e\s*(?:c:\\|cmd|powershell|/bin/)"),
+     "T1059", "Netcat -e command execution", "high"),
+    # --- Tunneling / pivoting / backconnect proxies ---
+    (re.compile(_exe("netsh") + r"interface\s+portproxy\s+add\b"),
+     "T1090", "Netsh portproxy relay configured", "high"),
+    (re.compile(r"\bfrpc(?:\.exe)?\b[^\n]{0,80}(?:-c\b|\.ini\b|\.toml\b|server_addr|remote_port)"),
+     "T1572", "FRP reverse-tunnel client", "high"),
+    (re.compile(r"\b(?:revsocks|stowaway|ligolo(?:-ng)?|neo-?regeorg|regeorg|pystinger)\b"),
+     "T1090", "SOCKS / reverse tunneling proxy tool", "high"),
+    # --- Known C2 frameworks / RAT families (distinctive tool names) ---
+    (re.compile(r"\bposhc2\b"), "T1071", "PoshC2 framework reference", "critical"),
+    (re.compile(r"\bnimplant\b"), "T1071", "NimPlant C2 implant reference", "critical"),
+    (re.compile(r"\bkoadic\b"), "T1059.007", "Koadic C2 (JScript/VBScript)", "critical"),
+    (re.compile(r"\bbrute\s?ratel\b|\bbruteratel\b"), "T1071", "Brute Ratel C4 framework reference", "critical"),
+    (re.compile(r"\bpupy\b"), "T1071", "Pupy cross-platform RAT reference", "high"),
+    (re.compile(r"\b(?:asyncrat|njrat|dcrat|nanocore|xworm|remcos)\b"),
+     "T1219", "Commodity RAT family reference", "high"),
+    # --- Defense evasion: in-memory AMSI / ETW bypasses ---
+    (re.compile(r"\bamsiutils\b|\bamsiinitfailed\b|\bamsiscanbuffer\b"),
+     "T1562.001", "AMSI bypass technique", "high"),
+    (re.compile(r"\betweventwrite\b"), "T1562.006", "ETW tracing patched/blocked (etwEventWrite)", "medium"),
+    # WDigest cleartext credential caching re-enabled (UseLogonCredential = 1).
+    (re.compile(r"(?=.*wdigest)(?=.*uselogoncredential)(?=.*\b(?:1|0x0*1)\b)"),
+     "T1003.001", "WDigest cleartext credential caching enabled", "high"),
+    # --- Ransomware precursors: shadow-copy removal via WMI/PowerShell ---
+    (re.compile(r"\bwmic\b[^\n]{0,40}shadowcopy\s+delete\b"),
+     "T1490", "Shadow copy deletion via WMIC", "critical"),
+    (re.compile(r"(?=.*win32_shadowcopy)(?=.*(?:\.delete\(\)|remove-wmiobject|remove-ciminstance|removeciminstance))"),
+     "T1490", "Shadow copy deletion via WMI object", "critical"),
+    # --- Additional proxy-execution / injection LOLBins ---
+    (re.compile(r"\bmavinject(?:\.exe)?\b[^\n]{0,40}/injectrunning\b"),
+     "T1055", "Process injection via mavinject /INJECTRUNNING", "high"),
+    (re.compile(r"\bcertoc(?:\.exe)?\b[^\n]{0,40}-loaddll\b"),
+     "T1218", "Certoc.exe DLL load (proxy execution)", "high"),
+    (re.compile(r"\bconhost(?:\.exe)?\b[^\n]{0,20}--headless\b"),
+     "T1564.003", "Conhost headless execution (hidden console)", "medium"),
+    # --- DNS-based C2 / exfil probes ---
+    (re.compile(r"(?:nslookup|resolve-dnsname)\b[^\n]{0,80}(?:-type[= ]txt|-q[= ]txt|-querytype[= ]txt|\btxt\b[^\n]{0,20}@)"),
+     "T1071.004", "DNS TXT query (possible C2 channel)", "low"),
+    # --- Supply chain: package installs from non-registry / URL sources ---
+    (re.compile(r"\bnpm\s+(?:install|ci|exec)\b[^\n]{0,160}(?:git\+https?://|https?://[^\s]+\.(?:tgz|tar\.gz))"),
+     "T1195.001", "npm install from a non-registry URL", "medium"),
+    (re.compile(r"\bpip[0-9]?\s+install\b[^\n]{0,160}(?:git\+https?://|--index-url\s+https?://(?!(?:pypi\.org|files\.pythonhosted\.org))|https?://[^\s]+\.(?:whl|tar\.gz|zip))"),
+     "T1195.001", "pip install from a non-PyPI URL", "medium"),
+    # --- Git: attacker-tooling pull / hook-based persistence ---
+    (re.compile(r"\bgit\s+clone\b[^\n]{0,120}https?://\d{1,3}(?:\.\d{1,3}){3}"),
+     "T1105", "git clone from a raw IP address", "medium"),
+    (re.compile(r"\bcore\.hookspath\b"),
+     "T1546", "git core.hooksPath set (hook persistence)", "medium"),
 ]
 
 # Expected parent for common system processes (lowercase)
@@ -343,6 +400,18 @@ WEB_ATTACK_PATTERNS: list[tuple[str | re.Pattern[str], str, str, str]] = [
     ("/manager/deploy", "T1505.003", "Tomcat Manager app deployment", "high"),
     ("/manager/upload", "T1505.003", "Tomcat Manager app upload", "high"),
     (".war", "T1505.003", "WAR archive deployment (webshell vector)", "high"),
+    # Exploitation of public-facing apps: well-known RCE payload shapes.
+    ("${jndi:", "T1190", "Log4Shell JNDI injection (${jndi:})", "critical"),
+    ("class.module.classloader", "T1190", "Spring4Shell class-loader manipulation", "critical"),
+    ("%{(", "T1190", "Struts OGNL injection (%{...})", "critical"),
+    ("eval-stdin.php", "T1190", "PHPUnit eval-stdin RCE (CVE-2017-9841)", "critical"),
+    ("() {", "T1190", "Shellshock payload (() { )", "critical"),
+    (re.compile(r"/wp-content/uploads/[^\s?]+\.php"),
+     "T1505.003", "PHP in WordPress uploads (web shell)", "high"),
+    # Source / secret disclosure and SSRF against cloud metadata.
+    ("/.git/", "T1190", "Exposed .git repository access", "medium"),
+    ("/.env", "T1552", "Exposed .env configuration file access", "medium"),
+    ("169.254.169.254", "T1552.005", "SSRF to cloud metadata endpoint", "high"),
 ]
 
 # Scanner/attack-tool signatures that live in the *User-Agent* header, not the request
@@ -420,6 +489,67 @@ LINUX_SUSPICIOUS_CMDLINE_PATTERNS: list[tuple[re.Pattern[str], str, str, str]] =
     # Persistence via systemd (noisy: legitimate admin action too, so low).
     (re.compile(r"\bsystemctl\s+enable\s+(?!.*(?:ssh|sshd|network|cron|getty|systemd-)\b)\S+"),
      "T1543.002", "systemd service enabled for persistence", "low"),
+    # --- Backconnect / reverse shells: additional interpreters ---
+    (re.compile(r"\bphp\b[^\n]{0,16}-r\b[^\n]{0,240}(?:fsockopen|pfsockopen)\b"),
+     "T1059.004", "PHP socket reverse shell", "critical"),
+    (re.compile(r"\bruby\b[^\n]{0,240}\btcpsocket\.new\b[^\n]{0,120}(?:exec|/bin/(?:ba)?sh)"),
+     "T1059.004", "Ruby socket reverse shell", "critical"),
+    (re.compile(r"\bawk\b[^\n]{0,240}/inet/tcp/"),
+     "T1059.004", "awk /inet/tcp reverse shell", "critical"),
+    # Fetch-and-run variants the plain "| sh" rule misses (sudo in the middle; piped to python).
+    (re.compile(r"\b(?:curl|wget)\b[^|;&\n]{0,300}\|\s*sudo\s+(?:-\S+\s+)*(?:ba|z|da|a)?sh\b"),
+     "T1059.004", "Download piped to a root shell (sudo)", "critical"),
+    (re.compile(r"\b(?:curl|wget)\b[^|;&\n]{0,300}\|\s*(?:sudo\s+)?python[23]?\b"),
+     "T1059.006", "Download piped to Python interpreter", "high"),
+    # --- Supply chain: dependency installs from URL / non-official sources ---
+    (re.compile(r"\bpip[0-9]?\s+install\b[^\n]{0,200}(?:git\+https?://|--index-url\s+https?://(?!(?:pypi\.org|files\.pythonhosted\.org))|https?://\S+\.(?:whl|tar\.gz|zip))"),
+     "T1195.001", "pip install from a non-PyPI source", "medium"),
+    (re.compile(r"\bnpm\s+(?:install|ci|exec)\b[^\n]{0,200}(?:git\+https?://|https?://\S+\.(?:tgz|tar\.gz))"),
+     "T1195.001", "npm install from a non-registry URL", "medium"),
+    (re.compile(r"\bnpx\s+https?://"),
+     "T1059.007", "npx executing a remote script", "medium"),
+    # --- Git: attacker-tooling pull / hook persistence ---
+    (re.compile(r"\bgit\s+clone\b[^\n]{0,120}https?://\d{1,3}(?:\.\d{1,3}){3}"),
+     "T1105", "git clone from a raw IP address", "medium"),
+    (re.compile(r"\bcore\.hookspath\b"),
+     "T1546", "git core.hooksPath set (hook persistence)", "medium"),
+    # --- Tunneling / pivoting / backconnect ---
+    (re.compile(r"\bssh\b[^\n]{0,160}-r\s*\*?\d{1,5}:"),
+     "T1572", "SSH remote port-forward (reverse tunnel)", "medium"),
+    (re.compile(r"\bssh\b[^\n]{0,160}-d\s*\d{1,5}\b"),
+     "T1572", "SSH dynamic SOCKS proxy", "low"),
+    (re.compile(r"\bchisel\s+(?:client|server)\b|\bfrpc\b[^\n]{0,60}(?:-c\b|\.ini\b|\.toml\b)"),
+     "T1572", "Reverse tunneling / proxy tool (chisel/frp)", "high"),
+    (re.compile(r"\bngrok\b\s+(?:tcp|http|start)\b"),
+     "T1572", "Ngrok tunnel established", "medium"),
+    # --- Defense evasion: disabling host protections ---
+    (re.compile(r"\bsetenforce\s+0\b"),
+     "T1562.001", "SELinux enforcement disabled (setenforce 0)", "medium"),
+    (re.compile(r"\biptables\b[^\n]{0,20}(?:-f\b|--flush\b)|\bufw\s+disable\b|\bsystemctl\s+stop\s+firewalld\b"),
+     "T1562.004", "Host firewall flushed / disabled", "medium"),
+    (re.compile(r"\bchattr\s+[+-]i\b"),
+     "T1222.002", "Immutable attribute toggled (chattr)", "low"),
+    # --- Persistence via shell / cron redirect ---
+    (re.compile(r"\bcrontab\b\s+-(?:\s|$)"),
+     "T1053.003", "crontab installed from stdin", "low"),
+    (re.compile(r">>?\s*(?:~|/root|/home/[^/\s]+|\$home)/\.(?:bashrc|bash_profile|bash_login|profile|zshrc|zshenv)\b"),
+     "T1546.004", "Shell rc file modified via redirect", "low"),
+    (re.compile(r"\bld_preload\s*=\s*\S+\.so\b"),
+     "T1574.006", "LD_PRELOAD library injection (inline)", "medium"),
+    # --- Credential access ---
+    (re.compile(r"\b(?:cat|less|more|head|tail|cp|strings|xxd|base64)\b[^\n]{0,40}/etc/shadow\b"),
+     "T1003.008", "Read /etc/shadow password hashes", "high"),
+    (re.compile(r"\bfind\b[^\n]{0,120}-name\b[^\n]{0,20}['\"]?id_(?:rsa|dsa|ecdsa|ed25519)\b"),
+     "T1552.004", "Search for SSH private keys", "medium"),
+    (re.compile(r"\bmimipenguin\b|\bunshadow\b|\blazagne\b"),
+     "T1003.008", "Linux credential-dumping tool", "critical"),
+    # --- Cloud / container abuse ---
+    (re.compile(r"\b(?:curl|wget)\b[^\n]{0,80}169\.254\.169\.254"),
+     "T1552.005", "Cloud metadata service access", "medium"),
+    (re.compile(r"\bnsenter\b[^\n]{0,60}--target\s+1\b"),
+     "T1611", "nsenter into host namespace (container escape)", "high"),
+    (re.compile(r"\bdocker\s+run\b[^\n]{0,200}(?:--privileged|--pid[= ]host|--net[= ]host|-v\s*/:/)"),
+     "T1610", "Privileged / host-mounted container run", "medium"),
 ]
 
 # Linux persistence file locations -> (path fragment, technique, description, severity).
@@ -439,6 +569,61 @@ LINUX_PERSISTENCE_PATHS: list[tuple[str, str, str, str]] = [
     ("/.bash_profile", "T1546.004", "Shell rc persistence (.bash_profile)", "low"),
     ("/etc/profile.d", "T1546.004", "System-wide shell profile persistence", "low"),
 ]
+
+# --- Domain / DNS reputation heuristics --------------------------------------
+# These are deliberately WEAK signals (mostly "low"): a benign site can live on a
+# cheap TLD and a CDN label can look random. They exist to give the correlation
+# pass something to combine with beaconing / download / process context, not to
+# stand alone. Each observed domain is scored once (deduplicated in the engine),
+# so cost scales with the number of *distinct* domains, not the event volume.
+
+# Abuse-prone / free / high-risk TLDs (the effective top label, lowercased).
+# Kept to genuinely abuse-heavy TLDs; legitimate sites do use several of these,
+# hence the low base severity. ".onion" (Tor) is included as a stronger tell.
+SUSPICIOUS_TLDS: set[str] = {
+    "xyz", "top", "tk", "ml", "ga", "cf", "gq", "work", "click", "link", "country",
+    "kim", "men", "loan", "download", "zip", "mov", "rest", "cam", "quest", "sbs",
+    "cyou", "icu", "buzz", "monster", "fit", "surf", "gdn", "pw", "bar", "best",
+    "wtf", "party", "review", "stream", "racing", "date", "onion",
+}
+
+# Dynamic-DNS / quick-tunnel providers frequently used for C2 and exfil egress.
+DYNAMIC_DNS_SUFFIXES: tuple[str, ...] = (
+    "duckdns.org", "no-ip.com", "no-ip.org", "noip.com", "ddns.net", "hopto.org",
+    "zapto.org", "serveo.net", "ngrok.io", "ngrok-free.app", "ngrok.app",
+    "trycloudflare.com", "localtunnel.me", "loca.lt", "portmap.io", "dynu.com",
+    "freedns.afraid.org", "sslip.io", "nip.io", "pagekite.me", "myftp.org",
+    "servehttp.com", "serveftp.com", "hopto.org", "chickenkiller.com",
+)
+
+# High-volume benign parents / CDNs whose (often random-looking) subdomains would
+# otherwise trip the entropy heuristic. A host equal to or under any of these is
+# skipped entirely.
+DOMAIN_ANALYSIS_ALLOWLIST: tuple[str, ...] = (
+    "microsoft.com", "windows.com", "windowsupdate.com", "msftncsi.com", "msftconnecttest.com",
+    "msn.com", "office.com", "office365.com", "live.com", "outlook.com", "sharepoint.com",
+    "azure.com", "azureedge.net", "azurewebsites.net", "windows.net", "msedge.net", "skype.com",
+    "google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "youtube.com",
+    "gvt1.com", "gvt2.com", "doubleclick.net", "ggpht.com",
+    "apple.com", "icloud.com", "mzstatic.com", "cdn-apple.com",
+    "akamai.net", "akamaiedge.net", "akadns.net", "edgekey.net", "edgesuite.net",
+    "cloudflare.com", "cloudflare.net", "cloudfront.net", "fastly.net",
+    "amazonaws.com", "amazon.com", "aws.dev",
+    "fbcdn.net", "facebook.com", "instagram.com", "whatsapp.net",
+    "digicert.com", "verisign.com", "sectigo.com", "letsencrypt.org",
+    "mozilla.org", "mozilla.net", "firefox.com", "ubuntu.com", "debian.org", "archlinux.org",
+    "github.com", "githubusercontent.com", "githubassets.com", "cloudflare-dns.com",
+)
+
+# DGA / high-entropy registrable-label thresholds and DNS-tunnelling shape limits.
+DGA_MIN_LABEL_LEN = 12
+DGA_MIN_ENTROPY = 3.8            # bits/char over the registrable label
+DNS_TUNNEL_MIN_QNAME_LEN = 60
+DNS_TUNNEL_MIN_LABELS = 5
+DNS_TUNNEL_MIN_LABEL_LEN = 30
+# Cap on domain-indicator findings per run so a case full of DGA noise can't emit
+# an unbounded number of (individually weak) findings.
+DOMAIN_FINDING_CAP = 300
 
 MITRE_TECHNIQUE_NAMES: dict[str, str] = {
     "T1003": "OS Credential Dumping",
@@ -538,4 +723,25 @@ MITRE_TECHNIQUE_NAMES: dict[str, str] = {
     "T1021.004": "SSH",
     "T1078.003": "Local Accounts",
     "T1078.004": "Cloud Accounts",
+    # Expanded coverage: backconnect/tunneling, C2/RAT, supply chain, git, cloud/container
+    "T1059.006": "Python",
+    "T1071.004": "DNS",
+    "T1195.001": "Compromise Software Dependencies and Development Tools",
+    "T1219": "Remote Access Software",
+    "T1218": "System Binary Proxy Execution",
+    "T1546": "Event Triggered Execution",
+    "T1552": "Unsecured Credentials",
+    "T1552.004": "Private Keys",
+    "T1552.005": "Cloud Instance Metadata API",
+    "T1562.006": "Indicator Blocking",
+    "T1003.008": "/etc/passwd and /etc/shadow",
+    "T1610": "Deploy Container",
+    "T1611": "Escape to Host",
+    "T1213": "Data from Information Repositories",
+    # Domain / DNS reputation
+    "T1036": "Masquerading",
+    "T1048": "Exfiltration Over Alternative Protocol",
+    "T1071.001": "Web Protocols",
+    "T1568": "Dynamic Resolution",
+    "T1568.002": "Domain Generation Algorithms",
 }

