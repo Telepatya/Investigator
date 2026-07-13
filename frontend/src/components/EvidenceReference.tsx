@@ -109,8 +109,9 @@ export function EvidenceLinkedText({ caseId, text }: { caseId: string; text: str
 }
 
 /** Safe, deliberately small Markdown renderer for AI-authored case text.
- * Raw HTML is never interpreted. Evidence tokens become in-app detail links,
- * including grouped model output such as [[finding:10], [finding:15]]. */
+ * Raw HTML and external navigation are never interpreted. Evidence tokens
+ * become in-app detail links, including grouped model output such as
+ * [[finding:10], [finding:15]]. */
 export function EvidenceMarkdown({ caseId, text }: { caseId: string; text: string }) {
   const lines = text.replace(/\r\n?/g, "\n").split("\n");
   const blocks: ReactNode[] = [];
@@ -260,9 +261,10 @@ function renderInline(caseId: string, text: string, keyPrefix: string): ReactNod
     } else {
       const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
       nodes.push(link ? (
-        <a key={key} href={link[2]} target="_blank" rel="noreferrer" className="text-accent-cyan underline decoration-accent-cyan/40 underline-offset-2 hover:decoration-accent-cyan">
-          {link[1]}
-        </a>
+        <span key={key} className="break-all text-accent-cyan" title="External links from AI responses are displayed as text for safety">
+          <span className="font-medium">{link[1]}</span>
+          <span className="text-ink-500"> ({link[2]})</span>
+        </span>
       ) : <Fragment key={key}>{token}</Fragment>);
     }
     cursor = start + token.length;

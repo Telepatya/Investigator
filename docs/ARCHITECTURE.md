@@ -457,7 +457,7 @@ area. Existing route paths remain stable:
 ```
 
 Streaming assistant messages are rendered by a safe React Markdown subset: raw
-HTML is treated as text, external Markdown links are limited to HTTP(S)/mailto,
+HTML is treated as text, external Markdown URLs are displayed without navigation,
 and `[[event:id]]` / `[[finding:id]]` tokens become case-scoped evidence drawers.
 The citation tokenizer also accepts singly bracketed or grouped model output so a
 formatting variation cannot strand an otherwise valid evidence reference.
