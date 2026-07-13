@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api import analysis_router, cases_router, settings_router
-from app.api.security import ALLOWED_HOSTS, allowed_origins
+from app.api.security import ALLOWED_HOSTS, allowed_origins, authorize_http
 from app.config import ensure_dirs
 from app.store.cases import (
     CaseNotFoundError,
@@ -88,6 +88,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _enforce_http_origin(request: Request, call_next):
+    # CORS controls whether a hostile page can read a response; it does not stop
+    # a browser from sending a "simple" multipart/form-data request. Reject
+    # present-but-untrusted Origins before any state-changing route can run.
+    if not authorize_http(request):
+        return JSONResponse(status_code=403, content={"detail": "Origin not allowed"})
+    return await call_next(request)
 
 
 @app.exception_handler(CaseNotFoundError)

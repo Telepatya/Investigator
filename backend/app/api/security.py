@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 
-from fastapi import WebSocket
+from fastapi import Request, WebSocket
 
 from app.store import cases as case_store
 
@@ -20,6 +20,7 @@ from app.store import cases as case_store
 # ``evil.example`` resolving to 127.0.0.1 arrives with that name in the Host
 # header and is rejected by TrustedHostMiddleware built from this list.
 ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+STATE_CHANGING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 
 def allowed_origins() -> list[str]:
@@ -33,6 +34,23 @@ def allowed_origins() -> list[str]:
     ]
 
 
+def has_allowed_origin(origin: str | None) -> bool:
+    """Allow non-browser clients and our known browser origins only.
+
+    Command-line clients generally omit ``Origin``. Browsers include it for
+    cross-origin requests, so a present value is authoritative and must match
+    the frontend allowlist.
+    """
+    return origin is None or origin in set(allowed_origins())
+
+
+def authorize_http(request: Request) -> bool:
+    """Reject cross-origin browser writes; CORS alone only hides responses."""
+    if request.method.upper() not in STATE_CHANGING_METHODS:
+        return True
+    return has_allowed_origin(request.headers.get("origin"))
+
+
 async def authorize_ws(websocket: WebSocket, case_id: str) -> bool:
     """Reject a WebSocket handshake from a disallowed origin or unknown case.
 
@@ -42,8 +60,7 @@ async def authorize_ws(websocket: WebSocket, case_id: str) -> bool:
     ``Origin`` means a non-browser client, which cannot be a cross-site vector.
     Closing before ``accept()`` denies the handshake with an HTTP 403.
     """
-    origin = websocket.headers.get("origin")
-    if origin is not None and origin not in set(allowed_origins()):
+    if not has_allowed_origin(websocket.headers.get("origin")):
         await websocket.close(code=1008)
         return False
     if not case_store.case_exists(case_id):

@@ -12,6 +12,7 @@ import keyring
 from pydantic import BaseModel, Field
 
 SERVICE_NAME = "investigator-dfir"
+UPLOAD_STAGING_PREFIX = ".investigator-upload-"
 DEFAULT_CONFIG_DIR = Path.home() / ".investigator"
 DEFAULT_CASES_DIR = DEFAULT_CONFIG_DIR / "cases"
 CONFIG_FILE = DEFAULT_CONFIG_DIR / "config.json"

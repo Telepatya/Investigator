@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 import aiofiles
@@ -14,6 +17,7 @@ from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
 
 from app.api.security import authorize_ws
 from app.config import (
+    UPLOAD_STAGING_PREFIX,
     case_dir_path,
     case_upload_file_path,
     case_uploads_path,
@@ -128,6 +132,7 @@ async def delete_case(case_id: str) -> dict:
     if not await asyncio.to_thread(case_store.case_exists, case_id):
         raise HTTPException(404, "Case not found")
     async with coordinator.run(case_id, "case deletion"):
+        _discard_case_uploads(case_id)
         if not await asyncio.to_thread(case_store.delete_case, case_id):
             raise HTTPException(404, "Case not found")
     return {"ok": True}
@@ -140,11 +145,26 @@ MAX_UPLOAD_BYTES = int(os.environ.get("INVESTIGATOR_MAX_UPLOAD_BYTES", str(64 * 
 MAX_CASE_BYTES = int(os.environ.get("INVESTIGATOR_MAX_CASE_BYTES", str(256 * 1024 ** 3)))
 
 
+@dataclass
+class _ChunkUploadState:
+    part_path: Path
+    total_chunks: int
+    next_index: int
+    bytes_written: int
+    file_type: str
+    mem_forensic_timeline: bool
+    mem_eventlogs: bool
+
+
+_CHUNK_UPLOADS: dict[tuple[str, str], _ChunkUploadState] = {}
+
+
 def _uploads_total_bytes(case_id: str) -> int:
+    """Return committed evidence bytes, excluding private staging files."""
     total = 0
     for path in case_uploads_path(case_id).iterdir():
         try:
-            if path.is_file():
+            if path.is_file() and not path.name.startswith(UPLOAD_STAGING_PREFIX):
                 total += path.stat().st_size
         except OSError:
             continue
@@ -158,6 +178,74 @@ def _remove_partial(path: Path) -> None:
         pass
 
 
+def _staging_path(destination: Path, suffix: str) -> Path:
+    return destination.parent / f"{UPLOAD_STAGING_PREFIX}{uuid.uuid4().hex}.{suffix}"
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size if path.is_file() else 0
+    except OSError:
+        return 0
+
+
+def _discard_chunk_upload(case_id: str, safe_name: str) -> None:
+    state = _CHUNK_UPLOADS.pop((case_id, safe_name), None)
+    if state is not None:
+        _remove_partial(state.part_path)
+
+
+def _discard_case_uploads(case_id: str) -> None:
+    for state_key in [key for key in _CHUNK_UPLOADS if key[0] == case_id]:
+        state = _CHUNK_UPLOADS.pop(state_key)
+        _remove_partial(state.part_path)
+
+
+def _append_staged_chunk(part_path: Path, chunk_path: Path, expected_size: int) -> None:
+    """Append one validated chunk, restoring the prior length on write failure."""
+    try:
+        with open(part_path, "ab") as part, open(chunk_path, "rb") as chunk:
+            shutil.copyfileobj(chunk, part, length=4 * 1024 * 1024)
+    except BaseException:
+        try:
+            with open(part_path, "r+b") as part:
+                part.truncate(expected_size)
+        except OSError:
+            pass
+        raise
+
+
+def _truncate_file(path: Path, size: int) -> None:
+    with open(path, "r+b") as handle:
+        handle.truncate(size)
+
+
+async def _stage_upload(
+    upload: UploadFile,
+    target: Path,
+    *,
+    existing_file_bytes: int,
+    other_case_bytes: int,
+) -> int:
+    """Stream to a private file while enforcing projected file and case sizes."""
+    request_bytes = 0
+    async with aiofiles.open(target, "wb") as out:
+        while True:
+            chunk = await upload.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            projected_file_bytes = existing_file_bytes + request_bytes + len(chunk)
+            if projected_file_bytes > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, "Upload exceeds the per-file size limit")
+            if other_case_bytes + projected_file_bytes > MAX_CASE_BYTES:
+                raise HTTPException(
+                    413, "Case storage limit reached; delete evidence before uploading more",
+                )
+            await out.write(chunk)
+            request_bytes += len(chunk)
+    return request_bytes
+
+
 @router.post("/{case_id}/upload")
 async def upload_file(
     case_id: str,
@@ -166,30 +254,34 @@ async def upload_file(
     mem_forensic_timeline: bool = False,
     mem_eventlogs: bool = False,
 ) -> dict:
-    safe_name, dest = _upload_destination(case_id, file.filename)
-    if await asyncio.to_thread(_uploads_total_bytes, case_id) >= MAX_CASE_BYTES:
-        raise HTTPException(413, "Case storage limit reached; delete evidence before uploading more")
-    try:
-        written = 0
-        async with aiofiles.open(dest, "wb") as out:
-            while True:
-                chunk = await file.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "Upload exceeds the per-file size limit")
-                await out.write(chunk)
-    except HTTPException:
-        await asyncio.to_thread(_remove_partial, dest)
-        raise
+    validated_case_id = _validated_case_id(case_id)
+    safe_name = _safe_upload_name(file.filename)
+    async with coordinator.run(validated_case_id, "evidence upload"):
+        safe_name, dest = _upload_destination(validated_case_id, safe_name)
+        _discard_chunk_upload(validated_case_id, safe_name)
+        staging = _staging_path(dest, "part")
+        committed = False
+        try:
+            total = await asyncio.to_thread(_uploads_total_bytes, validated_case_id)
+            replaced_size = await asyncio.to_thread(_file_size, dest)
+            await _stage_upload(
+                file,
+                staging,
+                existing_file_bytes=0,
+                other_case_bytes=max(total - replaced_size, 0),
+            )
+            await asyncio.to_thread(os.replace, staging, dest)
+            committed = True
+        finally:
+            if not committed:
+                await asyncio.to_thread(_remove_partial, staging)
 
     # kick off ingestion in the background
     memory_options = {
         "forensic_timeline": bool(mem_forensic_timeline),
         "eventlogs": bool(mem_eventlogs),
     }
-    asyncio.create_task(manager.run_ingestion(case_id, dest, file_type, memory_options))
+    asyncio.create_task(manager.run_ingestion(validated_case_id, dest, file_type, memory_options))
     return {"ok": True, "filename": safe_name, "path": str(dest)}
 
 
@@ -205,40 +297,92 @@ async def upload_chunk(
     mem_eventlogs: bool = False,
 ) -> dict:
     """Chunked upload for multi-GB memory dumps."""
-    safe_name, dest = _upload_destination(case_id, filename)
     if total_chunks < 1 or chunk_index < 0 or chunk_index >= total_chunks:
         raise HTTPException(400, "Invalid chunk sequence")
-    dest_exists = await asyncio.to_thread(dest.exists)
-    if chunk_index == 0:
-        if await asyncio.to_thread(_uploads_total_bytes, case_id) >= MAX_CASE_BYTES:
-            raise HTTPException(413, "Case storage limit reached; delete evidence before uploading more")
-    elif not dest_exists:
-        # Appending to a file that was never started means chunks arrived out of
-        # order; refuse rather than silently writing a corrupt dump.
-        raise HTTPException(409, "Chunk received out of order; restart the upload")
-    mode = "wb" if chunk_index == 0 else "ab"
-    already = await asyncio.to_thread(lambda: dest.stat().st_size) if mode == "ab" else 0
-    try:
-        written = already
-        async with aiofiles.open(dest, mode) as out:
-            while True:
-                chunk = await file.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "Upload exceeds the per-file size limit")
-                await out.write(chunk)
-    except HTTPException:
-        await asyncio.to_thread(_remove_partial, dest)
-        raise
+    validated_case_id = _validated_case_id(case_id)
+    safe_name = _safe_upload_name(filename)
+    complete = False
+    async with coordinator.run(validated_case_id, "chunked evidence upload"):
+        safe_name, dest = _upload_destination(validated_case_id, safe_name)
+        state_key = (validated_case_id, safe_name)
+        if chunk_index == 0:
+            _discard_chunk_upload(*state_key)
+            part_path = _staging_path(dest, "parts")
+            await asyncio.to_thread(part_path.touch)
+            state = _ChunkUploadState(
+                part_path=part_path,
+                total_chunks=total_chunks,
+                next_index=0,
+                bytes_written=0,
+                file_type=file_type,
+                mem_forensic_timeline=bool(mem_forensic_timeline),
+                mem_eventlogs=bool(mem_eventlogs),
+            )
+            _CHUNK_UPLOADS[state_key] = state
+        else:
+            state = _CHUNK_UPLOADS.get(state_key)
+            if state is None:
+                raise HTTPException(409, "Chunk received out of order; restart the upload")
 
-    if chunk_index + 1 >= total_chunks:
+        metadata = (
+            total_chunks,
+            file_type,
+            bool(mem_forensic_timeline),
+            bool(mem_eventlogs),
+        )
+        expected_metadata = (
+            state.total_chunks,
+            state.file_type,
+            state.mem_forensic_timeline,
+            state.mem_eventlogs,
+        )
+        if metadata != expected_metadata:
+            raise HTTPException(409, "Upload metadata changed; restart the upload")
+        if chunk_index != state.next_index:
+            raise HTTPException(
+                409, f"Expected chunk {state.next_index}; received chunk {chunk_index}",
+            )
+
+        request_staging = _staging_path(dest, "chunk")
+        try:
+            total = await asyncio.to_thread(_uploads_total_bytes, validated_case_id)
+            replaced_size = await asyncio.to_thread(_file_size, dest)
+            chunk_bytes = await _stage_upload(
+                file,
+                request_staging,
+                existing_file_bytes=state.bytes_written,
+                other_case_bytes=max(total - replaced_size, 0),
+            )
+            if chunk_bytes == 0:
+                raise HTTPException(400, "Upload chunks must not be empty")
+            await asyncio.to_thread(
+                _append_staged_chunk,
+                state.part_path,
+                request_staging,
+                state.bytes_written,
+            )
+            if chunk_index + 1 == state.total_chunks:
+                try:
+                    await asyncio.to_thread(os.replace, state.part_path, dest)
+                except BaseException:
+                    await asyncio.to_thread(_truncate_file, state.part_path, state.bytes_written)
+                    raise
+                _CHUNK_UPLOADS.pop(state_key, None)
+                complete = True
+            else:
+                state.bytes_written += chunk_bytes
+                state.next_index += 1
+        finally:
+            await asyncio.to_thread(_remove_partial, request_staging)
+
+    if complete:
         memory_options = {
-            "forensic_timeline": bool(mem_forensic_timeline),
-            "eventlogs": bool(mem_eventlogs),
+            "forensic_timeline": state.mem_forensic_timeline,
+            "eventlogs": state.mem_eventlogs,
         }
-        asyncio.create_task(manager.run_ingestion(case_id, dest, file_type, memory_options))
+        asyncio.create_task(
+            manager.run_ingestion(validated_case_id, dest, state.file_type, memory_options),
+        )
         return {"ok": True, "complete": True, "filename": safe_name}
     return {"ok": True, "complete": False, "chunk_index": chunk_index}
 
@@ -256,6 +400,9 @@ async def delete_evidence(case_id: str, name: str) -> dict:
         raise HTTPException(404, "Case not found")
     loop = asyncio.get_running_loop()
     async with coordinator.run(case_id, "evidence deletion"):
+        safe_name = evidence_store.sanitize_upload_filename(name)
+        if safe_name:
+            _discard_chunk_upload(case_id, safe_name)
         result = await loop.run_in_executor(None, evidence_store.delete_evidence, case_id, name)
     if result is None:
         raise HTTPException(404, "Evidence file not found")

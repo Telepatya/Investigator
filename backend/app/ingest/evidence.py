@@ -10,14 +10,13 @@ from typing import Any
 
 from sqlalchemy import bindparam, delete as sqldelete, func, select, text
 
-from app.config import case_uploads_path
+from app.config import UPLOAD_STAGING_PREFIX, case_uploads_path
 from app.ingest.parsers import PARSABLE_EXTENSIONS, _source_from_member
 from app.ingest.pipeline import MEMORY_EXTENSIONS
 from app.memory.forensics import memprocfs_artifact_dir, remove_memprocfs_artifacts
 from app.store import cases as case_store
 from app.store.cases import _rmtree_with_retries
 from app.store.database import Event, Finding, MemoryResult, Process, compact_db
-
 
 def sanitize_upload_filename(filename: str | None) -> str | None:
     """Reduce a client-supplied filename to a bare basename so an upload can
@@ -85,7 +84,7 @@ def list_evidence(case_id: str) -> list[dict[str, Any]]:
     try:
         items: list[dict[str, Any]] = []
         for path in sorted(uploads.iterdir()):
-            if path.is_dir():
+            if path.is_dir() or path.name.startswith(UPLOAD_STAGING_PREFIX):
                 continue  # extracted zip contents
             kind = _kind(path)
             sources = _effective_sources(session, path)

@@ -94,6 +94,10 @@ backend enforces origin/host controls, centralized in `backend/app/api/security.
   hostname in `Host` and is refused.
 - **CORS allowlist.** Cross-origin HTTP reads are limited to the built app on
   `INVESTIGATOR_PORT` and the Vite dev server on `:5173`.
+- **HTTP Origin validation.** CORS does not stop a browser from sending a simple
+  cross-origin write such as `multipart/form-data`. Every `POST`, `PUT`, `PATCH`,
+  and `DELETE` with a present `Origin` is therefore rejected unless it matches
+  the frontend allowlist. Non-browser clients may omit `Origin`.
 - **WebSocket origin validation.** CORS does not apply to WebSocket handshakes, so
   every WebSocket route validates the browser `Origin` against the same allowlist
   (and the target case's existence) *before* accepting. A missing `Origin` denotes
@@ -112,9 +116,16 @@ security (e.g. a reverse proxy) before doing so.
 Untrusted uploads and archives are bounded so they cannot exhaust local disk or
 memory:
 
-- Per-file and per-case upload caps (`INVESTIGATOR_MAX_UPLOAD_BYTES` and
-  `INVESTIGATOR_MAX_CASE_BYTES`; defaults are generous because memory dumps are
-  legitimately large) and chunk-order validation for resumable uploads.
+- Per-file and projected per-case upload caps (`INVESTIGATOR_MAX_UPLOAD_BYTES`
+  and `INVESTIGATOR_MAX_CASE_BYTES`; defaults are generous because memory dumps
+  are legitimately large). Quota decisions and writes are serialized per case,
+  and ordinary replacements are staged then atomically committed so a rejected
+  or interrupted upload cannot destroy the previous evidence file.
+- Chunked uploads retain private partial state and require the exact next index,
+  stable total-chunk count, and stable ingestion options. Each request chunk is
+  validated before append; skipped, duplicate, empty, oversized, or mismatched
+  chunks cannot complete or modify the accepted prefix. Partial staging files
+  are hidden from evidence listings and removed during startup recovery.
 - ZIP extraction limits the parsable-member count, per-member and total expanded
   size, and rejects decompression-bomb members by their real expanded/compressed
   ratio. Declared archive sizes are attacker-controlled, so the extraction write

@@ -18,7 +18,7 @@ from threading import RLock
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
-from app.config import case_db_path, get_cases_dir
+from app.config import UPLOAD_STAGING_PREFIX, case_db_path, get_cases_dir
 from app.store.database import (
     CaseMeta,
     ChatHistory,
@@ -244,6 +244,24 @@ def cleanup_stale_case_artifacts() -> list[dict[str, str]]:
         if uploads.is_dir():
             for path in uploads.iterdir():
                 if not path.is_file():
+                    continue
+                if path.name.startswith(UPLOAD_STAGING_PREFIX):
+                    try:
+                        path.unlink()
+                        removed.append({
+                            "case_id": case_id,
+                            "kind": "stale_upload_staging",
+                            "path": str(path),
+                            "status": "removed",
+                        })
+                    except OSError as exc:
+                        removed.append({
+                            "case_id": case_id,
+                            "kind": "stale_upload_staging",
+                            "path": str(path),
+                            "status": "failed",
+                            "error": str(exc),
+                        })
                     continue
                 upload_stems.add(path.stem)
                 if path.suffix.lower() == ".zip":

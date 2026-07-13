@@ -238,20 +238,24 @@ class CaseStoreTests(unittest.TestCase):
         stale_derived = case_dir / "derived" / "memprocfs" / "gone"
         keep_extract = uploads / "archive_extracted"
         stale_extract = uploads / "old_extracted"
+        stale_upload = uploads / ".investigator-upload-abandoned.parts"
         keep_derived.mkdir(parents=True)
         stale_derived.mkdir(parents=True)
         keep_extract.mkdir()
         stale_extract.mkdir()
+        stale_upload.write_bytes(b"partial")
 
         removed = cases.cleanup_stale_case_artifacts()
 
         removed_kinds = {(row["kind"], Path(row["path"]).name) for row in removed}
         self.assertIn(("stale_memprocfs_derived", "gone"), removed_kinds)
         self.assertIn(("stale_zip_extract", "old_extracted"), removed_kinds)
+        self.assertIn(("stale_upload_staging", stale_upload.name), removed_kinds)
         self.assertTrue(keep_derived.exists())
         self.assertTrue(keep_extract.exists())
         self.assertFalse(stale_derived.exists())
         self.assertFalse(stale_extract.exists())
+        self.assertFalse(stale_upload.exists())
 
     def test_memory_purge_removes_memprocfs_artifacts_and_sources(self) -> None:
         case = cases.create_case("memory cleanup")
