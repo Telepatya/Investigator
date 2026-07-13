@@ -50,7 +50,7 @@ from app.llm.tools import execute_tool, get_case_overview, get_findings, run_too
 from app.memory.pipeline import _grade_handle
 from app.store import cases
 from app.store import database
-from app.store.database import Event, Finding, Process
+from app.store.database import Event, Finding, Process, Report
 
 
 class _Base(unittest.TestCase):
@@ -550,6 +550,41 @@ class ToolBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text, "done")
         self.assertEqual(trace, [])
         self.assertEqual(provider.calls, 1)
+
+
+class ChatCaseContextTests(unittest.TestCase):
+    def test_compact_digest_keeps_timeline_index_and_all_finding_ids(self) -> None:
+        report = Report(
+            id=4,
+            summary="Complete report summary",
+            timeline_narrative="Narrative",
+            timeline_entries=[
+                {"id": "timeline-1", "title": "Initial access", "event_ids": [10]},
+                {"id": "timeline-2", "title": "Persistence", "finding_ids": [2]},
+            ],
+            findings_analysis=[{"finding_id": 1, "verdict": "Confirmed"}],
+            suppression_revision=3,
+            generated_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+        )
+        active = Finding(
+            id=1, title="Active", description="active description", severity="high",
+            mitre_techniques=["T1055"], evidence={"event_id": 10}, source="detector",
+            ai_verdict="Confirmed", created_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+        )
+        suppressed = Finding(
+            id=2, title="Suppressed", description="suppressed description", severity="medium",
+            mitre_techniques=[], evidence={}, source="detector", created_at=datetime(2026, 7, 12, tzinfo=timezone.utc),
+        )
+
+        payload = json.loads(orchestrator._compact_chat_case_digest(
+            report, [active], [suppressed],
+        ))
+
+        self.assertEqual(len(payload["latest_report"]["evidence_backed_timeline"]), 2)
+        self.assertEqual({f["id"] for f in payload["all_findings"]}, {1, 2})
+        self.assertFalse(payload["all_findings"][0]["suppressed"])
+        self.assertTrue(payload["all_findings"][1]["suppressed"])
+        self.assertNotIn("evidence", payload["all_findings"][0])
 
 
 class JsonRepairTests(unittest.IsolatedAsyncioTestCase):

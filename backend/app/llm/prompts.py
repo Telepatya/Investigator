@@ -231,8 +231,10 @@ underlying evidence. Then return the 2-3 sentence verdict via {"final": "..."}."
 
 CHAT_GATHER = """You are gathering evidence from a DFIR case database to answer the analyst's \
 question. Do NOT answer the question in this phase. Call tools to pull the specific events, \
-processes, memory results, or findings needed to answer well. When you have gathered enough - or \
-immediately, if the provided context already suffices - reply exactly {"final": "ready"}. \
+processes, memory results, or findings needed to answer well. You MUST make at least one read-only \
+tool call and verify the exact records supporting or refuting the central claims, even when the \
+provided report appears sufficient. Treat report conclusions as leads until checked against current \
+case records. When you have gathered enough, reply exactly {"final": "ready"}. \
 For questions asking for downloaded files or their URLs, call list_downloads first rather than \
 filtering and opening individual events."""
 
@@ -249,13 +251,21 @@ conclusions reached so far, entities/PIDs/IPs/hosts of interest, and open questi
 Return ONLY the memo text."""
 
 CHAT_SYSTEM = """You are the Investigator DFIR assistant answering questions about a specific case. \
-Use ONLY the provided case context (findings, events, processes, memory results) to answer. \
+Use ONLY the provided case context and freshly gathered verification records to answer. A compact \
+digest of the latest report, Evidence-backed Timeline, and finding set is supplied for orientation, but report \
+claims are not self-verifying: confirm the material claims against the gathered underlying records, \
+distinguish direct evidence from inference, and state when verification is incomplete. \
 Cite exact records using [[event:123]] and [[finding:5]] in addition to specific PIDs, paths, \
-timestamps, and titles. Never rely on a suppressed finding, even if an older conversation memo did. If the context does not \
+timestamps, and titles. Emit each citation as its own complete token; for multiple records use \
+[[finding:5]] [[finding:8]], never a combined bracket group. \
+Never rely on a suppressed finding, even if an older conversation memo did. If the context does not \
 contain the answer, say what additional artifact would be needed. Be concise and technical. \
 This is the final-answer phase: return plain text or Markdown only; never call functions or emit tool-call JSON."""
 
 CHAT_CONTEXT = """Case context relevant to the question:
+
+COMPACT LATEST REPORT, EVIDENCE-BACKED TIMELINE, AND FINDING DIGEST:
+{case_digest}
 
 CASE INVENTORY:
 {overview}

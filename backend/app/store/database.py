@@ -99,10 +99,22 @@ class Report(Base):
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    title: Mapped[str] = mapped_column(String(160), default="New chat")
+    memo: Mapped[str | None] = mapped_column(Text, default=None)
+    memo_upto: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class ChatHistory(Base):
     __tablename__ = "chat_history"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str | None] = mapped_column(String(32), index=True)
     role: Mapped[str] = mapped_column(String(16))
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -269,6 +281,31 @@ def _initialize_schema(path: Path, engine: Engine) -> None:
             conn.exec_driver_sql("ALTER TABLE reports ADD COLUMN timeline_entries JSON DEFAULT '[]'")
         if "suppression_revision" not in report_cols:
             conn.exec_driver_sql("ALTER TABLE reports ADD COLUMN suppression_revision INTEGER DEFAULT 0")
+        chat_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(chat_history)")}
+        if "chat_id" not in chat_cols:
+            conn.exec_driver_sql("ALTER TABLE chat_history ADD COLUMN chat_id TEXT")
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_chat_history_chat_id ON chat_history (chat_id)"
+        )
+        legacy_count = conn.exec_driver_sql(
+            "SELECT COUNT(*) FROM chat_history WHERE chat_id IS NULL"
+        ).scalar_one()
+        if legacy_count:
+            conn.exec_driver_sql(
+                """
+                INSERT OR IGNORE INTO chat_sessions(
+                    id, title, memo, memo_upto, created_at, updated_at
+                )
+                SELECT
+                    'legacy', 'Previous chat',
+                    (SELECT value FROM case_meta WHERE key = 'chat_memo'),
+                    COALESCE(CAST((SELECT value FROM case_meta WHERE key = 'chat_memo_upto') AS INTEGER), 0),
+                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                """
+            )
+            conn.exec_driver_sql(
+                "UPDATE chat_history SET chat_id = 'legacy' WHERE chat_id IS NULL"
+            )
         conn.exec_driver_sql(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(

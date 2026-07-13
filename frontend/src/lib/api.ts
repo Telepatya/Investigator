@@ -200,6 +200,31 @@ export const api = {
   startAnalysis: (id: string) =>
     req<{ ok: boolean }>(`/cases/${id}/analyze`, { method: "POST" }),
   getReport: (id: string) => req<Report>(`/cases/${id}/report`),
+  listChats: (id: string) => req<{
+    chats: {
+      id: string;
+      title: string;
+      message_count: number;
+      preview: string;
+      created_at: string;
+      updated_at: string;
+    }[];
+  }>(`/cases/${id}/chats`),
+  createChat: (id: string, title = "New chat") =>
+    req<{ id: string; title: string; messages: []; memo: null }>(`/cases/${id}/chats`, {
+      method: "POST",
+      body: JSON.stringify({ title }),
+    }),
+  getChat: (id: string, chatId: string) => req<{
+    id: string;
+    title: string;
+    memo: string | null;
+    messages: { id: number; role: "user" | "assistant"; content: string; created_at: string }[];
+  }>(`/cases/${id}/chats/${encodeURIComponent(chatId)}`),
+  deleteChat: (id: string, chatId: string) =>
+    req<{ ok: boolean }>(`/cases/${id}/chats/${encodeURIComponent(chatId)}`, {
+      method: "DELETE",
+    }),
 
   // Settings
   getLLMConfig: () => req<LLMConfig>("/settings/llm"),

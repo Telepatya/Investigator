@@ -456,6 +456,25 @@ area. Existing route paths remain stable:
 /cases/:caseId/{overview,timeline,findings,evidence,entities,memory,events,report,chat}
 ```
 
+Streaming assistant messages are rendered by a safe React Markdown subset: raw
+HTML is treated as text, external Markdown links are limited to HTTP(S)/mailto,
+and `[[event:id]]` / `[[finding:id]]` tokens become case-scoped evidence drawers.
+The citation tokenizer also accepts singly bracketed or grouped model output so a
+formatting variation cannot strand an otherwise valid evidence reference.
+
+Each chat turn receives a compact index of the latest report, every Evidence-backed
+Timeline entry, and all current active/suppressed finding IDs and titles. Full
+descriptions and evidence are fetched only when relevant. A mandatory read-only
+gathering phase opens fresh underlying case records before the final answer, and the
+final prompt requires the model to separate directly verified evidence from inference.
+
+Chats are case-scoped persistent sessions. `chat_sessions` owns title, timestamps,
+and the rolling memo cursor; `chat_history.chat_id` partitions messages. The client
+sends only a chat ID and the new question—history is loaded by the backend, which
+resends the recent raw tail plus that chat's compact memo because provider calls are
+stateless. The lightweight schema migration assigns legacy unscoped messages and
+their old case-level memo to a preserved `Previous chat` session.
+
 Timeline and Entity Map are lazy imports because vis-timeline and React Flow are
 the largest route dependencies. The initial case list, settings, and dashboard do
 not pay their download/parse cost.
@@ -587,7 +606,8 @@ Every case database contains:
 | `findings` | Materialized detector, memory, AI, and manual findings with MITRE techniques, structured evidence, suppression state, and optional AI verdict. |
 | `memory_results` | Structured outputs from memory plugins and correlation heuristics. |
 | `reports` | Persisted executive summary, timeline narrative, and per-finding analysis. |
-| `chat_history` | Case-scoped user/assistant transcript. |
+| `chat_sessions` | Independent saved chats within a case: title, rolling memo/cursor, and created/updated timestamps. |
+| `chat_history` | User/assistant transcript partitioned by chat session. |
 | `case_meta` | Durable metadata: manual finding intent, manual event baselines/sync signature, disabled rules, benign identities, chat memo, and bookkeeping. |
 | `events_fts` | FTS5 projection of event summary/entity/source/category used by search and LLM tools. |
 

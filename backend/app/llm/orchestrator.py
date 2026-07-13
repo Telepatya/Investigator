@@ -16,7 +16,13 @@ from app.config import load_config
 from app.detect import overrides
 from app.llm import prompts
 from app.llm.base import get_provider
-from app.llm.tools import describe_call, fts_query as _fts_query, get_case_overview, run_tool_loop
+from app.llm.tools import (
+    describe_call,
+    execute_tool,
+    fts_query as _fts_query,
+    get_case_overview,
+    run_tool_loop,
+)
 from app.store import cases as case_store
 from app.store.database import ChatHistory, Event, Finding, MemoryResult, Process, Report
 
@@ -211,6 +217,51 @@ def _finding_context(findings: list[Finding], *, suppressed: bool = False, limit
             + f": {finding.description[:300]}"
         )
     return "\n".join(lines) or ("None." if suppressed else "No active findings.")
+
+
+def _compact_chat_case_digest(
+    report: Report | None,
+    active_findings: list[Finding],
+    suppressed_findings: list[Finding],
+) -> str:
+    """Build a bounded orientation digest; exact records come from verification tools."""
+    report_payload = None
+    if report is not None:
+        timeline = []
+        for entry in report.timeline_entries or []:
+            if not isinstance(entry, dict):
+                continue
+            timeline.append({
+                "id": entry.get("id"),
+                "timestamp": entry.get("timestamp"),
+                "title": entry.get("title"),
+                "description": str(entry.get("description") or "")[:240],
+                "event_ids": entry.get("event_ids") or [],
+                "finding_ids": entry.get("finding_ids") or [],
+            })
+        report_payload = {
+            "id": report.id,
+            "generated_at": report.generated_at,
+            "summary": (report.summary or "")[:6000],
+            "timeline_narrative": (report.timeline_narrative or "")[:4000],
+            "evidence_backed_timeline": timeline,
+        }
+
+    finding_payload = []
+    for suppressed, rows in ((False, active_findings), (True, suppressed_findings)):
+        for finding in rows:
+            finding_payload.append({
+                "id": finding.id,
+                "title": finding.title,
+                "severity": finding.severity,
+                "mitre_techniques": finding.mitre_techniques or [],
+                "suppressed": suppressed,
+            })
+
+    return json.dumps({
+        "latest_report": report_payload,
+        "all_findings": finding_payload,
+    }, default=str, indent=2)
 
 
 def _sample_events(events: list[Event], active_findings: list[Finding], limit: int = 60) -> list[Event]:
@@ -627,7 +678,7 @@ async def _extract_ai_findings(
     return created
 
 
-async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]) -> AsyncIterator[str | dict]:
+async def chat_stream(case_id: str, chat_id: str, question: str) -> AsyncIterator[str | dict]:
     """Retrieval-augmented chat with a tool-gathering phase, then a streamed answer.
 
     Yields str chunks (answer text) and dicts (pre-typed websocket events like
@@ -635,6 +686,10 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
     """
     session = case_store.get_session(case_id)
     try:
+        chat = case_store.get_chat_session(session, chat_id)
+        if not chat:
+            raise ValueError("Chat session not found")
+        history = case_store.get_chat_history(session, chat_id, limit=6)
         # Retrieve context: FTS search on the question + top findings
         try:
             matched = case_store.search_events(session, _fts_query(question), limit=25)
@@ -649,10 +704,14 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
         active_findings, suppressed_findings = _split_findings(session, findings)
         active_findings = sorted(
             active_findings, key=lambda f: _SEVERITY_RANK.get(f.severity, 0), reverse=True
-        )[:25]
+        )
         suppressed_findings = sorted(
             suppressed_findings, key=lambda f: _SEVERITY_RANK.get(f.severity, 0), reverse=True
-        )[:25]
+        )
+        latest_report = case_store.get_latest_report(session)
+        case_digest = _compact_chat_case_digest(
+            latest_report, active_findings, suppressed_findings,
+        )
         processes = list(session.scalars(
             select(Process).where(Process.severity.in_(["high", "critical", "medium"])).limit(25)
         ))
@@ -676,15 +735,13 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
         ) or "None"
 
         context = prompts.CHAT_CONTEXT.format(
+            case_digest=case_digest,
             overview=get_case_overview(session, {}), findings=findings_text,
             suppressed=suppressed_text, events=events_text,
             processes=processes_text, memory=memory_text, question=question,
         )
 
-        try:
-            memo = case_store.get_meta(session, "chat_memo")
-        except Exception:
-            memo = None
+        memo = chat.memo
 
         # --- Phase 1: tool-driven data gathering (non-streamed) ---
         gathered: list[dict] = []
@@ -723,6 +780,26 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
         except Exception:
             gathered = []
 
+        # Verification is mandatory even when a provider ignores the gathering
+        # instruction or the configured tool loop returns no action. Open one
+        # exact current record so the final phase always receives fresh database
+        # evidence rather than relying solely on the generated report.
+        if not gathered:
+            if active_findings:
+                verify_name, verify_args = "get_finding", {"finding_id": active_findings[0].id}
+            elif matched:
+                verify_name, verify_args = "get_event", {"event_id": matched[0].id}
+            else:
+                verify_name, verify_args = "get_case_overview", {}
+            verify_result = execute_tool(session, verify_name, verify_args, case_id=case_id)
+            gathered.append({
+                "tool": verify_name,
+                "args": verify_args,
+                "result_preview": verify_result[:200],
+                "result": verify_result,
+            })
+            yield {"type": "tool", "content": describe_call(verify_name, verify_args)}
+
         tool_context = _chat_tool_context(gathered)
 
         # --- Phase 2: streamed final answer ---
@@ -732,12 +809,12 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
                 "\n\nRunning investigation memo (earlier conversation):\n" + memo
             )
         messages = [{"role": "system", "content": system_content}]
-        for h in history[-6:]:
-            if h.get("role") in ("user", "assistant"):
-                messages.append({"role": h["role"], "content": h["content"]})
+        for h in history:
+            if h.role in ("user", "assistant"):
+                messages.append({"role": h.role, "content": h.content})
         messages.append({"role": "user", "content": context + tool_context})
 
-        case_store.save_chat(session, "user", question)
+        case_store.save_chat(session, chat_id, "user", question)
         session.commit()
 
         provider = get_provider()
@@ -761,29 +838,35 @@ async def chat_stream(case_id: str, question: str, history: list[dict[str, str]]
             full.append(retry_text)
             yield retry_text
 
-        case_store.save_chat(session, "assistant", "".join(full))
+        case_store.save_chat(session, chat_id, "assistant", "".join(full))
         session.commit()
 
         try:
-            await _update_chat_memo(session)
+            await _update_chat_memo(session, chat_id)
         except Exception:
             logger.debug("Chat memo update failed", exc_info=True)
     finally:
         session.close()
 
 
-async def _update_chat_memo(session) -> None:
+async def _update_chat_memo(session, chat_id: str) -> None:
     """Fold older un-summarized chat history into a compact running memo."""
-    upto = int(case_store.get_meta(session, "chat_memo_upto") or 0)
+    chat = case_store.get_chat_session(session, chat_id)
+    if not chat:
+        return
+    upto = int(chat.memo_upto or 0)
     rows = list(session.scalars(
-        select(ChatHistory).where(ChatHistory.id > upto).order_by(ChatHistory.id)
+        select(ChatHistory).where(
+            ChatHistory.chat_id == chat_id,
+            ChatHistory.id > upto,
+        ).order_by(ChatHistory.id)
     ))
     candidates = rows[:-MEMO_KEEP_RAW] if len(rows) > MEMO_KEEP_RAW else []
     if not candidates:
         return
     if sum(len(r.content or "") for r in candidates) < MEMO_THRESHOLD_CHARS:
         return
-    memo = case_store.get_meta(session, "chat_memo") or "None yet."
+    memo = chat.memo or "None yet."
     exchanges = "\n".join(
         f"{r.role.upper()}: {(r.content or '')[:800]}" for r in candidates
     )[:12000]
@@ -792,8 +875,8 @@ async def _update_chat_memo(session) -> None:
         {"role": "user", "content": prompts.CHAT_MEMO.format(memo=memo, exchanges=exchanges)},
     ])
     if updated.strip():
-        case_store.set_meta(session, "chat_memo", updated.strip()[:4000])
-        case_store.set_meta(session, "chat_memo_upto", str(candidates[-1].id))
+        chat.memo = updated.strip()[:4000]
+        chat.memo_upto = candidates[-1].id
         session.commit()
 
 
@@ -847,7 +930,10 @@ async def investigate_entity_stream(case_id: str, entity_id: str) -> AsyncIterat
             f"[{call['tool']} {json.dumps(call['args'], default=str)}]\n{call.get('result', '')}"
             for call in gathered
         )[:12000]
-    prompt += "\n\nCite exact records using [[event:123]] and [[finding:5]] whenever IDs are available."
+    prompt += (
+        "\n\nCite exact records using [[event:123]] and [[finding:5]] whenever IDs are available. "
+        "Emit each citation as a separate complete token; never combine records inside one bracket group."
+    )
     result = await provider.complete(
         [{"role": "system", "content": prompts.SYSTEM_ANALYST},
          {"role": "user", "content": prompt}],

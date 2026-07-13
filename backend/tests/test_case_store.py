@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: E402
 
 import json
+import sqlite3
 import sys
 import tempfile
 import types
@@ -41,7 +42,7 @@ from app.memory import forensics
 from app.memory import pipeline as memory_pipeline
 from app.store import cases
 from app.store import database
-from app.store.database import Event, MemoryResult, Process
+from app.store.database import ChatHistory, ChatSession, Event, MemoryResult, Process
 
 
 class CaseStoreTests(unittest.TestCase):
@@ -86,6 +87,67 @@ class CaseStoreTests(unittest.TestCase):
 
         self.assertIn(db_path, database._ENGINE_CACHE)
         self.assertEqual(len(database._ENGINE_CACHE), 1)
+
+    def test_chat_sessions_keep_independent_history_and_delete_cleanly(self) -> None:
+        case = cases.create_case("chat sessions")
+        session = cases.get_session(case["id"])
+        try:
+            first = cases.create_chat_session(session)
+            second = cases.create_chat_session(session, "Second investigation")
+            cases.save_chat(session, first.id, "user", "Investigate process 123")
+            cases.save_chat(session, first.id, "assistant", "First answer")
+            cases.save_chat(session, second.id, "user", "Review persistence")
+            session.commit()
+
+            self.assertEqual(
+                [row.content for row in cases.get_chat_history(session, first.id)],
+                ["Investigate process 123", "First answer"],
+            )
+            self.assertEqual(
+                [row.content for row in cases.get_chat_history(session, second.id)],
+                ["Review persistence"],
+            )
+            self.assertEqual(first.title, "Investigate process 123")
+            self.assertTrue(cases.delete_chat_session(session, first.id))
+            session.commit()
+            self.assertIsNone(cases.get_chat_session(session, first.id))
+            self.assertEqual(cases.get_chat_history(session, first.id), [])
+            self.assertIsNotNone(cases.get_chat_session(session, second.id))
+        finally:
+            session.close()
+
+    def test_legacy_chat_history_migrates_into_previous_chat(self) -> None:
+        path = self.root / "legacy.db"
+        conn = sqlite3.connect(path)
+        try:
+            conn.executescript("""
+                CREATE TABLE case_meta (
+                    id INTEGER PRIMARY KEY, key VARCHAR(64) UNIQUE, value TEXT
+                );
+                INSERT INTO case_meta(key, value) VALUES ('chat_memo', 'legacy memo');
+                INSERT INTO case_meta(key, value) VALUES ('chat_memo_upto', '1');
+                CREATE TABLE chat_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    role VARCHAR(16), content TEXT, created_at DATETIME
+                );
+                INSERT INTO chat_history(role, content, created_at)
+                VALUES ('user', 'old question', CURRENT_TIMESTAMP);
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+        factory = database.init_db(path)
+        session = factory()
+        try:
+            chat = session.get(ChatSession, "legacy")
+            self.assertIsNotNone(chat)
+            self.assertEqual(chat.title, "Previous chat")
+            self.assertEqual(chat.memo, "legacy memo")
+            message = session.get(ChatHistory, 1)
+            self.assertEqual(message.chat_id, "legacy")
+        finally:
+            session.close()
 
     def test_startup_recovers_only_transient_case_statuses(self) -> None:
         ingesting = cases.create_case("interrupted ingest")

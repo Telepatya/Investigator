@@ -15,13 +15,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from app.config import case_db_path, get_cases_dir
 from app.store.database import (
     CaseMeta,
     ChatHistory,
+    ChatSession,
     Event,
     Report,
     dispose_db,
@@ -446,13 +447,72 @@ def set_meta(session: Session, key: str, value: str) -> None:
     session.flush()  # autoflush is off; make the write visible to same-session reads
 
 
-def save_chat(session: Session, role: str, content: str) -> None:
-    session.add(ChatHistory(role=role, content=content))
+def create_chat_session(session: Session, title: str = "New chat") -> ChatSession:
+    chat = ChatSession(
+        id=uuid.uuid4().hex[:12],
+        title=(title or "New chat").strip()[:160] or "New chat",
+    )
+    session.add(chat)
+    session.flush()
+    return chat
 
 
-def get_chat_history(session: Session, limit: int = 20) -> list[ChatHistory]:
+def get_chat_session(session: Session, chat_id: str) -> ChatSession | None:
+    return session.get(ChatSession, chat_id)
+
+
+def list_chat_sessions(session: Session) -> list[dict]:
+    chats = list(session.scalars(
+        select(ChatSession).order_by(ChatSession.updated_at.desc(), ChatSession.created_at.desc())
+    ))
+    result = []
+    for chat in chats:
+        count = session.scalar(
+            select(func.count(ChatHistory.id)).where(ChatHistory.chat_id == chat.id)
+        ) or 0
+        last = session.scalars(
+            select(ChatHistory)
+            .where(ChatHistory.chat_id == chat.id)
+            .order_by(ChatHistory.id.desc())
+            .limit(1)
+        ).first()
+        result.append({
+            "id": chat.id,
+            "title": chat.title,
+            "message_count": count,
+            "preview": (last.content or "")[:160] if last else "",
+            "created_at": chat.created_at.isoformat(),
+            "updated_at": chat.updated_at.isoformat(),
+        })
+    return result
+
+
+def delete_chat_session(session: Session, chat_id: str) -> bool:
+    chat = session.get(ChatSession, chat_id)
+    if not chat:
+        return False
+    session.execute(delete(ChatHistory).where(ChatHistory.chat_id == chat_id))
+    session.delete(chat)
+    return True
+
+
+def save_chat(session: Session, chat_id: str, role: str, content: str) -> None:
+    chat = session.get(ChatSession, chat_id)
+    if not chat:
+        raise ValueError("Chat session not found")
+    session.add(ChatHistory(chat_id=chat_id, role=role, content=content))
+    chat.updated_at = datetime.now(timezone.utc)
+    if role == "user" and chat.title == "New chat":
+        first_line = " ".join((content or "").strip().splitlines()).strip()
+        chat.title = first_line[:80] or "New chat"
+
+
+def get_chat_history(session: Session, chat_id: str, limit: int = 20) -> list[ChatHistory]:
     return list(
         session.scalars(
-            select(ChatHistory).order_by(ChatHistory.created_at.desc()).limit(limit)
+            select(ChatHistory)
+            .where(ChatHistory.chat_id == chat_id)
+            .order_by(ChatHistory.id.desc())
+            .limit(limit)
         )
     )[::-1]

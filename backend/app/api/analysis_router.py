@@ -144,12 +144,13 @@ async def chat_ws(websocket: WebSocket, case_id: str) -> None:
         while True:
             data = await websocket.receive_json()
             question = data.get("message", "")
-            history = data.get("history", [])
-            if not question:
+            chat_id = str(data.get("chat_id") or "")
+            if not question or not chat_id:
+                await websocket.send_json({"type": "error", "content": "A chat session is required"})
                 continue
             await websocket.send_json({"type": "start"})
             try:
-                async for chunk in chat_stream(case_id, question, history):
+                async for chunk in chat_stream(case_id, chat_id, question):
                     if isinstance(chunk, dict):
                         # pre-typed events (e.g. {"type": "tool", ...}) pass through
                         await websocket.send_json(chunk)
@@ -182,21 +183,91 @@ async def investigate_entity_ws(websocket: WebSocket, case_id: str) -> None:
         return
 
 
-@router.get("/{case_id}/chat-history")
-def get_chat_history(case_id: str) -> dict:
+@router.get("/{case_id}/chats")
+def list_chats(case_id: str) -> dict:
+    if not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
     session = case_store.get_session(case_id)
     try:
-        history = case_store.get_chat_history(session, limit=50)
-        try:
-            memo = case_store.get_meta(session, "chat_memo")
-        except Exception:
-            memo = None
+        return {"chats": case_store.list_chat_sessions(session)}
+    finally:
+        session.close()
+
+
+@router.post("/{case_id}/chats")
+def create_chat(case_id: str, payload: dict | None = None) -> dict:
+    if not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
+    session = case_store.get_session(case_id)
+    try:
+        chat = case_store.create_chat_session(session, str((payload or {}).get("title") or "New chat"))
+        session.commit()
+        return {"id": chat.id, "title": chat.title, "messages": [], "memo": None}
+    finally:
+        session.close()
+
+
+@router.get("/{case_id}/chats/{chat_id}")
+def get_chat(case_id: str, chat_id: str) -> dict:
+    if not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
+    session = case_store.get_session(case_id)
+    try:
+        chat = case_store.get_chat_session(session, chat_id)
+        if not chat:
+            raise HTTPException(404, "Chat not found")
+        history = case_store.get_chat_history(session, chat_id, limit=200)
+        return {
+            "id": chat.id,
+            "title": chat.title,
+            "memo": chat.memo,
+            "messages": [
+                {
+                    "id": h.id,
+                    "role": h.role,
+                    "content": h.content,
+                    "created_at": h.created_at.isoformat(),
+                }
+                for h in history
+            ],
+        }
+    finally:
+        session.close()
+
+
+@router.delete("/{case_id}/chats/{chat_id}")
+def delete_chat(case_id: str, chat_id: str) -> dict:
+    if not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
+    session = case_store.get_session(case_id)
+    try:
+        removed = case_store.delete_chat_session(session, chat_id)
+        if not removed:
+            raise HTTPException(404, "Chat not found")
+        session.commit()
+        return {"ok": True}
+    finally:
+        session.close()
+
+
+@router.get("/{case_id}/chat-history")
+def get_chat_history(case_id: str) -> dict:
+    """Compatibility view of the most recently updated chat."""
+    if not case_store.case_exists(case_id):
+        raise HTTPException(404, "Case not found")
+    session = case_store.get_session(case_id)
+    try:
+        chats = case_store.list_chat_sessions(session)
+        if not chats:
+            return {"messages": [], "memo": None}
+        chat = case_store.get_chat_session(session, chats[0]["id"])
+        history = case_store.get_chat_history(session, chat.id, limit=50) if chat else []
         return {
             "messages": [
                 {"role": h.role, "content": h.content, "created_at": h.created_at.isoformat()}
                 for h in history
             ],
-            "memo": memo,
+            "memo": chat.memo if chat else None,
         }
     finally:
         session.close()
