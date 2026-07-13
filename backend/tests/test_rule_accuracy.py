@@ -234,6 +234,54 @@ class NewWebAttackTests(_CaseTestBase):
             self.assertEqual(titles, [], benign)
 
 
+class DomainIndicatorTests(_CaseTestBase):
+    """DNS/URL reputation heuristics: abuse-prone TLD, DGA entropy, tunnelling shape,
+    dynamic-DNS -- weak on their own, and quiet for high-volume benign domains."""
+
+    def _dns_event(self, s, query):
+        cases.add_event(
+            s, timestamp=None, host="h", source="Sysmon", category="network",
+            entity="chrome.exe", severity="info",
+            summary=f"DNS query: {query}", raw={"QueryName": query, "EventID": "22"},
+        )
+
+    def _domain_findings(self, query):
+        def seed(s):
+            self._dns_event(s, query)
+        return [(t, sev) for t, sev in self._run(seed) if t.startswith("Suspicious domain indicator")]
+
+    def test_abuse_tld_alone_is_low(self) -> None:
+        found = self._domain_findings("promo-store.xyz")
+        self.assertEqual(found, [("Suspicious domain indicator: promo-store.xyz", "low")])
+
+    def test_dga_plus_bad_tld_is_medium(self) -> None:
+        # High-entropy registrable label AND an abuse-prone TLD -> two signals -> medium.
+        found = self._domain_findings("kq3v9zjx1p8wl7.xyz")
+        self.assertEqual(found, [("Suspicious domain indicator: kq3v9zjx1p8wl7.xyz", "medium")])
+
+    def test_dns_tunnelling_shape_is_medium(self) -> None:
+        query = "a" * 40 + ".b3f9c1e2a7d4.exfil-node.top"
+        found = self._domain_findings(query)
+        self.assertTrue(found and found[0][1] == "medium", found)
+
+    def test_dynamic_dns_is_flagged(self) -> None:
+        found = self._domain_findings("victim01.duckdns.org")
+        self.assertEqual(len(found), 1, found)
+
+    def test_benign_domains_are_quiet(self) -> None:
+        for benign in ("www.google.com", "outlook.office365.com", "example.com",
+                       "settings-win.data.microsoft.com", "api.github.com"):
+            self.assertEqual(self._domain_findings(benign), [], benign)
+
+    def test_each_domain_scored_once(self) -> None:
+        # Repeated queries to the same bad host produce a single finding.
+        def seed(s):
+            for _ in range(5):
+                self._dns_event(s, "promo-store.xyz")
+        found = [t for t, _ in self._run(seed) if t.startswith("Suspicious domain indicator")]
+        self.assertEqual(len(found), 1, found)
+
+
 class LolbinSeverityTests(_CaseTestBase):
     def _proc(self, s, name, cmdline):
         s.add(Process(

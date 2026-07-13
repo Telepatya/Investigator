@@ -570,6 +570,61 @@ LINUX_PERSISTENCE_PATHS: list[tuple[str, str, str, str]] = [
     ("/etc/profile.d", "T1546.004", "System-wide shell profile persistence", "low"),
 ]
 
+# --- Domain / DNS reputation heuristics --------------------------------------
+# These are deliberately WEAK signals (mostly "low"): a benign site can live on a
+# cheap TLD and a CDN label can look random. They exist to give the correlation
+# pass something to combine with beaconing / download / process context, not to
+# stand alone. Each observed domain is scored once (deduplicated in the engine),
+# so cost scales with the number of *distinct* domains, not the event volume.
+
+# Abuse-prone / free / high-risk TLDs (the effective top label, lowercased).
+# Kept to genuinely abuse-heavy TLDs; legitimate sites do use several of these,
+# hence the low base severity. ".onion" (Tor) is included as a stronger tell.
+SUSPICIOUS_TLDS: set[str] = {
+    "xyz", "top", "tk", "ml", "ga", "cf", "gq", "work", "click", "link", "country",
+    "kim", "men", "loan", "download", "zip", "mov", "rest", "cam", "quest", "sbs",
+    "cyou", "icu", "buzz", "monster", "fit", "surf", "gdn", "pw", "bar", "best",
+    "wtf", "party", "review", "stream", "racing", "date", "onion",
+}
+
+# Dynamic-DNS / quick-tunnel providers frequently used for C2 and exfil egress.
+DYNAMIC_DNS_SUFFIXES: tuple[str, ...] = (
+    "duckdns.org", "no-ip.com", "no-ip.org", "noip.com", "ddns.net", "hopto.org",
+    "zapto.org", "serveo.net", "ngrok.io", "ngrok-free.app", "ngrok.app",
+    "trycloudflare.com", "localtunnel.me", "loca.lt", "portmap.io", "dynu.com",
+    "freedns.afraid.org", "sslip.io", "nip.io", "pagekite.me", "myftp.org",
+    "servehttp.com", "serveftp.com", "hopto.org", "chickenkiller.com",
+)
+
+# High-volume benign parents / CDNs whose (often random-looking) subdomains would
+# otherwise trip the entropy heuristic. A host equal to or under any of these is
+# skipped entirely.
+DOMAIN_ANALYSIS_ALLOWLIST: tuple[str, ...] = (
+    "microsoft.com", "windows.com", "windowsupdate.com", "msftncsi.com", "msftconnecttest.com",
+    "msn.com", "office.com", "office365.com", "live.com", "outlook.com", "sharepoint.com",
+    "azure.com", "azureedge.net", "azurewebsites.net", "windows.net", "msedge.net", "skype.com",
+    "google.com", "googleapis.com", "gstatic.com", "googleusercontent.com", "youtube.com",
+    "gvt1.com", "gvt2.com", "doubleclick.net", "ggpht.com",
+    "apple.com", "icloud.com", "mzstatic.com", "cdn-apple.com",
+    "akamai.net", "akamaiedge.net", "akadns.net", "edgekey.net", "edgesuite.net",
+    "cloudflare.com", "cloudflare.net", "cloudfront.net", "fastly.net",
+    "amazonaws.com", "amazon.com", "aws.dev",
+    "fbcdn.net", "facebook.com", "instagram.com", "whatsapp.net",
+    "digicert.com", "verisign.com", "sectigo.com", "letsencrypt.org",
+    "mozilla.org", "mozilla.net", "firefox.com", "ubuntu.com", "debian.org", "archlinux.org",
+    "github.com", "githubusercontent.com", "githubassets.com", "cloudflare-dns.com",
+)
+
+# DGA / high-entropy registrable-label thresholds and DNS-tunnelling shape limits.
+DGA_MIN_LABEL_LEN = 12
+DGA_MIN_ENTROPY = 3.8            # bits/char over the registrable label
+DNS_TUNNEL_MIN_QNAME_LEN = 60
+DNS_TUNNEL_MIN_LABELS = 5
+DNS_TUNNEL_MIN_LABEL_LEN = 30
+# Cap on domain-indicator findings per run so a case full of DGA noise can't emit
+# an unbounded number of (individually weak) findings.
+DOMAIN_FINDING_CAP = 300
+
 MITRE_TECHNIQUE_NAMES: dict[str, str] = {
     "T1003": "OS Credential Dumping",
     "T1003.001": "LSASS Memory",
@@ -683,4 +738,10 @@ MITRE_TECHNIQUE_NAMES: dict[str, str] = {
     "T1610": "Deploy Container",
     "T1611": "Escape to Host",
     "T1213": "Data from Information Repositories",
+    # Domain / DNS reputation
+    "T1036": "Masquerading",
+    "T1048": "Exfiltration Over Alternative Protocol",
+    "T1071.001": "Web Protocols",
+    "T1568": "Dynamic Resolution",
+    "T1568.002": "Domain Generation Algorithms",
 }

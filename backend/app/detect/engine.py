@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import Text, cast, or_, select
 
 from app.detect.rules import (
+    DGA_MIN_ENTROPY,
+    DGA_MIN_LABEL_LEN,
+    DNS_TUNNEL_MIN_LABEL_LEN,
+    DNS_TUNNEL_MIN_LABELS,
+    DNS_TUNNEL_MIN_QNAME_LEN,
+    DOMAIN_ANALYSIS_ALLOWLIST,
+    DOMAIN_FINDING_CAP,
+    DYNAMIC_DNS_SUFFIXES,
     EXPECTED_PARENTS,
     LINUX_PERSISTENCE_PATHS,
     LINUX_SUSPICIOUS_CMDLINE_PATTERNS,
@@ -23,6 +32,7 @@ from app.detect.rules import (
     SUSPICIOUS_CMDLINE_PATTERNS,
     SUSPICIOUS_EXECUTION_DIRS,
     SUSPICIOUS_PARENT_CHILD_MAP,
+    SUSPICIOUS_TLDS,
     SYSTEM_PROCESS_PATHS,
     TASK_UPDATER_MASQUERADES,
     WEB_ATTACK_PATTERNS,
@@ -129,6 +139,143 @@ def _addr_scope(addr: str) -> str:
     if ":" in a and a.startswith(("fe80", "fc", "fd")):
         return "private"
     return "public"
+
+
+# --- Domain / DNS reputation helpers -----------------------------------------
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_INTERNAL_DOMAIN_SUFFIXES = (
+    ".local", ".lan", ".internal", ".intranet", ".corp", ".home", ".arpa",
+    ".localdomain", ".test", ".invalid", ".localhost",
+)
+# ccTLD second levels that act as the public suffix (foo.co.uk -> registrable "foo").
+_TWO_LEVEL_SLD = {"co", "com", "org", "net", "gov", "edu", "ac", "gob", "mil", "or", "ne", "go"}
+
+
+def _shannon_entropy(s: str) -> float:
+    """Shannon entropy (bits/char) of a string; 0.0 for empty input."""
+    if not s:
+        return 0.0
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
+
+
+def _normalize_host(host: str) -> str:
+    """Lowercase a hostname and strip quoting, brackets, a trailing dot, and :port."""
+    h = (host or "").strip().strip('"').strip("'").lower().strip("[]").rstrip(".")
+    return re.sub(r":\d+$", "", h)
+
+
+def _host_from_url(url: str) -> str:
+    """Extract the host component from a URL (scheme, credentials, path, port stripped)."""
+    u = (url or "").strip()
+    u = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", u, flags=re.IGNORECASE)
+    u = u.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in u:
+        u = u.rsplit("@", 1)[1]
+    return _normalize_host(u)
+
+
+def _domain_candidates(raw: dict[str, Any]) -> list[str]:
+    """Hostnames worth reputation-scoring from a network/download event's raw fields."""
+    out: list[str] = []
+    for key in ("QueryName", "DestinationHostname", "RemoteHostname"):
+        v = raw.get(key)
+        if v:
+            out.append(_normalize_host(str(v)))
+    for key in ("Url", "RemoteUrl"):
+        v = raw.get(key)
+        if v:
+            h = _host_from_url(str(v))
+            if h:
+                out.append(h)
+    return out
+
+
+def _split_domain(host: str) -> tuple[str, str, list[str]] | None:
+    """Return (registrable_label, effective_tld, labels) or None for a bare/single label."""
+    labels = host.split(".")
+    if len(labels) < 2 or any(not lbl for lbl in labels):
+        return None
+    if len(labels) >= 3 and labels[-2] in _TWO_LEVEL_SLD:
+        return labels[-3], labels[-1], labels
+    return labels[-2], labels[-1], labels
+
+
+def _check_domain_indicators(session, existing, event, raw, evidence, seen_domains, state) -> None:
+    """Score DNS query names / URL hosts for weak reputation signals (abuse-prone TLD,
+    DGA-like entropy, DNS-tunnelling shape, dynamic-DNS, punycode). Each distinct host
+    is scored at most once (seen_domains), and total emissions are capped so a case
+    full of algorithmic domains cannot flood the finding list."""
+    if state["emitted"] >= DOMAIN_FINDING_CAP:
+        return
+    is_dns = bool(raw.get("QueryName"))
+    proto_tech = "T1071.004" if is_dns else "T1071.001"
+    for host in _domain_candidates(raw):
+        if not host or "." not in host or ":" in host:
+            continue
+        if _IPV4_RE.match(host) or host.endswith(_INTERNAL_DOMAIN_SUFFIXES):
+            continue
+        if host in seen_domains:
+            continue
+        seen_domains.add(host)
+        if any(host == s or host.endswith("." + s) for s in DOMAIN_ANALYSIS_ALLOWLIST):
+            continue
+        split = _split_domain(host)
+        if not split:
+            continue
+        reg_label, eff_tld, labels = split
+
+        reasons: list[str] = []
+        techniques: set[str] = set()
+        top_sev: str | None = None
+
+        def add(sev: str, reason: str, tech: str) -> None:
+            nonlocal top_sev
+            reasons.append(reason)
+            techniques.add(tech)
+            if top_sev is None or SEVERITY_RANK[sev] > SEVERITY_RANK[top_sev]:
+                top_sev = sev
+
+        if any(host == s or host.endswith("." + s) for s in DYNAMIC_DNS_SUFFIXES):
+            add("low", "dynamic-DNS / quick-tunnel provider", "T1568")
+        if eff_tld in SUSPICIOUS_TLDS:
+            add("low", f"abuse-prone TLD .{eff_tld}", proto_tech)
+        if any(lbl.startswith("xn--") for lbl in labels):
+            add("low", "punycode/IDN label (possible homoglyph)", "T1036")
+        ent = _shannon_entropy(reg_label)
+        if len(reg_label) >= DGA_MIN_LABEL_LEN and ent >= DGA_MIN_ENTROPY:
+            add("low", f"high-entropy label '{reg_label}' ({ent:.1f} bits/char, DGA-like)", "T1568.002")
+        if is_dns and len(host) >= DNS_TUNNEL_MIN_QNAME_LEN and (
+            len(labels) >= DNS_TUNNEL_MIN_LABELS
+            or max(len(lbl) for lbl in labels) >= DNS_TUNNEL_MIN_LABEL_LEN
+        ):
+            add("medium", "long/segmented DNS query (possible DNS tunnelling/exfil)", "T1048")
+
+        if not reasons:
+            continue
+        severity = top_sev or "low"
+        # Two independent weak signals corroborate: promote low -> medium.
+        if severity == "low" and len(reasons) >= 2:
+            severity = "medium"
+        reason_text = "; ".join(reasons)
+        kind = "DNS query" if is_dns else "connection/URL"
+        _add_finding(
+            session, existing,
+            title=f"Suspicious domain indicator: {host[:120]}",
+            description=(
+                f"{kind} to {host}: {reason_text}. Individually a weak signal -- "
+                "corroborate with beaconing cadence, download provenance, or the "
+                "requesting process before actioning."
+            ),
+            severity=severity,
+            techniques=sorted(techniques),
+            evidence={**evidence, "domain": host, "reasons": reason_text},
+            source="network-domain",
+        )
+        _escalate_event(session, event, severity, f"Detection: suspicious domain indicator ({reason_text})")
+        state["emitted"] += 1
+        if state["emitted"] >= DOMAIN_FINDING_CAP:
+            return
 
 
 # Windows Event IDs are only unique per channel: EventID 4625 in the Application
@@ -3027,6 +3174,9 @@ def run_detections_sync(case_id: str) -> int:
         event_stream = session.scalars(select(Event).execution_options(yield_per=EVENT_STREAM_BATCH_SIZE))
         provenance_events: list[Event] = []
         beacon_tracker: dict[str, list[Event]] = defaultdict(list)
+        # Each distinct DNS/URL host is reputation-scored once; state caps emissions.
+        domain_seen: set[str] = set()
+        domain_state: dict[str, int] = {"emitted": 0}
         web_ip_tracker: dict[str, dict[str, Any]] = defaultdict(
             lambda: {"total": 0, "errors": 0, "auth_fail": 0, "auth_ok": set(), "events": []}
         )
@@ -3402,6 +3552,12 @@ def run_detections_sync(case_id: str) -> int:
                 raddr = str(raw.get("Raddr") or raw.get("raddr") or raw.get("RemoteAddress") or "")
                 if raddr and _addr_scope(raddr) != "local":
                     beacon_tracker[raddr].append(event)
+
+            # DNS query names / URL hosts: abuse-prone TLD, DGA entropy, tunnelling, etc.
+            if event.category == "network" or raw.get("Url") or raw.get("RemoteUrl"):
+                _check_domain_indicators(
+                    session, existing, event, raw, evidence, domain_seen, domain_state
+                )
 
         mark_phase(
             "event scan",
