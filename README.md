@@ -28,6 +28,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - [Development](#development)
 - [Dependency security](#dependency-security)
 - [Demo, support, and releases](#demo-support-and-releases)
+- [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [A note on detections](#a-note-on-detections)
 
@@ -314,6 +315,14 @@ network, injection, and logon paths without real evidence.
 Official releases are published only from GitHub-verified signed tags. Each
 release includes a reproducible Windows ZIP, SHA-256 checksum manifest,
 CycloneDX SBOM, and versioned notes.
+
+## Roadmap
+
+The proposed [v0.2.0 roadmap](ROADMAP.md) covers benchmark infrastructure,
+profile-guided optimization, local privacy-preserving metrics, a top-level
+universal Exclusions feature for automatically suppressing matching findings
+across cases without deleting evidence, and case manifests with SHA-256
+evidence hashing for verifiable chain-of-custody.
 
 ## Contributing
 

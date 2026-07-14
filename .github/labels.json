@@ -8,5 +8,10 @@
   {"name": "false positive", "color": "fbca04", "description": "Verified benign activity triggers a deterministic finding"},
   {"name": "feature request", "color": "a2eeef", "description": "Proposed capability or improvement"},
   {"name": "documentation", "color": "0075ca", "description": "Documentation-only work"},
-  {"name": "dependencies", "color": "0366d6", "description": "Dependency or lock-file update"}
+  {"name": "dependencies", "color": "0366d6", "description": "Dependency or lock-file update"},
+  {"name": "roadmap", "color": "5319e7", "description": "Planned work associated with a documented release roadmap"},
+  {"name": "performance", "color": "0e8a16", "description": "Profiling, optimization, or benchmark work"},
+  {"name": "metrics", "color": "006b75", "description": "Local operational metrics and diagnostics"},
+  {"name": "exclusions", "color": "c2e0c6", "description": "Universal automatic finding exclusion rules"},
+  {"name": "evidence integrity", "color": "bfd4f2", "description": "Case manifests, evidence hashing, and integrity verification"}
 ]

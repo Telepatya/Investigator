@@ -5,7 +5,11 @@ migration, and verification details live in `docs/releases/`.
 
 ## Unreleased
 
-No changes yet.
+### Added
+
+- A proposed v0.2.0 roadmap covering optimization, benchmarks, local metrics,
+  audited universal finding exclusions, and case manifests with SHA-256
+  evidence hashing.
 
 ## 0.1.2 - 2026-07-14
 
