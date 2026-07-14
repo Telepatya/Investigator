@@ -13,8 +13,21 @@ assert SPEC and SPEC.loader
 generate_sbom = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(generate_sbom)
 
+RUN_SPEC = importlib.util.spec_from_file_location("investigator_launcher", ROOT / "run.py")
+assert RUN_SPEC and RUN_SPEC.loader
+investigator_launcher = importlib.util.module_from_spec(RUN_SPEC)
+RUN_SPEC.loader.exec_module(investigator_launcher)
+
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_locked_install_uses_hashes_without_dependency_resolution(self) -> None:
+        command = investigator_launcher.locked_pip_install_command(
+            Path("python.exe"), Path("requirements-memory.lock")
+        )
+        self.assertIn("--require-hashes", command)
+        self.assertIn("--no-deps", command)
+        self.assertEqual(command[-2:], ["-r", "requirements-memory.lock"])
+
     def test_sbom_is_deterministic_and_contains_both_ecosystems(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "first.json"

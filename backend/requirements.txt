@@ -1,6 +1,6 @@
 # Legacy unlocked install file.
 #
 # Normal launcher and CI installs must use requirements*.lock with
-# pip --require-hashes. Keep direct dependency edits in requirements.in and
+# pip --require-hashes --no-deps. Keep direct dependency edits in requirements.in and
 # requirements-memory.in, then regenerate the lock files.
 -r requirements-memory.in

@@ -28,7 +28,7 @@ npm ci
 npm run build
 cd ..
 $env:SOURCE_DATE_EPOCH = git show -s --format=%ct HEAD
-python scripts/build_release.py --version v0.1.1 --output dist
+python scripts/build_release.py --version v0.1.2 --output dist
 ```
 
 Build twice into separate output directories and compare the ZIP and SBOM
@@ -40,7 +40,7 @@ Use a GitHub-verified GPG or SSH signing key. Confirm `git tag -v` succeeds in
 your configured environment before pushing.
 
 ```powershell
-$version = "v0.1.1"
+$version = "v0.1.2"
 git status --short                 # must print nothing
 git tag -s $version -m "Investigator $version"
 git tag -v $version
@@ -72,7 +72,7 @@ Get-Content SHA256SUMS.txt | ForEach-Object {
     if ($actual -ne $expected) { throw "Checksum mismatch: $name" }
 }
 git fetch --tags origin
-git tag -v v0.1.1
+git tag -v v0.1.2
 ```
 
 Also verify that the GitHub release shows a verified tag, the SBOM parses as

@@ -31,7 +31,7 @@ files must not be edited by hand. JavaScript dependencies are changed through
 # Backend
 cd backend
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.lock
+.\.venv\Scripts\python.exe -m pip install --require-hashes --no-deps -r requirements-dev.lock
 .\.venv\Scripts\ruff.exe check app tests
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 

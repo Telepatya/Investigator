@@ -41,8 +41,9 @@ or documentation improvements that do not expose a vulnerability.
 
 Investigator uses locked dependencies for reproducible installs.
 
-- Python runtime installs use `backend/requirements-memory.lock` with
-  `pip --require-hashes`.
+- Python runtime installs use the complete compiled closure in
+  `backend/requirements-memory.lock` with `pip --require-hashes --no-deps`, so
+  installation cannot re-resolve a newly published transitive version.
 - Python lock files are generated from `backend/requirements*.in` using
   `backend/scripts/update-locks.ps1` or `backend/scripts/update-locks.sh`.
 - Frontend installs use `npm ci` from the committed

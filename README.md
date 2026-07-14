@@ -2,7 +2,7 @@
 
 **Made by Roei.f**
 
-> **Public Beta — v0.1.1**
+> **Public Beta — v0.1.2**
 >
 > This is pre-release software for evaluation and analyst-assisted investigation.
 > Interfaces and stored data may change before 1.0; validate conclusions against
@@ -169,7 +169,7 @@ python run.py --allow-unlocked-deps  # temporary local fallback if Python lock f
 ```powershell
 cd backend
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-memory.lock
+.\.venv\Scripts\python.exe -m pip install --require-hashes --no-deps -r requirements-memory.lock
 .\.venv\Scripts\python.exe -m app.main   # serves API on :8400 (and the built UI if present)
 
 # in another terminal, for UI development:
@@ -259,7 +259,7 @@ The short version:
 ```bash
 # Backend tests
 cd backend
-python -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.lock
+python -m venv .venv && .venv/bin/pip install --require-hashes --no-deps -r requirements-dev.lock
 .venv/bin/ruff check app tests
 .venv/bin/python -m unittest discover -s tests
 
@@ -290,7 +290,12 @@ python -m pip install uv
 .\scripts\update-locks.ps1    # or ./scripts/update-locks.sh
 ```
 
-The launcher installs from `backend/requirements-memory.lock` with `pip --require-hashes` and re-runs the install only when that lock file changes. The frontend uses the committed `frontend/package-lock.json` and installs with `npm ci`.
+The launcher installs the complete compiled dependency closure from
+`backend/requirements-memory.lock` with `pip --require-hashes --no-deps` and
+re-runs the install only when that lock file changes. `--no-deps` prevents pip
+from re-resolving newly published transitive versions outside the lock. The
+frontend uses the committed `frontend/package-lock.json` and installs with
+`npm ci`.
 
 Use `python run.py --allow-unlocked-deps` only as a temporary local workaround while creating the first lock files — never for releases or normal installs.
 
@@ -303,7 +308,7 @@ network, injection, and logon paths without real evidence.
 - [Supported OS and dependency matrix](docs/SUPPORT.md)
 - [Known limitations](docs/KNOWN_LIMITATIONS.md)
 - [Case-database migration policy](docs/MIGRATIONS.md)
-- [Changelog](CHANGELOG.md) and [versioned release notes](docs/releases/v0.1.1.md)
+- [Changelog](CHANGELOG.md) and [versioned release notes](docs/releases/v0.1.2.md)
 - [Release, signed-tag, checksum, SBOM, and verification procedure](docs/RELEASING.md)
 
 Official releases are published only from GitHub-verified signed tags. Each

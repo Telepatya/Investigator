@@ -94,6 +94,20 @@ def npm_cmd() -> str:
     return "npm.cmd" if IS_WINDOWS else "npm"
 
 
+def locked_pip_install_command(python: Path, lock_file: Path) -> list[str]:
+    """Install exactly the complete uv-compiled lock without re-resolution."""
+    return [
+        str(python), "-m", "pip", "install",
+        "--require-hashes",
+        # The uv-compiled lock is already a complete dependency closure. Avoid
+        # re-resolving package metadata: a newly published version satisfying a
+        # transitive range must not change or break a locked install (notably
+        # google-auth[requests] with older pip releases).
+        "--no-deps",
+        "-r", str(lock_file),
+    ]
+
+
 def ensure_venv(allow_unlocked_deps: bool = False) -> Path:
     py = venv_python()
     if not py.exists():
@@ -105,11 +119,10 @@ def ensure_venv(allow_unlocked_deps: bool = False) -> Path:
         digest = file_sha256(lock_file)
         if not state_matches(BACKEND_LOCK_STATE, digest):
             log(f"Installing locked backend dependencies from {lock_file.name}...")
-            run([
-                str(py), "-m", "pip", "install",
-                "--require-hashes",
-                "-r", str(lock_file),
-            ])
+            run(locked_pip_install_command(py, lock_file))
+            # --no-deps controls installation, while pip check independently
+            # verifies that the compiled closure satisfies package metadata.
+            run([str(py), "-m", "pip", "check"])
             write_state(BACKEND_LOCK_STATE, digest)
         return py
 

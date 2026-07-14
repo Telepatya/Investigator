@@ -7,6 +7,15 @@ migration, and verification details live in `docs/releases/`.
 
 No changes yet.
 
+## 0.1.2 - 2026-07-14
+
+### Fixed
+
+- Fresh Windows installs now consume the compiled hashed Python lock with
+  `--no-deps`, preventing pip from re-resolving a newly published transitive
+  dependency outside the lock. A subsequent `pip check` still validates the
+  installed dependency closure.
+
 ## 0.1.1 - 2026-07-14
 
 ### Added
