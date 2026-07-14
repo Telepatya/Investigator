@@ -1,0 +1,7 @@
+provenance: synthetic
+generator: manual
+format: Microsoft Defender Advanced Hunting JSONL
+purpose: Demonstrate file, process, persistence, network, injection, and logon normalization
+expected_records: 9
+contains_real_case_data: false
+reviewed_by: repository-maintainer

@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a scoped capability, evidence source, or workflow improvement.
+title: "[Feature]: "
+labels: ["feature request"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the analyst need without assuming a particular implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence formats and safety considerations
+      description: For new evidence sources, name the producer/export format and explain how fixtures can be synthetic.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Primary area
+      options: ["Parsing / ingestion", "Detection / correlation", "Case storage / migration", "Memory forensics", "Frontend / workflow", "Packaging / documentation"]
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and release notes.
+          required: true
+        - label: This request does not contain real case data or vulnerability details.
+          required: true

@@ -1,0 +1,12 @@
+[
+  {"name": "good first issue", "color": "7057ff", "description": "Narrowly scoped and documented for a new contributor"},
+  {"name": "validation", "color": "d4c5f9", "description": "Needs a safe reproducer or maintainer confirmation"},
+  {"name": "parser", "color": "1d76db", "description": "Evidence parsing, ingestion, or normalization"},
+  {"name": "detection", "color": "b60205", "description": "Detection, correlation, severity, or ATT&CK mapping"},
+  {"name": "security", "color": "ee0701", "description": "Security hardening or a safely disclosed vulnerability"},
+  {"name": "bug", "color": "d73a4a", "description": "Confirmed incorrect behavior"},
+  {"name": "false positive", "color": "fbca04", "description": "Verified benign activity triggers a deterministic finding"},
+  {"name": "feature request", "color": "a2eeef", "description": "Proposed capability or improvement"},
+  {"name": "documentation", "color": "0075ca", "description": "Documentation-only work"},
+  {"name": "dependencies", "color": "0366d6", "description": "Dependency or lock-file update"}
+]

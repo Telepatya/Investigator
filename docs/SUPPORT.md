@@ -1,0 +1,60 @@
+# Support and dependency matrix
+
+This matrix describes the environments the project promises to validate for the
+current `0.1.x` beta. “Unsupported” means a useful bug report is welcome, but a
+release may not be delayed for that environment.
+
+## Operating systems
+
+| Operating system | Architecture | Level | Log/artifact analysis | Memory analysis | Distribution |
+| --- | --- | --- | --- | --- | --- |
+| Windows 11 | x86-64 | Supported | CI/release validated | Supported when optional MemProcFS and YARA dependencies load | Reproducible release ZIP |
+| Ubuntu 24.04 LTS | x86-64 | Core supported | CI validated from source | Best effort; depends on MemProcFS platform support | Source checkout |
+| Other Windows, Linux, macOS | any | Unsupported/community | May work from source | Not release validated | None |
+
+Investigator is a local desktop workflow and is not supported as a shared,
+multi-user, Internet-exposed service. Windows on ARM, containers, WSL GUI use,
+and network filesystems for the case directory are not release targets.
+
+## Toolchain
+
+| Dependency | Supported version | Required when | Notes |
+| --- | --- | --- | --- |
+| CPython | 3.11 or 3.12, 64-bit | Always | The release archive creates a local virtual environment. Python 3.13+ is not yet a release target. |
+| Node.js | 22.x | Building from source or frontend development | Not needed by the release ZIP, which contains a prebuilt frontend. |
+| npm | Version bundled with supported Node 22 | Building from source | Installs exactly from `frontend/package-lock.json` with `npm ci`. |
+| Modern browser | Current Edge, Chrome, or Firefox | Always | The backend binds to loopback and opens the UI locally. |
+
+## Required Python dependencies
+
+The application runtime dependencies in `backend/requirements.in` and their
+transitive dependencies in `backend/requirements.lock` are required. They cover
+the API/server, SQLite access, evidence ingestion, credential-vault integration,
+and configured LLM-provider clients. Releases install them from a hashed lock
+file; floating installs are unsupported.
+
+An AI service is not required for deterministic parsing, search, correlation, or
+detections. Ollama and remote-provider accounts/keys are runtime integrations,
+not installation prerequisites.
+
+## Optional dependencies
+
+| Dependency | Capability enabled | Behavior when absent |
+| --- | --- | --- |
+| `memprocfs` | Raw-memory mounting and forensic extraction | Memory images cannot be processed; log and artifact workflows remain available. |
+| `yara-python` | YARA scanning of extracted memory bytes | YARA results are skipped and health/status explains the missing capability. |
+| Ollama | Fully local AI reports and chat | Deterministic investigation remains available. |
+| OpenAI, Anthropic, or Gemini account/API key | Remote AI reports and chat | That provider cannot be selected; no effect on deterministic analysis. |
+| Custom YARA rules | Organization-specific memory signatures | Only bundled rules are used. |
+
+The source launcher currently installs `backend/requirements-memory.lock` by
+default so the optional memory features are available when compatible wheels
+exist. This does not make raw-memory analysis necessary to use Investigator.
+
+## Compatibility policy
+
+The lock files, CI versions, and this matrix are authoritative together. A pull
+request that raises a minimum version, removes an operating-system target, or
+changes an optional capability to required must update this document and the
+versioned release notes. Security fixes may require an earlier compatibility
+change, which will be called out prominently.

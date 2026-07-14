@@ -1,0 +1,60 @@
+name: Bug report
+description: Report reproducible incorrect application behavior that is not parser-specific.
+title: "[Bug]: "
+labels: ["bug", "validation"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not attach real case evidence, credentials, databases, or memory dumps. Report vulnerabilities privately through SECURITY.md."
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and its user impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Use a synthetic or fully sanitized case and list the smallest reliable sequence.
+      placeholder: "1. Create a case\n2. Import ...\n3. Open ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Investigator version or commit
+      placeholder: "v0.1.0 or commit SHA"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: ["Windows 11 x64", "Ubuntu 24.04 x64", "Other / unsupported"]
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Paste minimal logs or screenshots after removing paths, users, hosts, IPs, tokens, and case content.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed real evidence, credentials, personal data, and customer identifiers.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

@@ -1,0 +1,9 @@
+# Default reviewer for all project files.
+* @Telepatya
+
+# Accuracy- and trust-sensitive areas require the project owner.
+/backend/app/ingest/ @Telepatya
+/backend/app/detect/ @Telepatya
+/backend/app/store/ @Telepatya
+/.github/workflows/ @Telepatya
+/SECURITY.md @Telepatya

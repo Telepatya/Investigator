@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Verify, build, and publish
+    runs-on: windows-latest
+    steps:
+      - name: Check out signed tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require GitHub-verified annotated tag and versioned notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ref = gh api "/repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:GITHUB_REF_NAME" | ConvertFrom-Json
+          if ($ref.object.type -ne "tag") { throw "Release tags must be annotated and signed" }
+          $tag = gh api "/repos/$env:GITHUB_REPOSITORY/git/tags/$($ref.object.sha)" | ConvertFrom-Json
+          if (-not $tag.verification.verified) {
+            throw "GitHub did not verify the tag signature: $($tag.verification.reason)"
+          }
+          $notes = "docs/releases/$env:GITHUB_REF_NAME.md"
+          if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) { throw "Missing $notes" }
+          $commit = git rev-list -n 1 $env:GITHUB_REF_NAME
+          $epoch = git show -s --format=%ct $commit
+          "SOURCE_DATE_EPOCH=$epoch" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.lock
+
+      - name: Install locked backend development dependencies
+        working-directory: backend
+        run: python -m pip install --require-hashes -r requirements-dev.lock
+
+      - name: Run backend release checks
+        working-directory: backend
+        run: |
+          ruff check app tests
+          python -m unittest discover -s tests -v
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend from lock
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build release assets twice
+        shell: pwsh
+        run: |
+          python scripts/build_release.py --version $env:GITHUB_REF_NAME --output dist
+          python scripts/build_release.py --version $env:GITHUB_REF_NAME --output dist-repro
+          $zip = "Investigator-$env:GITHUB_REF_NAME-windows.zip"
+          $sbom = "Investigator-$env:GITHUB_REF_NAME-sbom.cdx.json"
+          foreach ($name in @($zip, $sbom)) {
+            $first = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist/$name").Hash
+            $second = (Get-FileHash -Algorithm SHA256 -LiteralPath "dist-repro/$name").Hash
+            if ($first -ne $second) { throw "Non-reproducible release asset: $name" }
+          }
+
+      - name: Publish immutable GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME dist/* `
+            --verify-tag `
+            --title "Investigator $env:GITHUB_REF_NAME" `
+            --notes-file "docs/releases/$env:GITHUB_REF_NAME.md"

@@ -1,0 +1,58 @@
+name: Parser error
+description: Report rejected, missing, or incorrectly normalized evidence.
+title: "[Parser]: "
+labels: ["bug", "parser", "validation"]
+body:
+  - type: markdown
+    attributes:
+      value: "Prefer a minimal synthetic fixture. Follow docs/TEST_FIXTURES.md before attaching any sample."
+  - type: input
+    id: producer
+    attributes:
+      label: Evidence producer and version
+      placeholder: "Microsoft Defender Advanced Hunting portal export, July 2026"
+    validations:
+      required: true
+  - type: input
+    id: format
+    attributes:
+      label: Export format and filename
+      placeholder: "JSONL, DeviceProcessEvents.jsonl"
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed normalized result
+      description: State whether records are skipped, fail, or have incorrect timestamp/host/category/entity/summary/raw fields.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected normalized result
+    validations:
+      required: true
+  - type: textarea
+    id: fixture
+    attributes:
+      label: Minimal sanitized fixture
+      description: Paste only synthetic or irreversibly sanitized text. Do not attach real EVTX, archives, databases, or memory images.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Investigator version or commit
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Fixture declaration
+      options:
+        - label: I followed docs/TEST_FIXTURES.md and can lawfully contribute this transformed fixture.
+          required: true
+        - label: The sample contains no real case, person, organization, host, network, credential, token, or unique identifier.
+          required: true
+        - label: I understand parser fixes require re-ingestion to affect an existing case.
+          required: true

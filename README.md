@@ -2,7 +2,7 @@
 
 **Made by Roei.f**
 
-> **Public Beta — v0.1.0**
+> **Public Beta — v0.1.1**
 >
 > This is pre-release software for evaluation and analyst-assisted investigation.
 > Interfaces and stored data may change before 1.0; validate conclusions against
@@ -27,6 +27,8 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - [Architecture](#architecture)
 - [Development](#development)
 - [Dependency security](#dependency-security)
+- [Demo, support, and releases](#demo-support-and-releases)
+- [Contributing](#contributing)
 - [A note on detections](#a-note-on-detections)
 
 ## Features
@@ -230,9 +232,18 @@ Memory correlation combines MemProcFS process, module, VAD, thread, handle, serv
 
 ## Requirements
 
-- **Python 3.11+**
-- **Node.js 20.19+ or 22.12+** (required by Vite 8; the CI build runs Node 22)
-- Optional but recommended: `memprocfs` and `yara-python` (installed via `backend/requirements-memory.lock`). Without them, log and artifact analysis still works; raw memory-dump parsing and YARA scanning are skipped and reported in the UI health status.
+- **Required:** 64-bit Python 3.11 or 3.12, the hashed core Python lock,
+  and a current Edge, Chrome, or Firefox browser.
+- **Required only for a source/frontend build:** Node.js 22 and its bundled npm.
+  Node is not required by the Windows release archive because its frontend is
+  prebuilt.
+- **Optional capabilities:** `memprocfs` and `yara-python` for raw-memory and
+  YARA analysis; Ollama or a configured remote AI provider for reports/chat; and
+  custom YARA rules. Log ingestion, search, correlation, and deterministic
+  detection remain available without them.
+
+See [docs/SUPPORT.md](docs/SUPPORT.md) for the authoritative supported OS,
+toolchain, required-dependency, and optional-dependency matrix.
 
 ## Architecture
 
@@ -260,6 +271,9 @@ npm run dev
 
 CI runs the backend lint + test suite (Ruff, `unittest`, `pip-audit`) and the frontend type-check + build on every push and pull request. See [SECURITY.md](SECURITY.md) for the vulnerability-reporting policy.
 
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before changing parser or detection
+behavior. Real case evidence is never accepted as a test fixture.
+
 ## Dependency security
 
 Investigator installs reproducible dependencies from lock files, not floating package ranges. Human-edited Python dependencies live in:
@@ -279,6 +293,30 @@ python -m pip install uv
 The launcher installs from `backend/requirements-memory.lock` with `pip --require-hashes` and re-runs the install only when that lock file changes. The frontend uses the committed `frontend/package-lock.json` and installs with `npm ci`.
 
 Use `python run.py --allow-unlocked-deps` only as a temporary local workaround while creating the first lock files — never for releases or normal installs.
+
+## Demo, support, and releases
+
+The [synthetic demonstration case](demo/synthetic-case/README.md) imports nine
+generated Defender-style events and exercises filesystem, process, persistence,
+network, injection, and logon paths without real evidence.
+
+- [Supported OS and dependency matrix](docs/SUPPORT.md)
+- [Known limitations](docs/KNOWN_LIMITATIONS.md)
+- [Case-database migration policy](docs/MIGRATIONS.md)
+- [Changelog](CHANGELOG.md) and [versioned release notes](docs/releases/v0.1.1.md)
+- [Release, signed-tag, checksum, SBOM, and verification procedure](docs/RELEASING.md)
+
+Official releases are published only from GitHub-verified signed tags. Each
+release includes a reproducible Windows ZIP, SHA-256 checksum manifest,
+CycloneDX SBOM, and versioned notes.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests, parser/detection review
+requirements, and the mandatory [sanitized-fixture method](docs/TEST_FIXTURES.md).
+Project behavior is governed by the [Code of Conduct](CODE_OF_CONDUCT.md) and
+[maintainer/review policy](MAINTAINERS.md). Use the structured bug, parser-error,
+false-positive, and feature-request forms when opening an issue.
 
 ## A note on detections
 

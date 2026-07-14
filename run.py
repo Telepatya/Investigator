@@ -149,6 +149,12 @@ def frontend_source_digest() -> str:
 
 
 def ensure_frontend(build: bool) -> None:
+    # Release archives contain a verified production build but intentionally omit
+    # frontend source and node_modules. This keeps Node.js out of the end-user
+    # dependency set while source checkouts retain the normal locked build path.
+    if build and (FRONTEND_DIST / "index.html").exists() and not (FRONTEND / "src").exists():
+        log("Using packaged frontend build.")
+        return
     npm = npm_cmd()
     if not FRONTEND_LOCK.exists():
         raise SystemExit("Missing frontend/package-lock.json; run npm install deliberately and commit the lockfile.")

@@ -61,3 +61,5 @@ cases/
 .agents/
 .codex_tmp/
 testing/
+/dist/
+/dist-repro/

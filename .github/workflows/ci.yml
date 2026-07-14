@@ -13,6 +13,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  repository-policy:
+    name: Repository policy and release metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate label definitions
+        run: python .github/scripts/sync_labels.py --check
+
+      - name: Generate and parse deterministic SBOM
+        run: |
+          python scripts/generate_sbom.py --version v0.0.0 --output sbom-test.json
+          python -m json.tool sbom-test.json > /dev/null
+
   backend:
     name: Backend
     runs-on: ubuntu-latest
