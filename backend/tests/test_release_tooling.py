@@ -41,6 +41,10 @@ class ReleaseToolingTests(unittest.TestCase):
             purls = {component["purl"] for component in data["components"]}
             self.assertTrue(any(purl.startswith("pkg:pypi/fastapi@") for purl in purls))
             self.assertTrue(any(purl.startswith("pkg:npm/react@") for purl in purls))
+            self.assertTrue(any(purl.startswith("pkg:docker/ubuntu@22.04") for purl in purls))
+            self.assertTrue(any(
+                purl.startswith("pkg:deb/ubuntu/yara@4.1.3-1build1") for purl in purls
+            ))
 
 
 if __name__ == "__main__":

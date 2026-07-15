@@ -43,6 +43,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - **Analyst workstation UI.** Responsive glass-panel workspace with system-aware light/dark themes, a persistent case shell, expandable current-case event search, reusable detail drawers, subtle loading/interaction animation, and case-scoped busy states.
 - **Investigation views.** A server-filtered chronological timeline, deterministic layered entity map, overview dashboard, memory explorer, findings and event tables, evidence management, report export, and streaming AI chat. Timeline and entity-map bundles load only when those routes are opened.
 - **Analyst findings.** Events and entities can be promoted to durable manual findings. Event flags carry their chosen severity into the referenced event and exact-entity-related timeline activity, while benign/delete actions restore the prior parser or detector severity.
+- **Reverse workspaces.** Upload suspicious binaries to standalone or case-linked workspaces for network-isolated, non-root static analysis. Reverse reuses the configured LLM, preserves a signed provenance chain, and supports reports, IOC extraction, replay, and follow-up chat without intentionally executing samples.
 
 | Entity map | Timeline |
 | --- | --- |
@@ -162,7 +163,26 @@ python run.py --dev                  # backend + Vite dev server with hot reload
 python run.py --port 9000            # use a different port
 python run.py --skip-build           # skip rebuilding the frontend
 python run.py --allow-unlocked-deps  # temporary local fallback if Python lock files aren't generated yet
+python run.py --build-reverse-sandbox # explicitly build the optional Docker static-analysis image
 ```
+
+The **Reverse** tab works as a local workspace manager without Docker. Running
+static binary analysis additionally requires Docker Desktop (Linux containers)
+and the explicitly built `investigator-reverse:latest` image. Normal startup
+never downloads or builds that image. Reverse projects and artifacts are stored
+under `~/.investigator/reverse/`; private provenance and provider keys remain in
+the operating-system credential vault. Reverse uses ForensicBuddy's adaptive
+malware-analysis prompt and one-operation loop (`run_cmd`, `read_file`,
+`write_file`, and `list_dir`) instead of a fixed checklist or rigid report
+template. A separate IOC extraction pass and non-rewriting flow verifier run
+before the final report is signed. Follow-up chat also retains ForensicBuddy's
+tool-capable 12-turn loop, so it can inspect the sealed artifacts instead of
+answering solely from report text.
+Verifier status is visible on the Report tab and can be retried independently.
+When built-in analyzers are insufficient, approved Reverse projects also let the
+model create Python parsers/decoders and run them against the sealed sample
+inside the same networkless, non-root sandbox. This does not enable a shell,
+subprocesses, native loading, or intentional sample execution.
 
 <details>
 <summary><strong>Manual start</strong> (without the launcher)</summary>

@@ -17,6 +17,7 @@ import {
   Loader2,
   MessageSquare,
   ShieldCheck,
+  Binary,
 } from "lucide-react";
 import { clsx } from "clsx";
 import { api } from "../lib/api";
@@ -35,6 +36,7 @@ const TABS = [
   { to: "events", label: "Events", icon: <List size={16} /> },
   { to: "report", label: "Report", icon: <FileText size={16} /> },
   { to: "chat", label: "AI", icon: <MessageSquare size={16} /> },
+  { to: "reverse", label: "Reverse", icon: <Binary size={16} /> },
 ];
 
 export default function CaseLayout() {

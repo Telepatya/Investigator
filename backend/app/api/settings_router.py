@@ -18,6 +18,8 @@ from app.models.schemas import (
     ModelInfo,
     ProviderTestResult,
 )
+from app.reverse.schemas import ReverseSettingsUpdate
+from app.reverse.tools import TOOL_DESCRIPTIONS
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -138,3 +140,34 @@ async def update_general_settings(body: dict) -> dict:
         cfg.yara_rules_dir = body["yara_rules_dir"] or ""
     save_config(cfg)
     return {"cases_dir": cfg.cases_dir, "yara_rules_dir": cfg.yara_rules_dir}
+
+
+def _reverse_settings_response() -> dict:
+    cfg = load_config()
+    return {
+        **cfg.reverse.model_dump(),
+        "available_tools": [
+            {"id": tool_id, "description": description}
+            for tool_id, description in TOOL_DESCRIPTIONS.items()
+        ],
+    }
+
+
+@router.get("/reverse")
+async def get_reverse_settings() -> dict:
+    return _reverse_settings_response()
+
+
+@router.put("/reverse")
+async def update_reverse_settings(body: ReverseSettingsUpdate) -> dict:
+    cfg = load_config()
+    changes = body.model_dump(exclude_unset=True)
+    if "enabled_tools" in changes:
+        unknown = sorted(set(changes["enabled_tools"] or []) - set(TOOL_DESCRIPTIONS))
+        if unknown:
+            raise HTTPException(400, f"Unknown Reverse tools: {', '.join(unknown)}")
+        changes["enabled_tools"] = list(dict.fromkeys(changes["enabled_tools"] or []))
+    for key, value in changes.items():
+        setattr(cfg.reverse, key, value)
+    save_config(cfg)
+    return _reverse_settings_response()

@@ -24,9 +24,10 @@ import type {
 const BASE = "/api";
 
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
+  const contentHeaders = opts?.body instanceof FormData ? undefined : { "Content-Type": "application/json" };
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...opts,
+    headers: opts?.headers ?? contentHeaders,
   });
   if (!res.ok) {
     const text = await res.text();
@@ -241,6 +242,77 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  // Reverse workspaces
+  listReverseProjects: (caseId?: string) =>
+    req<import("./types").ReverseProject[]>(`/reverse/projects${caseId ? `?case_id=${encodeURIComponent(caseId)}` : ""}`),
+  getReverseProject: (id: string) => req<import("./types").ReverseProject>(`/reverse/projects/${id}`),
+  createReverseProject: (body: { name: string; description?: string; linked_case_id?: string | null }) =>
+    req<import("./types").ReverseProject>("/reverse/projects", { method: "POST", body: JSON.stringify(body) }),
+  updateReverseProject: (id: string, body: Record<string, unknown>) =>
+    req<import("./types").ReverseProject>(`/reverse/projects/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteReverseProject: (id: string) => req<{ ok: boolean }>(`/reverse/projects/${id}`, { method: "DELETE" }),
+  getReverseProjectTools: (id: string) =>
+    req<import("./types").ReverseToolPolicy>(`/reverse/projects/${id}/tools`),
+  updateReverseProjectTools: (id: string, enabledTools: string[]) =>
+    req<import("./types").ReverseToolPolicy>(`/reverse/projects/${id}/tools`, {
+      method: "PUT", body: JSON.stringify({ enabled_tools: enabledTools }),
+    }),
+  getReverseHealth: () => req<import("./types").ReverseHealth>("/reverse/health"),
+  listReverseArtifacts: (id: string) =>
+    req<import("./types").ReverseArtifact[]>(`/reverse/projects/${id}/artifacts`),
+  uploadReverseArtifact: (id: string, file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    return req<import("./types").ReverseArtifact>(`/reverse/projects/${id}/artifacts`, { method: "POST", body });
+  },
+  deleteReverseArtifact: (id: string, artifactId: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/artifacts/${artifactId}`, { method: "DELETE" }),
+  startReverseAnalysis: (id: string, notes: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/start`, {
+      method: "POST", body: JSON.stringify({ notes }),
+    }),
+  getReverseStatus: (id: string) =>
+    req<import("./types").ReverseStatus>(`/reverse/projects/${id}/analysis/status`),
+  stopReverseAnalysis: (id: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/analysis/stop`, { method: "POST" }),
+  resumeReverseAnalysis: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/resume`, { method: "POST" }),
+  decideReverseExtension: (id: string, decision: "approve" | "deny") =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/turn-extension/${decision}`, { method: "POST" }),
+  replayReverseAnalysis: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/replay`, { method: "POST" }),
+  getReverseReport: (id: string) =>
+    req<import("./types").ReverseReport>(`/reverse/projects/${id}/report`),
+  regenerateReverseIocs: (id: string) =>
+    req<{ iocs: string }>(`/reverse/projects/${id}/report/iocs`, { method: "POST" }),
+  retryReverseReportSignature: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/sign`, { method: "POST" }),
+  retryReverseReportVerification: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/verify`, { method: "POST" }),
+  recoverReverseReport: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/recover`, { method: "POST" }),
+  getReverseMessages: (id: string) =>
+    req<import("./types").ReverseChatMessage[]>(`/reverse/projects/${id}/messages`),
+  sendReverseMessage: (id: string, message: string) =>
+    req<import("./types").ReverseChatMessage>(`/reverse/projects/${id}/messages`, {
+      method: "POST", body: JSON.stringify({ message }),
+    }),
+  clearReverseMessages: (id: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/messages`, { method: "DELETE" }),
+  pauseReverseChat: (id: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/chat/pause`, { method: "POST" }),
+  resumeReverseChat: (id: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/chat/resume`, { method: "POST" }),
+  getReverseTrace: (id: string) =>
+    req<import("./types").ReverseTraceEntry[]>(`/reverse/projects/${id}/trace`),
+  verifyReverseTrace: (id: string) =>
+    req<{ valid: boolean; entries: number; failed_sequences: number[] }>(`/reverse/projects/${id}/trace/verify`),
+  getReverseAudit: (id: string) =>
+    req<import("./types").ReverseAuditEvent[]>(`/reverse/projects/${id}/audit`),
+  getReverseSettings: () => req<import("./types").ReverseSettings>("/settings/reverse"),
+  updateReverseSettings: (body: Partial<import("./types").ReverseSettings>) =>
+    req<import("./types").ReverseSettings>("/settings/reverse", { method: "PUT", body: JSON.stringify(body) }),
+
   health: () =>
     req<{
       status: string;
@@ -250,6 +322,7 @@ export const api = {
       credit: string;
       memprocfs: boolean;
       yara: boolean;
+      reverse: import("./types").ReverseHealth & { store_ready: boolean };
     }>(
       "/health",
     ),
@@ -257,6 +330,10 @@ export const api = {
 
 export function downloadUrl(path: string): string {
   return `${BASE}${path}`;
+}
+
+export function reverseArtifactDownloadUrl(projectId: string, artifactId: string): string {
+  return downloadUrl(`/reverse/projects/${projectId}/artifacts/${artifactId}/download`);
 }
 
 export function memoryProcessDownloadUrl(

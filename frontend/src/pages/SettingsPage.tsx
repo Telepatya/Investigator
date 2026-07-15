@@ -9,6 +9,8 @@ import {
   Loader2,
   Cpu,
   ShieldAlert,
+  Binary,
+  Box,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type { LLMConfig, ModelInfo, Provider } from "../lib/types";
@@ -296,6 +298,8 @@ export default function SettingsPage() {
         </div>
       </Section>
 
+      <ReverseSandboxSettings />
+
       <div className="flex items-center gap-3">
         <button className="btn-primary" onClick={save}>
           Save settings
@@ -308,6 +312,67 @@ export default function SettingsPage() {
       </div>
     </PageShell>
   );
+}
+
+function ReverseSandboxSettings() {
+  const { data } = useQuery({ queryKey: ["reverse-settings"], queryFn: api.getReverseSettings });
+  const { data: health } = useQuery({ queryKey: ["reverse-health"], queryFn: api.getReverseHealth });
+  const [draft, setDraft] = useState<Awaited<ReturnType<typeof api.getReverseSettings>> | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => { if (data) setDraft(data); }, [data]);
+  if (!draft) return <Section title="Reverse sandbox"><div className="text-sm text-ink-400">Loading sandbox settings…</div></Section>;
+
+  const number = (key: keyof typeof draft, value: number) => setDraft({ ...draft, [key]: value });
+  async function saveReverse() {
+    setSaving(true); setError(""); setSaved(false);
+    try {
+      const updated = await api.updateReverseSettings({
+        sandbox_idle_ttl_minutes: draft!.sandbox_idle_ttl_minutes,
+        sandbox_memory_limit_mb: draft!.sandbox_memory_limit_mb,
+        sandbox_cpu_limit: draft!.sandbox_cpu_limit,
+        sandbox_pids_limit: draft!.sandbox_pids_limit,
+        analysis_max_turns: draft!.analysis_max_turns,
+        analysis_extension_turns: draft!.analysis_extension_turns,
+        max_upload_bytes: draft!.max_upload_bytes,
+        max_project_bytes: draft!.max_project_bytes,
+        max_tool_output_chars: draft!.max_tool_output_chars,
+        enabled_tools: draft!.enabled_tools,
+      });
+      setDraft(updated); setSaved(true); setTimeout(() => setSaved(false), 2000);
+    } catch (e) { setError(String(e)); } finally { setSaving(false); }
+  }
+
+  return (
+    <Section title="Reverse sandbox" right={<span className={`chip ${health?.image_available ? "bg-emerald-400/10 text-emerald-400" : "bg-amber-400/10 text-amber-400"}`}><Box size={12} /> {health?.image_available ? "ready" : "not built"}</span>}>
+      <div className="mb-4 flex items-start gap-2 rounded-xl border border-accent-blue/20 bg-accent-blue/10 p-3 text-sm text-ink-200">
+        <Binary size={17} className="mt-0.5 shrink-0 text-accent-blue" />
+        <div>Reverse uses the AI provider above. Uploaded samples are inspected only by a network-isolated, non-root static-analysis container and are never intentionally executed.</div>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        <ReverseNumber label="Idle TTL (minutes)" value={draft.sandbox_idle_ttl_minutes} min={5} max={1440} onChange={(v) => number("sandbox_idle_ttl_minutes", v)} />
+        <ReverseNumber label="Memory limit (MB)" value={draft.sandbox_memory_limit_mb} min={256} max={32768} onChange={(v) => number("sandbox_memory_limit_mb", v)} />
+        <ReverseNumber label="CPU limit" value={draft.sandbox_cpu_limit} min={0.25} max={16} step={0.25} onChange={(v) => number("sandbox_cpu_limit", v)} />
+        <ReverseNumber label="PID limit" value={draft.sandbox_pids_limit} min={32} max={1024} onChange={(v) => number("sandbox_pids_limit", v)} />
+        <ReverseNumber label="Analysis turns" value={draft.analysis_max_turns} min={1} max={100} onChange={(v) => number("analysis_max_turns", v)} />
+        <ReverseNumber label="Extension turns" value={draft.analysis_extension_turns} min={1} max={50} onChange={(v) => number("analysis_extension_turns", v)} />
+      </div>
+      <div className="mt-5 border-t border-white/5 pt-4">
+        <div className="label mb-2">Enabled static tools</div>
+        <div className="grid gap-2 sm:grid-cols-2">
+          {draft.available_tools.map((tool) => <label key={tool.id} className="flex cursor-pointer items-start gap-2 rounded-xl bg-[rgb(var(--panel-strong)/0.46)] p-3 text-sm"><input type="checkbox" className="mt-1 accent-accent-cyan" checked={draft.enabled_tools.includes(tool.id)} onChange={(event) => setDraft({ ...draft, enabled_tools: event.target.checked ? [...draft.enabled_tools, tool.id] : draft.enabled_tools.filter((id) => id !== tool.id) })} /><span><span className="font-mono text-xs font-semibold text-ink-100">{tool.id}</span><span className="mt-0.5 block text-xs text-ink-400">{tool.description}</span></span></label>)}
+        </div>
+      </div>
+      <div className="mt-4 flex items-center gap-3"><button className="btn-primary" disabled={saving} onClick={saveReverse}>{saving ? <Loader2 size={15} className="animate-spin" /> : "Save Reverse settings"}</button>{saved && <span className="flex items-center gap-1 text-sm text-emerald-400"><CheckCircle2 size={15} /> Saved</span>}{error && <span className="text-sm text-sev-critical">{error}</span>}</div>
+      {!health?.image_available && <div className="mt-3 font-mono text-xs text-ink-400">python run.py --build-reverse-sandbox</div>}
+    </Section>
+  );
+}
+
+function ReverseNumber({ label, value, min, max, step = 1, onChange }: { label: string; value: number; min: number; max: number; step?: number; onChange: (value: number) => void }) {
+  return <div><label className="label">{label}</label><input className="input" type="number" value={value} min={min} max={max} step={step} onChange={(event) => onChange(Math.max(min, Math.min(max, Number(event.target.value) || min)))} /></div>;
 }
 
 function ToolCallLimit({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {

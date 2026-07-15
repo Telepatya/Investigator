@@ -14,6 +14,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_LOCK = ROOT / "backend" / "requirements-memory.lock"
 NPM_LOCK = ROOT / "frontend" / "package-lock.json"
+REVERSE_DOCKERFILE = ROOT / "backend" / "reverse_sandbox" / "Dockerfile"
 PYTHON_PACKAGE_RE = re.compile(
     r"^([A-Za-z0-9_.-]+)==([^\s;\\]+)(?:\s*;\s*(.*?))?\s*\\?$"
 )
@@ -86,8 +87,63 @@ def npm_components(path: Path) -> list[dict[str, Any]]:
     return list(components.values())
 
 
+def reverse_sandbox_components(path: Path) -> list[dict[str, Any]]:
+    """Record the pinned sandbox base image and explicitly locked apt tools."""
+    if not path.is_file():
+        return []
+    match = re.search(
+        r"^FROM\s+([^\s:@]+):([^\s@]+)@sha256:([0-9a-f]{64})\s*$",
+        path.read_text(encoding="utf-8"),
+        flags=re.MULTILINE | re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError("Reverse sandbox Dockerfile must pin its base image by sha256 digest")
+    name, version, digest = match.groups()
+    purl = (
+        f"pkg:docker/{urllib.parse.quote(name, safe='/')}@{urllib.parse.quote(version, safe='.+-')}"
+        f"?digest=sha256%3A{digest.lower()}"
+    )
+    components = [{
+        "type": "container",
+        "bom-ref": purl,
+        "name": name,
+        "version": version,
+        "purl": purl,
+        "hashes": [{"alg": "SHA-256", "content": digest.lower()}],
+        "properties": [
+            {"name": "investigator:ecosystem", "value": "docker"},
+            {"name": "investigator:source", "value": "backend/reverse_sandbox/Dockerfile"},
+        ],
+    }]
+    for package, package_version in re.findall(
+        r"^\s{8}([a-z0-9+.-]+)=([^\s\\]+)\s*\\?$",
+        path.read_text(encoding="utf-8"),
+        flags=re.MULTILINE | re.IGNORECASE,
+    ):
+        apt_purl = (
+            f"pkg:deb/ubuntu/{urllib.parse.quote(package.lower(), safe='')}@"
+            f"{urllib.parse.quote(package_version, safe='.+-~:')}?distro=ubuntu-22.04"
+        )
+        components.append({
+            "type": "library",
+            "bom-ref": apt_purl,
+            "name": package.lower(),
+            "version": package_version,
+            "purl": apt_purl,
+            "properties": [
+                {"name": "investigator:ecosystem", "value": "ubuntu-apt"},
+                {"name": "investigator:source", "value": "backend/reverse_sandbox/Dockerfile"},
+            ],
+        })
+    return components
+
+
 def build_sbom(version: str) -> dict[str, Any]:
-    components = python_components(PYTHON_LOCK) + npm_components(NPM_LOCK)
+    components = (
+        python_components(PYTHON_LOCK)
+        + npm_components(NPM_LOCK)
+        + reverse_sandbox_components(REVERSE_DOCKERFILE)
+    )
     components.sort(key=lambda item: (item["purl"].casefold(), item["purl"]))
     return {
         "bomFormat": "CycloneDX",

@@ -135,6 +135,10 @@ async def delete_case(case_id: str) -> dict:
         _discard_case_uploads(case_id)
         if not await asyncio.to_thread(case_store.delete_case, case_id):
             raise HTTPException(404, "Case not found")
+        # Reverse workspaces are independent records. Preserve their analysis
+        # history while clearing the now-invalid optional case association.
+        from app.reverse.store import unlink_deleted_case
+        await asyncio.to_thread(unlink_deleted_case, case_id)
     return {"ok": True}
 
 

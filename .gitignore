@@ -63,3 +63,6 @@ cases/
 testing/
 /dist/
 /dist-repro/
+
+# Local behavior reference only; never package the legacy standalone app or its keys.
+/ForensicBuddy-master/

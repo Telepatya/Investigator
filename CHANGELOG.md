@@ -5,8 +5,28 @@ migration, and verification details live in `docs/releases/`.
 
 ## Unreleased
 
+### Fixed
+
+- Reverse report finalization now persists exact report bytes before signing,
+  uses Windows-compatible compact Ed25519 credentials, supports RSA key
+  compatibility and signing retries, and cannot fail a completed analysis when
+  the OS credential vault is unavailable.
+- Reverse analysis now faithfully uses ForensicBuddy's adaptive prompt,
+  one-operation command/file loop, completion/blocking logic, permissive report
+  generator, and separate IOC-enumeration pass instead of a fixed PE checklist or
+  rigid report contract. The final verifier records findings without rewriting or
+  shortening the report. Follow-up chat now uses ForensicBuddy's guarded 12-turn
+  tool loop instead of answering from report text alone.
+
 ### Added
 
+- Native Reverse workspaces with optional case links, shared LLM settings,
+  versioned SQLite history, signed provenance, reports/IOCs/chat/replay, and an
+  explicitly built, networkless static-analysis sandbox.
+- ForensicBuddy-compatible `run_cmd`, `read_file`, `write_file`, and `list_dir`
+  tools plus a broad static-analysis argv allowlist. Model-authored Python helpers
+  run through a restricted interpreter that denies networking, subprocesses,
+  native loading, root-filesystem reads, and sample mutation.
 - A proposed v0.2.0 roadmap covering optimization, benchmarks, local metrics,
   audited universal finding exclusions, and case manifests with SHA-256
   evidence hashing.

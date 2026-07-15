@@ -12,6 +12,7 @@ import keyring
 from pydantic import BaseModel, Field
 
 SERVICE_NAME = "investigator-dfir"
+CONFIG_SCHEMA_VERSION = 3
 UPLOAD_STAGING_PREFIX = ".investigator-upload-"
 DEFAULT_CONFIG_DIR = Path.home() / ".investigator"
 DEFAULT_CASES_DIR = DEFAULT_CONFIG_DIR / "cases"
@@ -34,8 +35,28 @@ class LLMSettings(BaseModel):
     entity_max_tool_calls: int = Field(default=5, ge=0, le=20)
 
 
+class ReverseSettings(BaseModel):
+    """Non-secret configuration for the static reverse-engineering sandbox."""
+
+    sandbox_image: str = "investigator-reverse:latest"
+    sandbox_idle_ttl_minutes: int = Field(default=30, ge=5, le=1440)
+    sandbox_memory_limit_mb: int = Field(default=2048, ge=256, le=32768)
+    sandbox_cpu_limit: float = Field(default=2.0, ge=0.25, le=16.0)
+    sandbox_pids_limit: int = Field(default=128, ge=32, le=1024)
+    analysis_max_turns: int = Field(default=25, ge=1, le=100)
+    analysis_extension_turns: int = Field(default=10, ge=1, le=50)
+    max_upload_bytes: int = Field(default=2 * 1024 ** 3, ge=1024, le=64 * 1024 ** 3)
+    max_project_bytes: int = Field(default=8 * 1024 ** 3, ge=1024, le=256 * 1024 ** 3)
+    max_tool_output_chars: int = Field(default=20_000, ge=1000, le=200_000)
+    enabled_tools: list[str] = Field(
+        default_factory=lambda: ["run_cmd", "read_file", "write_file", "list_dir"]
+    )
+
+
 class AppConfig(BaseModel):
+    config_version: int = CONFIG_SCHEMA_VERSION
     llm: LLMSettings = Field(default_factory=LLMSettings)
+    reverse: ReverseSettings = Field(default_factory=ReverseSettings)
     cases_dir: str = str(DEFAULT_CASES_DIR)
     yara_rules_dir: str = ""
 
@@ -49,7 +70,19 @@ def load_config() -> AppConfig:
     ensure_dirs()
     if CONFIG_FILE.exists():
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        return AppConfig.model_validate(data)
+        previous_version = int(data.get("config_version", 1))
+        cfg = AppConfig.model_validate(data)
+        if previous_version < 2:
+            for tool_id in ("write_python_tool", "run_python_tool"):
+                if tool_id not in cfg.reverse.enabled_tools:
+                    cfg.reverse.enabled_tools.append(tool_id)
+            cfg.config_version = CONFIG_SCHEMA_VERSION
+            save_config(cfg)
+        if previous_version < 3:
+            cfg.reverse.enabled_tools = ["run_cmd", "read_file", "write_file", "list_dir"]
+            cfg.config_version = CONFIG_SCHEMA_VERSION
+            save_config(cfg)
+        return cfg
     cfg = AppConfig()
     save_config(cfg)
     return cfg
@@ -86,6 +119,12 @@ def has_api_key(provider: ProviderType) -> bool:
 def get_cases_dir(config: AppConfig | None = None) -> Path:
     cfg = config or load_config()
     path = Path(cfg.cases_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_reverse_dir() -> Path:
+    path = DEFAULT_CONFIG_DIR / "reverse"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

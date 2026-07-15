@@ -15,6 +15,8 @@ import EventsPage from "./pages/EventsPage";
 import ChatPage from "./pages/ChatPage";
 import ReportPage from "./pages/ReportPage";
 import { ThemeProvider } from "./lib/theme";
+import ReversePage, { ReverseCasePage } from "./pages/ReversePage";
+import ReverseProjectPage from "./pages/ReverseProjectPage";
 
 // Split the two heaviest routes into on-demand chunks: TimelinePage pulls in
 // vis-timeline and EntityMapPage pulls in reactflow, so neither weighs down the
@@ -40,6 +42,8 @@ const router = createBrowserRouter([
     element: <App />,
     children: [
       { index: true, element: <CasesPage /> },
+      { path: "reverse", element: <ReversePage /> },
+      { path: "reverse/:projectId", element: <ReverseProjectPage /> },
       { path: "settings", element: <SettingsPage /> },
       {
         path: "cases/:caseId",
@@ -55,6 +59,7 @@ const router = createBrowserRouter([
           { path: "events", element: <EventsPage /> },
           { path: "report", element: <ReportPage /> },
           { path: "chat", element: <ChatPage /> },
+          { path: "reverse", element: <ReverseCasePage /> },
         ],
       },
     ],

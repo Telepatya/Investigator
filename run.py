@@ -39,6 +39,8 @@ FRONTEND_LOCK = FRONTEND / "package-lock.json"
 FRONTEND_LOCK_STATE = FRONTEND / "node_modules" / ".investigator-package-lock.sha256"
 FRONTEND_DIST = FRONTEND / "dist"
 FRONTEND_BUILD_STATE = FRONTEND_DIST / ".investigator-src.sha256"
+REVERSE_SANDBOX = BACKEND / "reverse_sandbox"
+REVERSE_SANDBOX_IMAGE = "investigator-reverse:latest"
 logger = logging.getLogger(__name__)
 # Files whose contents determine the built frontend; a change to any triggers a
 # rebuild. node_modules and dist are excluded (deps handled separately, dist is
@@ -189,6 +191,22 @@ def ensure_frontend(build: bool) -> None:
             write_state(FRONTEND_BUILD_STATE, src_digest)
 
 
+def build_reverse_sandbox() -> None:
+    """Build the optional static-analysis image only on explicit request."""
+    docker = shutil.which("docker")
+    if not docker:
+        raise SystemExit("Docker CLI was not found. Install/start Docker Desktop, then retry.")
+    dockerfile = REVERSE_SANDBOX / "Dockerfile"
+    if not dockerfile.is_file():
+        raise SystemExit(f"Reverse sandbox source is missing: {dockerfile}")
+    log(f"Building optional Reverse sandbox image {REVERSE_SANDBOX_IMAGE} ...")
+    run([
+        docker, "build", "--pull", "--tag", REVERSE_SANDBOX_IMAGE,
+        "--file", str(dockerfile), str(BACKEND),
+    ], cwd=ROOT)
+    log("Reverse sandbox image is ready.")
+
+
 def open_browser_later(url: str, delay: float = 2.0) -> None:
     def _open() -> None:
         time.sleep(delay)
@@ -206,6 +224,11 @@ def main() -> int:
     parser.add_argument("--dev", action="store_true", help="Run Vite dev server with hot reload")
     parser.add_argument("--skip-build", action="store_true", help="Skip the frontend production build")
     parser.add_argument(
+        "--build-reverse-sandbox",
+        action="store_true",
+        help="Explicitly build the optional static-analysis Docker image, then exit",
+    )
+    parser.add_argument(
         "--allow-unlocked-deps",
         action="store_true",
         help="Temporary local fallback: install backend deps from requirements-memory.in when no lock is present",
@@ -213,6 +236,10 @@ def main() -> int:
     args = parser.parse_args()
 
     log("Investigator DFIR")
+
+    if args.build_reverse_sandbox:
+        build_reverse_sandbox()
+        return 0
 
     py = ensure_venv(allow_unlocked_deps=args.allow_unlocked_deps)
 

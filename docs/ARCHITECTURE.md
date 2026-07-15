@@ -56,6 +56,10 @@ principles:
 6. **Exact identity beats convenient matching.** Full file/process paths are
    normalized and matched exactly. Basename fallback is used only when the source
    identity is basename-only and unambiguous.
+7. **Static Reverse isolation.** Reverse workspaces have a separate versioned
+   SQLite store. Untrusted artifacts enter only a non-root, no-network Docker
+   sandbox through generated UUID paths and a shared argv/file-operation policy;
+   uploaded samples are not executed.
 
 ## Migration summary
 
@@ -122,6 +126,49 @@ The production frontend is built into `frontend/dist` and served by FastAPI, so
 the normal deployment is one local process on `127.0.0.1:8400`. Development mode
 uses Vite on `:5173` with `/api` proxied to the backend.
 
+### Reverse workspaces
+
+Reverse is a native top-level module, not a second web service. Metadata is kept
+in `~/.investigator/reverse/reverse.db`; each project owns UUID-addressed upload,
+output, log, and staging directories. A nullable case ID provides an optional
+association without crossing SQLite foreign-key boundaries. Deleting a case
+clears that association and records an audit event but preserves Reverse work.
+
+Each analysis run snapshots the shared Investigator provider/model settings and
+the sandbox image digest/tool versions. The orchestration is a native port of
+ForensicBuddy's prompt and adaptive loop: one `run_cmd`, `read_file`, `write_file`,
+or `list_dir` operation per turn, completion/blocking signals, duplicate
+suppression, and a three-turn no-progress stop. Host and container share the same
+argv/executable/path policy. Containers have no network or host
+mounts, run as a non-root user with all capabilities dropped, use a read-only root
+filesystem and bounded tmpfs, and are destroyed after the configured idle TTL.
+Artifacts are streamed into tmpfs through a fixed staging broker with UUID,
+offset, size, and SHA-256 checks; no project directory is mounted into Docker.
+The model may use `write_file` to create a Python parser/decoder below output or
+tools and invoke it through `run_cmd` with `python3`. The broker routes Python
+through a fixed audited runner that denies networking, child processes, native
+loading, root-filesystem access, and sample mutation.
+
+Follow-up Reverse chat uses ForensicBuddy's 12-turn analyst loop and the same four
+operations, command policy, duplicate suppression, and evidence feedback. A chat
+answer can therefore inspect the sealed sample or create a bounded helper instead
+of relying only on the previously generated report.
+
+There is no host checklist or report-format gate. The ForensicBuddy prompt directs
+the model to identify, unpack/deobfuscate, inspect structure and behavior, write
+custom helpers when useful, correlate claims with tool evidence, and explicitly
+finish or declare a concrete blocker. This preserves model judgment about which
+reverse-engineering avenues matter for the actual sample.
+
+Finalization uses ForensicBuddy's permissive report generator and dedicated IOC
+enumeration prompt. A separate flow verifier records whether the report matches
+the tool trace but never rewrites the analyst output. The final text and verifier state are visible and durable;
+verifier failures are marked and retryable instead of being treated as success.
+Only then are exact UTF-8 report bytes atomically committed and signed with the
+compact per-install Ed25519 key. Signing failures remain retryable without
+rerunning the model; public verification material is retained with the signed
+provenance event.
+
 ## Repository layout
 
 ```text
@@ -140,9 +187,11 @@ Investigator/
 |   |   |-- memory/                MemProcFS, YARA, forensic extraction
 |   |   |-- detect/                rules, overrides, manual findings, graphs
 |   |   |-- llm/                   providers, tools, prompts, orchestration
+|   |   |-- reverse/               projects, analysis, sandbox policy, provenance
 |   |   |-- store/                 registry, operation locks, SQLAlchemy storage
 |   |   `-- models/                request/response schemas
 |   `-- tests/                     unittest regression suite
+|-- backend/reverse_sandbox/       pinned optional static-analysis image source
 `-- frontend/
     |-- src/
     |   |-- App.tsx                global workstation shell and case search

@@ -152,6 +152,69 @@ advisory:
   With a remote provider, only prompt/tool excerpts are sent, and the settings UI
   warns that evidence will leave the machine.
 
+## Reverse Static-Analysis Boundary
+
+Reverse artifacts are potentially executable malware and receive a stricter
+boundary than ordinary case evidence:
+
+- Reverse uses the existing loopback/Host/Origin controls and stores uploads by
+  generated UUID, after streamed size enforcement, basename validation, hashing,
+  staging, and atomic commit. Project paths use canonical containment checks.
+- Reverse uses ForensicBuddy's four-operation protocol: `run_cmd`, `read_file`,
+  `write_file`, and `list_dir`. `run_cmd` accepts one argv array, never shell text.
+  Both host and container validate against the same immutable executable/path
+  policy, and the broker substitutes an exact absolute binary before `shell=False`.
+  Indirect execution features in `find`, `awk`, and `sed` are denied. Shells,
+  networks, privilege changes, and uploaded-sample launching remain outside the
+  protocol.
+- The optional Linux container runs non-root with no network, host mounts, or
+  Docker socket; all capabilities are dropped, `no-new-privileges` and a read-only
+  root filesystem are applied, and writable tmpfs, CPU, memory, PID, timeout, and
+  output bounds are enforced. It is ephemeral and reconstructed from stored
+  artifacts after its idle TTL.
+- Artifact reconstruction uses a fixed, non-model-callable staging broker rather
+  than a host mount. It accepts bounded chunks at an exact UUID and offset, then
+  checks the expected size and SHA-256 and seals the sample before a static tool
+  can read it. Staging commands and analysis commands both use `shell=False`.
+- The agent follows ForensicBuddy's adaptive investigation loop. Its prompt asks
+  for identification, unpacking/deobfuscation, static analysis, behavioral
+  indicators, evidence correlation, and comprehensive malicious-sample reporting,
+  but the host imposes no fixed file-format checklist or report schema. Exact
+  duplicate operations and three consecutive no-progress turns stop churn.
+- Follow-up Reverse chat uses the same guarded four-operation tool loop for up to
+  12 turns. Its tool requests and result hashes are added to audit/provenance
+  history; it does not gain a broader command or Python policy than analysis.
+- Reports receive ForensicBuddy's separate IOC-enumeration LLM pass, then an
+  independent flow/evidence verifier before signing. The verifier never rewrites,
+  shortens, or template-normalizes the report; it only records pass or needs-review
+  state. A provider/verifier outage leaves
+  a clearly marked, retryable unverified report rather than a false verified state.
+- Remote LLM providers may receive bounded strings, headers, hashes, report text,
+  and tool output from Reverse artifacts. The same evidence-leaves-the-machine
+  warning and global provider choice shown in Settings applies.
+- Analysis runs record the provider/model snapshot, image digest, tool versions,
+  artifact hashes, and a tamper-evident provenance chain. The per-install signing
+  private key is generated into the OS credential vault and is never packaged.
+  New installations use a compact Ed25519 key that fits Windows Credential
+  Manager; existing RSA keys remain readable. Report bytes are committed before
+  signing, so a vault outage leaves a completed report with an explicit,
+  retryable signature state rather than failing the analysis. Signed events
+  retain the public key and fingerprint needed for independent verification.
+- Model-authored Python is untrusted code, not an additional trusted analyzer.
+  The model writes reviewable helpers below `/workspace/output` or
+  `/workspace/tools`; provenance records payload hashes rather than copying source.
+  The fixed Python runner denies subprocess/fork/exec, sockets, native loading,
+  input mutation, and reads outside workspace/Python library paths. Python audit
+  hooks are defense in depth,
+  not a substitute for the Docker boundary; container escape risk is a remaining
+  limitation, so Docker Desktop and the host kernel must remain patched.
+
+Docker is optional and never contacted during normal startup. Building the image
+requires the explicit `python run.py --build-reverse-sandbox` action. Docker is a
+meaningful local privilege boundary: users should keep Docker Desktop and the host
+kernel patched, and must not weaken the container flags or add sample-execution
+tools without a separate dynamic-analysis threat model.
+
 ## Case Isolation And Concurrency
 
 Investigator is designed as a single local backend process with one SQLite

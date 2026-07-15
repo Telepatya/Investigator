@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import logging
+import asyncio
 
 from contextlib import asynccontextmanager
 
@@ -24,6 +25,11 @@ from app.store.cases import (
     recover_interrupted_case_operations,
 )
 from app.store.database import dispose_all_db_engines
+from app.reverse.analysis import analysis_manager
+from app.reverse.database import dispose_reverse_db, init_reverse_db
+from app.reverse.router import router as reverse_router
+from app.reverse.sandbox import sandbox_manager
+from app.reverse.store import cleanup_staging_files, recover_interrupted_runs, repair_case_links
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +43,12 @@ APP_CREDIT = "Made by Roei.f"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_dirs()
+    init_reverse_db()
+    for run_id in recover_interrupted_runs():
+        logger.warning("Recovered interrupted Reverse run %s", run_id)
+    for project_id in repair_case_links():
+        logger.warning("Cleared stale case link for Reverse project %s", project_id)
+    cleanup_staging_files()
     for case_id in recover_interrupted_case_operations():
         logger.warning("Recovered interrupted operation state for case %s", case_id)
     for result in cleanup_orphan_case_dirs():
@@ -62,9 +74,21 @@ async def lifespan(app: FastAPI):
                 result.get("path"),
                 result.get("case_id"),
             )
+    async def _reverse_cleanup_loop() -> None:
+        while True:
+            await asyncio.sleep(60)
+            for project_id in await asyncio.to_thread(sandbox_manager.cleanup_idle):
+                logger.info("Destroyed idle Reverse sandbox for %s", project_id)
+
+    cleanup_task = asyncio.create_task(_reverse_cleanup_loop(), name="reverse-sandbox-cleanup")
     try:
         yield
     finally:
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+        await analysis_manager.shutdown()
+        await asyncio.to_thread(sandbox_manager.shutdown)
+        dispose_reverse_db()
         dispose_all_db_engines()
 
 
@@ -111,12 +135,14 @@ async def _case_not_found_handler(_request: Request, _exc: CaseNotFoundError) ->
 app.include_router(settings_router.router)
 app.include_router(cases_router.router)
 app.include_router(analysis_router.router)
+app.include_router(reverse_router)
 
 
 @app.get("/api/health")
 async def health() -> dict:
     from app.memory.memprocfs_runner import is_memprocfs_available
     from app.memory.yara_scanner import get_scanner
+    reverse = await asyncio.to_thread(sandbox_manager.health)
     return {
         "status": "ok",
         "brand": APP_TITLE,
@@ -125,6 +151,10 @@ async def health() -> dict:
         "credit": APP_CREDIT,
         "memprocfs": is_memprocfs_available(),
         "yara": get_scanner().available(),
+        "reverse": {
+            **reverse,
+            "store_ready": True,
+        },
     }
 
 

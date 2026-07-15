@@ -26,7 +26,7 @@ BACKEND_FILES = (
     "backend/requirements.lock", "backend/requirements-memory.lock",
     "backend/requirements.txt",
 )
-TREES = ("backend/app", "frontend/dist", "docs", "demo")
+TREES = ("backend/app", "backend/reverse_sandbox", "frontend/dist", "docs", "demo")
 
 
 def source_epoch() -> int:

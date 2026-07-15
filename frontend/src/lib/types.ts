@@ -353,3 +353,128 @@ export interface Progress {
   done: boolean;
   error?: string | null;
 }
+
+export interface ReverseProject {
+  id: string;
+  name: string;
+  description: string;
+  linked_case_id: string | null;
+  status: string;
+  active_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+  artifact_count: number;
+  latest_run_status: string | null;
+}
+
+export interface ReverseArtifact {
+  id: string;
+  project_id: string;
+  name: string;
+  artifact_type: string;
+  content_type: string;
+  file_size: number;
+  sha256: string;
+  created_at: string;
+}
+
+export interface ReverseRun {
+  id: string;
+  project_id: string;
+  status: string;
+  provider: Provider;
+  model: string;
+  temperature: number;
+  max_tokens: number;
+  max_turns: number;
+  turns_used: number;
+  awaiting_reason: string | null;
+  error: string | null;
+  image_digest: string | null;
+  tool_versions: Record<string, string>;
+  report_signature_status: string;
+  report_signature_error: string | null;
+  report_verification_status: string;
+  report_verification_summary: string | null;
+  report_verification_error: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface ReverseStatus {
+  project_id: string;
+  status: string;
+  run: ReverseRun | null;
+  active: boolean;
+  can_resume: boolean;
+  can_recover_report: boolean;
+}
+
+export interface ReverseReport {
+  project_id: string;
+  run_id: string;
+  content: string;
+  iocs: string | null;
+  signature_status: string;
+  signature_error: string | null;
+  verification_status: string;
+  verification_summary: string | null;
+  verification_error: string | null;
+  verification_details: Record<string, unknown>;
+}
+
+export interface ReverseTraceEntry {
+  id: number;
+  sequence: number;
+  event_type: string;
+  payload: Record<string, unknown>;
+  previous_hash: string;
+  entry_hash: string;
+  signature: string | null;
+  created_at: string;
+}
+
+export interface ReverseChatMessage {
+  id: number;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  phase: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface ReverseAuditEvent {
+  id: number;
+  event_type: string;
+  details: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface ReverseHealth {
+  docker_available: boolean;
+  image_available: boolean;
+  image: string;
+  image_digest: string | null;
+  message: string;
+}
+
+export interface ReverseToolPolicy {
+  enabled_tools: string[];
+  available_tools: { id: string; description: string }[];
+}
+
+export interface ReverseSettings {
+  sandbox_image: string;
+  sandbox_idle_ttl_minutes: number;
+  sandbox_memory_limit_mb: number;
+  sandbox_cpu_limit: number;
+  sandbox_pids_limit: number;
+  analysis_max_turns: number;
+  analysis_extension_turns: number;
+  max_upload_bytes: number;
+  max_project_bytes: number;
+  max_tool_output_chars: number;
+  enabled_tools: string[];
+  available_tools: { id: string; description: string }[];
+}
