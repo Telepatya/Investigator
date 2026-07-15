@@ -278,7 +278,7 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([entry.event_type for entry in events], ["chat.started", "chat.completed"])
         self.assertNotIn("api_key", json.dumps([entry.payload for entry in events]))
 
-    async def test_follow_up_chat_uses_forensicbuddy_tool_loop(self) -> None:
+    async def test_follow_up_chat_uses_the_sandbox_tool_loop(self) -> None:
         project, artifact_id = self.project_with_artifact()
         run = ReverseRun(
             id=str(uuid.uuid4()), project_id=project.id, status="completed",

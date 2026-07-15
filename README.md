@@ -171,13 +171,13 @@ static binary analysis additionally requires Docker Desktop (Linux containers)
 and the explicitly built `investigator-reverse:latest` image. Normal startup
 never downloads or builds that image. Reverse projects and artifacts are stored
 under `~/.investigator/reverse/`; private provenance and provider keys remain in
-the operating-system credential vault. Reverse uses ForensicBuddy's adaptive
+the operating-system credential vault. Reverse uses an adaptive
 malware-analysis prompt and one-operation loop (`run_cmd`, `read_file`,
 `write_file`, and `list_dir`) instead of a fixed checklist or rigid report
 template. A separate IOC extraction pass and non-rewriting flow verifier run
-before the final report is signed. Follow-up chat also retains ForensicBuddy's
-tool-capable 12-turn loop, so it can inspect the sealed artifacts instead of
-answering solely from report text.
+before the final report is signed. Follow-up chat uses the same tool-capable
+12-turn loop, so it can inspect the sealed artifacts instead of answering
+solely from report text.
 Verifier status is visible on the Report tab and can be retried independently.
 When built-in analyzers are insufficient, approved Reverse projects also let the
 model create Python parsers/decoders and run them against the sealed sample

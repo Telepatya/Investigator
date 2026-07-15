@@ -135,8 +135,8 @@ association without crossing SQLite foreign-key boundaries. Deleting a case
 clears that association and records an audit event but preserves Reverse work.
 
 Each analysis run snapshots the shared Investigator provider/model settings and
-the sandbox image digest/tool versions. The orchestration is a native port of
-ForensicBuddy's prompt and adaptive loop: one `run_cmd`, `read_file`, `write_file`,
+the sandbox image digest/tool versions. The orchestration is an adaptive
+prompt-and-tool loop: one `run_cmd`, `read_file`, `write_file`,
 or `list_dir` operation per turn, completion/blocking signals, duplicate
 suppression, and a three-turn no-progress stop. Host and container share the same
 argv/executable/path policy. Containers have no network or host
@@ -149,18 +149,18 @@ tools and invoke it through `run_cmd` with `python3`. The broker routes Python
 through a fixed audited runner that denies networking, child processes, native
 loading, root-filesystem access, and sample mutation.
 
-Follow-up Reverse chat uses ForensicBuddy's 12-turn analyst loop and the same four
+Follow-up Reverse chat uses a 12-turn analyst loop and the same four
 operations, command policy, duplicate suppression, and evidence feedback. A chat
 answer can therefore inspect the sealed sample or create a bounded helper instead
 of relying only on the previously generated report.
 
-There is no host checklist or report-format gate. The ForensicBuddy prompt directs
+There is no host checklist or report-format gate. The analysis prompt directs
 the model to identify, unpack/deobfuscate, inspect structure and behavior, write
 custom helpers when useful, correlate claims with tool evidence, and explicitly
 finish or declare a concrete blocker. This preserves model judgment about which
 reverse-engineering avenues matter for the actual sample.
 
-Finalization uses ForensicBuddy's permissive report generator and dedicated IOC
+Finalization uses a permissive report generator and dedicated IOC
 enumeration prompt. A separate flow verifier records whether the report matches
 the tool trace but never rewrites the analyst output. The final text and verifier state are visible and durable;
 verifier failures are marked and retryable instead of being treated as success.

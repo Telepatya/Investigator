@@ -1,4 +1,4 @@
-"""Shared host/container policy for ForensicBuddy-compatible Reverse tools."""
+"""Shared host/container command policy for Reverse tools."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ INPUTS = "/workspace/inputs"
 OUTPUT = "/workspace/output"
 TOOLS = "/workspace/tools"
 
-# The model selects a logical identity; the broker supplies the absolute executable.
-# This preserves ForensicBuddy's argv tool set without trusting executable paths.
+# The model selects a logical identity; the broker supplies the absolute executable,
+# so executable paths coming from the model are never trusted.
 EXECUTABLE_PATHS: dict[str, str] = {
     "file": "/usr/bin/file",
     "strings": "/usr/bin/strings",

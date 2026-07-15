@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run model-authored Python with ForensicBuddy semantics inside Docker."""
+"""Run model-authored Python helpers under restricted semantics inside Docker."""
 
 from __future__ import annotations
 

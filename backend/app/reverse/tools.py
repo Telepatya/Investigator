@@ -1,4 +1,4 @@
-"""ForensicBuddy-compatible tool protocol for Reverse analysis."""
+"""One-operation JSON-array tool protocol for Reverse analysis."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Container broker for the original ForensicBuddy-style tool protocol."""
+"""Container broker for the one-operation Reverse tool protocol."""
 
 from __future__ import annotations
 

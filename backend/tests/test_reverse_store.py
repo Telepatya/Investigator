@@ -145,7 +145,7 @@ class ReverseStoreTests(unittest.TestCase):
         self.assertEqual(second.previous_hash, first.entry_hash)
         self.assertEqual(len(second.entry_hash), 64)
 
-    def test_forensicbuddy_tool_parser_accepts_one_array_operation_and_rejects_escape(self) -> None:
+    def test_reverse_tool_parser_accepts_one_array_operation_and_rejects_escape(self) -> None:
         artifact = "/workspace/inputs/11111111-1111-4111-8111-111111111111"
         call = parse_tool_call(json.dumps([{
             "tool": "run_cmd", "cmd": ["strings", "-n", "6", artifact],
