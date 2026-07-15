@@ -7,6 +7,15 @@ migration, and verification details live in `docs/releases/`.
 
 ### Added
 
+- Benchmark infrastructure (`backend/benchmarks/`, roadmap workstream 1): a
+  one-command suite (`python -m benchmarks run`) over deterministic, versioned
+  synthetic corpora covering ingestion (JSONL/CSV/EVTX-derived JSON/Linux
+  logs/mixed ZIP), normalization and bulk insertion at three corpus sizes,
+  detection rebuilds over benign/mixed/suspicious corpora, query paths
+  (timeline, FTS, statistics, entity graph, finding serialization), and
+  MemProcFS artifact normalization — with machine-readable JSON results, a
+  commit-comparison report that flags >10% regressions and behavioral counter
+  drift, a CI smoke profile, and documentation in `docs/BENCHMARKS.md`.
 - A proposed v0.2.0 roadmap covering optimization, benchmarks, local metrics,
   audited universal finding exclusions, and case manifests with SHA-256
   evidence hashing.

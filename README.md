@@ -268,7 +268,15 @@ python -m venv .venv && .venv/bin/pip install --require-hashes --no-deps -r requ
 cd frontend
 npm ci
 npm run dev
+
+# Performance benchmarks (deterministic synthetic corpora, local only)
+cd backend
+.venv/bin/python -m benchmarks run            # full suite -> benchmarks/results/*.json
+.venv/bin/python -m benchmarks compare A B    # regression report between two runs
 ```
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for profiles, the result schema,
+and the regression policy.
 
 CI runs the backend lint + test suite (Ruff, `unittest`, `pip-audit`) and the frontend type-check + build on every push and pull request. See [SECURITY.md](SECURITY.md) for the vulnerability-reporting policy.
 

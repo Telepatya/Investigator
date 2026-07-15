@@ -57,6 +57,9 @@ cases/
 *.7z
 *.rar
 
+# Benchmark outputs (results are per-machine; commit only curated baselines)
+backend/benchmarks/results/
+
 # Local workspace/test artifacts
 .agents/
 .codex_tmp/

@@ -59,13 +59,20 @@ jobs:
         run: python -m pip check
 
       - name: Compile Python
-        run: python -m compileall -q app
+        run: python -m compileall -q app benchmarks
 
       - name: Run Ruff
-        run: ruff check app tests
+        run: ruff check app tests benchmarks
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
+
+      # Harness correctness only — shared-runner timings never gate a merge.
+      # Full benchmark runs are local, scheduled, or manual (docs/BENCHMARKS.md).
+      - name: Run smoke benchmark
+        run: |
+          python -m benchmarks run --profile smoke --output /tmp/benchmark-smoke.json
+          python -m benchmarks compare /tmp/benchmark-smoke.json /tmp/benchmark-smoke.json
 
       - name: Audit Python dependencies
         run: pip-audit -r requirements.lock

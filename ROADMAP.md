@@ -42,10 +42,13 @@ or manual, so noisy shared-runner timings never gate a merge.
 
 **Done when:**
 
-- [ ] One documented command runs the full local suite
-- [ ] Synthetic corpora are deterministic and versioned
-- [ ] Two commits can be compared with a generated summary report
-- [ ] A >10% regression in the reference environment requires an explanation or explicit baseline update
+- [x] One documented command runs the full local suite (`python -m benchmarks run`, see [docs/BENCHMARKS.md](docs/BENCHMARKS.md))
+- [x] Synthetic corpora are deterministic and versioned (`CORPUS_VERSION`, hashed manifest, determinism tests)
+- [x] Two commits can be compared with a generated summary report (`python -m benchmarks compare`)
+- [x] A >10% regression in the reference environment requires an explanation or explicit baseline update (enforced by `compare`'s exit code; policy in docs/BENCHMARKS.md)
+
+*Status: delivered, except frontend build-size / render timings which move to
+workstream 2's frontend work where reliably measurable.*
 
 ## 2. Profile-guided optimization
 
