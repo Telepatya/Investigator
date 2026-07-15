@@ -81,12 +81,7 @@ def _extract_array(text: str) -> list[Any] | None:
     return None
 
 
-def parse_tool_call(text: str) -> SemanticToolCall | None:
-    """Parse the first operation from the original one-object JSON-array protocol."""
-    values = _extract_array(text)
-    if not values or not isinstance(values[0], dict):
-        return None
-    raw = dict(values[0])
+def _normalize_request(raw: dict[str, Any]) -> dict[str, Any]:
     if "tool" not in raw and isinstance(raw.get("name"), str):
         raw["tool"] = raw.pop("name")
     aliases = {
@@ -100,9 +95,32 @@ def parse_tool_call(text: str) -> SemanticToolCall | None:
         raw["cmd"] = command if isinstance(command, list) else [command]
     if raw.get("tool") == "write_file" and "content_base64" not in raw and "content" in raw:
         raw["content_base64"] = raw.pop("content")
+    return raw
+
+
+def _parse_with_reason(text: str) -> tuple[SemanticToolCall | None, str | None]:
+    values = _extract_array(text)
+    if not values or not isinstance(values[0], dict):
+        return None, None
+    raw = _normalize_request(dict(values[0]))
     try:
         call = TOOL_ADAPTER.validate_python(raw)
     except ValidationError:
-        return None
-    allowed, _reason = validate_tool_request(call.model_dump())
-    return call if allowed else None
+        return None, (
+            "Tool request failed schema validation; use the documented key names "
+            "and value types exactly."
+        )
+    allowed, reason = validate_tool_request(call.model_dump())
+    if not allowed:
+        return None, reason
+    return call, None
+
+
+def parse_tool_call(text: str) -> SemanticToolCall | None:
+    """Parse the first operation from the original one-object JSON-array protocol."""
+    return _parse_with_reason(text)[0]
+
+
+def parse_tool_rejection(text: str) -> str | None:
+    """Why an attempted tool call was refused (policy or schema), if one was attempted."""
+    return _parse_with_reason(text)[1]

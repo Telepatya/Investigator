@@ -230,6 +230,24 @@ def recover_interrupted_runs() -> list[str]:
     return recovered
 
 
+def recover_interrupted_chats() -> list[str]:
+    """Unstick projects left in the operation-blocking "chatting" status by a crash."""
+    recovered: list[str] = []
+    with get_reverse_session() as db:
+        projects = list(db.scalars(select(ReverseProject).where(
+            ReverseProject.status == "chatting"
+        )))
+        for project in projects:
+            project.status = "completed"
+            project.updated_at = now()
+            add_audit(project.id, "chat.recovered", {
+                "reason": "Investigator stopped while a chat LLM action was active",
+            }, db=db)
+            recovered.append(project.id)
+        db.commit()
+    return recovered
+
+
 def add_audit(project_id: str, event_type: str, details: dict[str, Any], *, db=None) -> None:
     owns = db is None
     session = db or get_reverse_session()

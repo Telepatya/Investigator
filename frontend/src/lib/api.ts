@@ -306,7 +306,7 @@ export const api = {
   getReverseTrace: (id: string) =>
     req<import("./types").ReverseTraceEntry[]>(`/reverse/projects/${id}/trace`),
   verifyReverseTrace: (id: string) =>
-    req<{ valid: boolean; entries: number; failed_sequences: number[] }>(`/reverse/projects/${id}/trace/verify`),
+    req<{ valid: boolean; entries: number; failed_sequences: number[]; failed_signature_sequences: number[] }>(`/reverse/projects/${id}/trace/verify`),
   getReverseAudit: (id: string) =>
     req<import("./types").ReverseAuditEvent[]>(`/reverse/projects/${id}/audit`),
   getReverseSettings: () => req<import("./types").ReverseSettings>("/settings/reverse"),

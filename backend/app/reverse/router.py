@@ -221,6 +221,7 @@ async def remove_project(project_id: str) -> dict[str, bool]:
         raise HTTPException(500, "Could not remove Reverse project files") from exc
     if not removed:
         raise HTTPException(404, "Reverse project not found")
+    _UPLOAD_LOCKS.pop(project_id.lower(), None)
     return {"ok": True}
 
 

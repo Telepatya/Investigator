@@ -1,10 +1,11 @@
 import { useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Binary, Box, CheckCircle2, Download, FileCode2, Link2, Loader2, MessageSquare, Play, RefreshCw, ShieldCheck, Square, Trash2, Upload, XCircle } from "lucide-react";
+import { Binary, CheckCircle2, Download, FileCode2, Link2, Loader2, Play, RefreshCw, ShieldCheck, Square, Trash2, Upload, XCircle } from "lucide-react";
 import { api, reverseArtifactDownloadUrl } from "../lib/api";
 import type { ReverseArtifact } from "../lib/types";
 import { CodeBlock, ConfirmDialog, EmptyState, PageShell, PageTitle, Section, Spinner } from "../components/common";
+import { ReverseChat } from "../components/ReverseChat";
 import { ReverseMarkdown } from "../components/ReverseMarkdown";
 
 type View = "workspace" | "report" | "chat" | "provenance" | "activity";
@@ -16,15 +17,13 @@ export default function ReverseProjectPage() {
   const fileRef = useRef<HTMLInputElement>(null);
   const [view, setView] = useState<View>("workspace");
   const [notes, setNotes] = useState("");
-  const [chatText, setChatText] = useState("");
   const [pendingArtifact, setPendingArtifact] = useState<ReverseArtifact | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   const project = useQuery({ queryKey: ["reverse-project", projectId], queryFn: () => api.getReverseProject(projectId), refetchInterval: 4000 });
   const artifacts = useQuery({ queryKey: ["reverse-artifacts", projectId], queryFn: () => api.listReverseArtifacts(projectId), refetchInterval: 5000 });
   const status = useQuery({ queryKey: ["reverse-status", projectId], queryFn: () => api.getReverseStatus(projectId), refetchInterval: 2500 });
-  const report = useQuery({ queryKey: ["reverse-report", projectId], queryFn: () => api.getReverseReport(projectId), retry: false, enabled: view === "report" || project.data?.status === "completed" });
-  const messages = useQuery({ queryKey: ["reverse-messages", projectId], queryFn: () => api.getReverseMessages(projectId), enabled: view === "chat", refetchInterval: view === "chat" ? 4000 : false });
+  const report = useQuery({ queryKey: ["reverse-report", projectId], queryFn: () => api.getReverseReport(projectId), retry: false, enabled: view === "report" || view === "chat" || project.data?.status === "completed" });
   const trace = useQuery({ queryKey: ["reverse-trace", projectId], queryFn: () => api.getReverseTrace(projectId), enabled: view === "provenance" });
   const audit = useQuery({ queryKey: ["reverse-audit", projectId], queryFn: () => api.getReverseAudit(projectId), enabled: view === "activity", refetchInterval: view === "activity" ? 3000 : false });
   const llm = useQuery({ queryKey: ["llm-config"], queryFn: api.getLLMConfig });
@@ -53,7 +52,6 @@ export default function ReverseProjectPage() {
   const removeArtifact = useMutation({ mutationFn: (id: string) => api.deleteReverseArtifact(projectId, id), onSuccess: () => { setPendingArtifact(null); invalidate(); } });
   const removeProject = useMutation({ mutationFn: () => api.deleteReverseProject(projectId), onSuccess: () => navigate("/reverse") });
   const link = useMutation({ mutationFn: (caseId: string) => api.updateReverseProject(projectId, caseId ? { linked_case_id: caseId } : { clear_case_link: true }), onSuccess: invalidate });
-  const send = useMutation({ mutationFn: () => api.sendReverseMessage(projectId, chatText), onSuccess: () => { setChatText(""); qc.invalidateQueries({ queryKey: ["reverse-messages", projectId] }); invalidate(); } });
   const iocs = useMutation({ mutationFn: () => api.regenerateReverseIocs(projectId), onSuccess: () => qc.invalidateQueries({ queryKey: ["reverse-report", projectId] }) });
   const reportSign = useMutation({ mutationFn: () => api.retryReverseReportSignature(projectId), onSuccess: invalidate });
   const reportVerify = useMutation({ mutationFn: () => api.retryReverseReportVerification(projectId), onSuccess: invalidate });
@@ -109,7 +107,7 @@ export default function ReverseProjectPage() {
         {report.data && <Section title="IOC inventory">{report.data.iocs ? <ReverseMarkdown content={report.data.iocs} /> : <div className="py-6 text-sm text-ink-400">No defensible indicators were extracted from this report.</div>}{iocs.error && <div className="mt-3 text-sm text-sev-critical">{String(iocs.error)}</div>}</Section>}
       </div>}
 
-      {view === "chat" && <Section title="Follow-up analysis chat"><div className="max-h-[520px] space-y-3 overflow-y-auto pr-1">{messages.data?.map((message) => <div key={message.id} className={`rounded-2xl p-3 text-sm ${message.role === "user" ? "ml-12 bg-accent-blue/10" : "mr-12 bg-[rgb(var(--panel-strong)/0.62)]"}`}><div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-ink-400">{message.role} · {message.phase}</div><div className="whitespace-pre-wrap text-ink-100">{message.content}</div></div>)}{!messages.data?.length && <div className="py-10 text-center text-sm text-ink-400">Ask questions after a report has been generated.</div>}</div><div className="mt-4 flex gap-2"><textarea className="input min-h-20 flex-1" value={chatText} onChange={(e) => setChatText(e.target.value)} placeholder="Ask about imports, strings, behaviors, or report evidence…" /><button className="btn-primary self-end" disabled={!chatText.trim() || send.isPending} onClick={() => send.mutate()}>{send.isPending ? <Loader2 size={15} className="animate-spin" /> : <MessageSquare size={15} />} Send</button></div>{send.error && <div className="mt-2 text-sm text-sev-critical">{String(send.error)}</div>}</Section>}
+      {view === "chat" && <ReverseChat projectId={projectId} hasReport={Boolean(report.data)} />}
 
       {view === "provenance" && <Section title="Security provenance" right={verify.data && <span className={`chip ${verify.data.valid ? "bg-emerald-400/10 text-emerald-400" : "bg-sev-critical/10 text-sev-critical"}`}><ShieldCheck size={12} /> {verify.data.valid ? "Chain valid" : "Chain invalid"}</span>}>{trace.isLoading ? <Spinner label="Verifying trace…" /> : !trace.data?.length ? <div className="py-10 text-center text-sm text-ink-400">No provenance entries yet.</div> : <div className="space-y-3">{trace.data.map((entry) => <details key={entry.id} className="rounded-2xl bg-[rgb(var(--panel-strong)/0.55)] p-3"><summary className="cursor-pointer text-sm font-semibold text-ink-100">#{entry.sequence} {entry.event_type}</summary><div className="mt-3"><CodeBlock>{JSON.stringify(entry.payload, null, 2)}</CodeBlock><div className="mt-2 break-all font-mono text-[10px] text-ink-500">{entry.entry_hash}</div></div></details>)}</div>}</Section>}
 

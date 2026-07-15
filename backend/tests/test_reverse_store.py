@@ -22,12 +22,13 @@ from app.reverse.store import (
     contained_project_path,
     create_project,
     list_projects,
+    recover_interrupted_chats,
     recover_interrupted_runs,
     repair_case_links,
     safe_filename,
     unlink_deleted_case,
 )
-from app.reverse.tools import parse_tool_call
+from app.reverse.tools import parse_tool_call, parse_tool_rejection
 from app.store import cases
 from app.store.database import dispose_all_db_engines
 
@@ -114,6 +115,26 @@ class ReverseStoreTests(unittest.TestCase):
         self.assertEqual(recover_interrupted_runs(), [run.id])
         with get_reverse_session() as db:
             self.assertEqual(db.get(ReverseRun, run.id).status, "stopped")
+
+    def test_interrupted_chat_status_is_recovered(self) -> None:
+        project = create_project("chat-recovery")
+        with get_reverse_session() as db:
+            row = db.get(ReverseProject, project.id)
+            row.status = "chatting"
+            db.commit()
+        self.assertEqual(recover_interrupted_chats(), [project.id])
+        with get_reverse_session() as db:
+            self.assertEqual(db.get(ReverseProject, project.id).status, "completed")
+        self.assertEqual(recover_interrupted_chats(), [])
+
+    def test_denied_tool_calls_surface_a_policy_reason(self) -> None:
+        denied = json.dumps([{"tool": "run_cmd", "cmd": ["curl", "http://evil.example"]}])
+        self.assertIsNone(parse_tool_call(denied))
+        self.assertEqual(parse_tool_rejection(denied), "NOT_IN_ALLOWLIST:curl")
+        malformed = json.dumps([{"tool": "run_cmd"}])
+        self.assertIsNone(parse_tool_call(malformed))
+        self.assertIn("schema validation", parse_tool_rejection(malformed))
+        self.assertIsNone(parse_tool_rejection("No tool call here."))
 
     def test_provenance_chain_links_canonical_hashes(self) -> None:
         project = create_project("provenance")

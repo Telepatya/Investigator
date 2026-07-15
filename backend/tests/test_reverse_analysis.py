@@ -313,6 +313,68 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             ["chat.started", "chat.tool_executed", "chat.completed"],
         )
 
+    async def test_cancelled_chat_never_leaves_project_stuck_in_chatting(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+        run = ReverseRun(
+            id=str(uuid.uuid4()), project_id=project.id, status="completed",
+            provider="ollama", model="snapshot-model", report_markdown="# Report",
+        )
+        with get_reverse_session() as db:
+            db.add(run)
+            db.commit()
+
+        class _CancelledProvider:
+            async def complete(self, _messages, stream=False):
+                import asyncio
+                raise asyncio.CancelledError()
+
+        manager = ReverseAnalysisManager()
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=_CancelledProvider()),
+        ):
+            import asyncio
+            with self.assertRaises(asyncio.CancelledError):
+                await manager.chat(project.id, "Question interrupted by disconnect")
+        with get_reverse_session() as db:
+            self.assertEqual(db.get(ReverseProject, project.id).status, "completed")
+
+    async def test_structured_summary_is_not_duplicated_in_the_report(self) -> None:
+        project, artifact_id = self.project_with_artifact()
+        provider = _Provider([
+            file_tool(artifact_id),
+            VALID_REPORT,
+            IOC_RESULT,
+            VERIFIER_PASS,
+        ])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sign_bytes", return_value="signature"),
+            patch("app.reverse.analysis.public_key_info", return_value={
+                "algorithm": "ed25519", "public_key_pem": "public",
+                "fingerprint_sha256": "f" * 64,
+            }),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+            patch("app.reverse.analysis.sandbox_manager.execute", return_value={
+                "success": True, "stdout": "PE32 executable", "stderr": "", "returncode": 0,
+            }),
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        with get_reverse_session() as db:
+            report = db.get(ReverseRun, run.id).report_markdown
+        # The structured model summary is embedded exactly once, with the
+        # completion marker stripped and no duplicate "Detailed Analysis" copy.
+        self.assertEqual(report.count("Static evidence is limited."), 1)
+        self.assertEqual(report.count("The fixture is not a complete executable."), 1)
+        self.assertNotIn("ANALYSIS COMPLETE", report)
+        self.assertNotIn("## Detailed Analysis", report)
+        self.assertIn("## AI-Extracted IOC Inventory", report)
+
     async def test_agent_completion_is_not_overridden_by_a_host_checklist(self) -> None:
         project, _artifact_id = self.project_with_artifact()
         provider = _Provider([VALID_REPORT, IOC_RESULT, VERIFIER_PASS])

@@ -29,7 +29,12 @@ from app.reverse.analysis import analysis_manager
 from app.reverse.database import dispose_reverse_db, init_reverse_db
 from app.reverse.router import router as reverse_router
 from app.reverse.sandbox import sandbox_manager
-from app.reverse.store import cleanup_staging_files, recover_interrupted_runs, repair_case_links
+from app.reverse.store import (
+    cleanup_staging_files,
+    recover_interrupted_chats,
+    recover_interrupted_runs,
+    repair_case_links,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,8 @@ async def lifespan(app: FastAPI):
     init_reverse_db()
     for run_id in recover_interrupted_runs():
         logger.warning("Recovered interrupted Reverse run %s", run_id)
+    for project_id in recover_interrupted_chats():
+        logger.warning("Recovered interrupted Reverse chat state for project %s", project_id)
     for project_id in repair_case_links():
         logger.warning("Cleared stale case link for Reverse project %s", project_id)
     cleanup_staging_files()

@@ -27,7 +27,7 @@ from .database import (
 from .provenance import public_key_info, sign_bytes
 from .sandbox import sandbox_manager
 from .store import add_audit, append_provenance, contained_project_path, now
-from .tools import parse_tool_call
+from .tools import parse_tool_call, parse_tool_rejection
 
 logger = logging.getLogger(__name__)
 ACTIVE_STATUSES = {"queued", "running", "verifying", "stopping"}
@@ -195,78 +195,112 @@ def _extract_report_section(text: str, section_name: str) -> str:
     return ""
 
 
+_COMPLETION_MARKER_RE = re.compile(
+    r"^\s*(?:ANALYSIS COMPLETE|ANALYSIS BLOCKED|FINAL REPORT)\s*[:\-]*\s*",
+    re.IGNORECASE,
+)
+
+
+def _first_paragraph(text: str, limit: int = 600) -> str:
+    paragraph = ""
+    for block in re.split(r"\n\s*\n", text):
+        cleaned = block.strip()
+        if cleaned and not cleaned.startswith("#"):
+            paragraph = cleaned
+            break
+    paragraph = paragraph or text.strip()
+    if len(paragraph) > limit:
+        paragraph = paragraph[:limit].rsplit(" ", 1)[0].rstrip() + "…"
+    return paragraph
+
+
+_NO_IOC_SECTION = (
+    "## Indicators of Compromise (IOCs)\n\n"
+    "No specific IOCs were extracted during automated analysis.\n"
+)
+
+
 def _forensicbuddy_report(
     project: ReverseProject,
     run: ReverseRun,
     catalog: list[dict[str, Any]],
     summary: str,
 ) -> str:
-    """Native Investigator rendering of ForensicBuddy's original report generator."""
-    classification = (
-        _extract_report_section(summary, "Threat Classification")
-        or _extract_report_section(summary, "Classification")
-    )
-    execution = (
-        _extract_report_section(summary, "Execution Flow")
-        or _extract_report_section(summary, "Execution")
-    )
-    capabilities = _extract_report_section(summary, "Capabilities")
-    iocs = (
-        _extract_report_section(summary, "Indicators of Compromise")
-        or _extract_report_section(summary, "IOCs")
-    )
-    persistence = _extract_report_section(summary, "Persistence")
-    network = _extract_report_section(summary, "Network")
-    anti_analysis = _extract_report_section(summary, "Anti-Analysis")
-    report = (
-        "# Forensic Malware Analysis Report\n\n"
+    """Native Investigator rendering of ForensicBuddy's original report generator.
+
+    The model's final analysis is included exactly once: structured summaries are
+    used verbatim, and only unstructured prose is reshaped into the required
+    section layout. This keeps the report free of repeated content while
+    preserving every claim the model made.
+    """
+    body = _COMPLETION_MARKER_RE.sub("", summary.strip(), count=1).strip() or summary.strip()
+    parts = [
+        "# Forensic Malware Analysis Report",
         "## Project Information\n"
         f"- **Project ID**: `{project.id}`\n"
         f"- **Project Name**: {project.name}\n"
         f"- **Analysis Date**: {run.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
         f"- **Status**: completed\n"
-        f"- **Analysis Model**: {run.provider} / {run.model}\n\n"
-        "## Analyzed Samples\n\n"
-    )
+        f"- **Analysis Model**: {run.provider} / {run.model}",
+        "## Analyzed Samples",
+    ]
     for artifact in catalog:
-        report += (
+        parts.append(
             f"### {artifact['name']}\n"
             f"- **SHA256**: `{artifact['sha256']}`\n"
             f"- **File Size**: {artifact['size']:,} bytes\n"
             f"- **Content Type**: {artifact['content_type']}\n"
-            f"- **Sandbox Path**: `{artifact['sandbox_path']}`\n\n"
+            f"- **Sandbox Path**: `{artifact['sandbox_path']}`",
         )
-    report += f"## Executive Summary\n\n{summary[:500]}...\n\n---\n\n"
-    sections = (
-        ("Threat Classification", classification),
-        ("Execution Flow & Behavior", execution),
-        ("Malware Capabilities", capabilities),
-        ("Indicators of Compromise (IOCs)", iocs),
-        ("Persistence Mechanisms", persistence),
-        ("Network Activity & C2", network),
-        ("Anti-Analysis Techniques", anti_analysis),
+    parts.append("---")
+    has_iocs = bool(
+        _extract_report_section(body, "Indicators of Compromise")
+        or _extract_report_section(body, "IOCs")
     )
-    for heading, content in sections:
-        if content:
-            report += f"## {heading}\n\n{content}\n\n"
-        elif heading == "Indicators of Compromise (IOCs)":
-            report += (
-                "## Indicators of Compromise (IOCs)\n\n"
-                "No specific IOCs were extracted during automated analysis.\n\n"
-            )
-    report += (
-        f"## Detailed Analysis\n\n{summary}\n\n"
+    if re.search(r"^#{1,6}\s+\S", body, re.MULTILINE):
+        # Already a structured Markdown report: keep it verbatim, once.
+        parts.append(body)
+        if not has_iocs:
+            parts.append(_NO_IOC_SECTION.rstrip())
+    else:
+        parts.append(f"## Executive Summary\n\n{_first_paragraph(body)}")
+        sections = (
+            ("Threat Classification", (
+                _extract_report_section(body, "Threat Classification")
+                or _extract_report_section(body, "Classification")
+            )),
+            ("Execution Flow & Behavior", (
+                _extract_report_section(body, "Execution Flow")
+                or _extract_report_section(body, "Execution")
+            )),
+            ("Malware Capabilities", _extract_report_section(body, "Capabilities")),
+            ("Indicators of Compromise (IOCs)", (
+                _extract_report_section(body, "Indicators of Compromise")
+                or _extract_report_section(body, "IOCs")
+            )),
+            ("Persistence Mechanisms", _extract_report_section(body, "Persistence")),
+            ("Network Activity & C2", _extract_report_section(body, "Network")),
+            ("Anti-Analysis Techniques", _extract_report_section(body, "Anti-Analysis")),
+        )
+        for heading, content in sections:
+            if content:
+                parts.append(f"## {heading}\n\n{content}")
+            elif heading == "Indicators of Compromise (IOCs)":
+                parts.append(_NO_IOC_SECTION.rstrip())
+        parts.append(f"## Detailed Analysis\n\n{body}")
+    parts.append(
         "## Security Provenance & Chain of Custody\n\n"
         f"- **Container Image**: `{run.image_digest or 'unknown'}`\n"
-        f"- **Tool Versions**: `{json.dumps(run.tool_versions, sort_keys=True)}`\n"
-        "- All analysis steps are retained in Investigator's tamper-evident provenance chain.\n\n"
-        "## Forensic Artifacts\n\n"
-        "Analysis artifacts, tool outputs, and generated helpers are retained in the Reverse history.\n\n"
+        f"- **Tool Versions**: `{json.dumps(run.tool_versions or {}, sort_keys=True)}`\n"
+        "- All analysis steps, tool outputs, and generated helpers are retained in "
+        "Investigator's tamper-evident provenance chain and Reverse history.",
+    )
+    parts.append(
         "---\n\n"
         "**Report Classification**: CONFIDENTIAL  \n"
-        "**Generated By**: Investigator Reverse using the ForensicBuddy analysis workflow\n"
+        "**Generated By**: Investigator Reverse using the ForensicBuddy analysis workflow",
     )
-    return report
+    return "\n\n".join(parts) + "\n"
 
 
 class ReverseAnalysisManager:
@@ -492,7 +526,7 @@ Keep your report concise but technically rigorous."""
                 messages = _messages_for_run(project_id, run_id)
                 if len(messages) > 3:
                     messages.append({"role": "system", "content": (
-                        f"SYSTEM REMINDER (Iteration {len(messages)}/{run.max_turns}): Review previous "
+                        f"SYSTEM REMINDER (Iteration {run.turns_used + 1}/{run.max_turns}): Review previous "
                         "tool outputs; large outputs may be truncated, so use targeted commands if needed. "
                         "DO NOT repeat identical tool calls. Output at most ONE tool in your JSON array this "
                         "turn. Build on findings or conclude with 'ANALYSIS COMPLETE' / 'ANALYSIS BLOCKED'."
@@ -526,18 +560,24 @@ Keep your report concise but technically rigorous."""
                     if any(signal in response.upper() for signal in completion_signals):
                         break
                     no_progress_turns += 1
+                    rejection = parse_tool_rejection(response)
+                    guidance = (
+                        f"Tool call denied: {rejection} Choose a different allowed operation, "
+                        "or conclude with 'ANALYSIS COMPLETE' / 'ANALYSIS BLOCKED'."
+                        if rejection else (
+                            "Reply with a JSON array containing exactly ONE tool object, or if you are "
+                            "done state 'ANALYSIS COMPLETE', or if no further progress is possible state "
+                            "'ANALYSIS BLOCKED' with the concrete blocker."
+                        )
+                    )
                     with get_reverse_session() as db:
                         db.add(ReverseMessage(
                             project_id=project_id,
                             run_id=run_id,
                             phase="analysis",
                             role="system",
-                            content=(
-                                "Reply with a JSON array containing exactly ONE tool object, or if you are "
-                                "done state 'ANALYSIS COMPLETE', or if no further progress is possible state "
-                                "'ANALYSIS BLOCKED' with the concrete blocker."
-                            ),
-                            metadata_json={"no_progress": True},
+                            content=guidance,
+                            metadata_json={"no_progress": True, "tool_rejection": rejection},
                         ))
                         db.commit()
                     if no_progress_turns >= 3:
@@ -785,7 +825,7 @@ Keep your report concise but technically rigorous."""
             run = db.get(ReverseRun, run_id)
             project = db.get(ReverseProject, project_id)
             if not run or not project:
-                return
+                raise RuntimeError("Reverse project or run disappeared while persisting the report")
             run.report_markdown = report
             run.iocs_markdown = _extract_iocs(report)
             run.status = "completed"
@@ -1183,21 +1223,22 @@ Keep your report concise but technically rigorous."""
                 }, db=db)
                 db.commit()
                 report = latest.report_markdown or ""
-            provider = get_provider(cfg)
-            history = self.chat_messages(project_id)[-20:]
-            prompt = [
-                {"role": "system", "content": self._chat_system_prompt()},
-                {"role": "user", "content": (
-                    f"INITIAL ANALYSIS REPORT:\n{report[-30000:]}\n\n"
-                    f"RECENT CHAT:\n{json.dumps(history, default=str)[-20000:]}\n\n"
-                    f"CURRENT QUESTION:\n{message}"
-                )},
-            ]
             executed_signatures: set[str] = set()
             tool_uses = 0
             no_progress_turns = 0
             response = "The follow-up investigation did not produce an answer."
             try:
+                provider = get_provider(cfg)
+                # Exclude the question stored above so it is not sent twice.
+                history = self.chat_messages(project_id)[:-1][-20:]
+                prompt = [
+                    {"role": "system", "content": self._chat_system_prompt()},
+                    {"role": "user", "content": (
+                        f"INITIAL ANALYSIS REPORT:\n{report[-30000:]}\n\n"
+                        f"RECENT CHAT:\n{json.dumps(history, default=str)[-20000:]}\n\n"
+                        f"CURRENT QUESTION:\n{message}"
+                    )},
+                ]
                 for iteration in range(12):
                     model_response = await provider.complete(prompt, stream=False)
                     if not isinstance(model_response, str):
@@ -1206,8 +1247,9 @@ Keep your report concise but technically rigorous."""
                     call = parse_tool_call(model_response)
                     prompt.append({"role": "assistant", "content": model_response})
                     if call is None:
+                        rejection = parse_tool_rejection(model_response)
                         stripped = model_response.strip()
-                        invalid_tool_attempt = (
+                        invalid_tool_attempt = rejection is not None or (
                             (stripped.startswith("[") or stripped.startswith("```"))
                             and ("\"tool\"" in stripped or "'tool'" in stripped)
                         )
@@ -1224,8 +1266,12 @@ Keep your report concise but technically rigorous."""
                         if no_progress_turns >= 3:
                             break
                         prompt.append({"role": "system", "content": (
-                            "Reply with exactly one tool call in a JSON array, or finish with "
-                            "CHAT COMPLETE / CHAT BLOCKED."
+                            f"Tool call denied: {rejection} Choose a different allowed operation, "
+                            "or finish with CHAT COMPLETE / CHAT BLOCKED."
+                            if rejection else (
+                                "Reply with exactly one tool call in a JSON array, or finish with "
+                                "CHAT COMPLETE / CHAT BLOCKED."
+                            )
                         )})
                         continue
 
@@ -1279,11 +1325,20 @@ Keep your report concise but technically rigorous."""
                             f"SYSTEM REMINDER (Iteration {iteration + 1}/12): Use at most ONE tool "
                             "per turn, do not repeat calls, and conclude with CHAT COMPLETE or CHAT BLOCKED."
                         )})
-                response = self._clean_chat_response(response)
-            except Exception as exc:
+                if parse_tool_call(response) is not None:
+                    response = (
+                        "The follow-up investigation could not reach a final answer within its "
+                        "tool budget. The tool activity that did run is recorded in the audit log; "
+                        "try a narrower question."
+                    )
+                else:
+                    response = self._clean_chat_response(response)
+            except BaseException as exc:
+                # Includes CancelledError (client disconnect): the project must never
+                # be left stuck in the operation-blocking "chatting" status.
                 with get_reverse_session() as db:
                     project = db.get(ReverseProject, project_id)
-                    if project:
+                    if project and project.status == "chatting":
                         project.status = "completed"
                         project.updated_at = now()
                     add_audit(project_id, "chat.failed", {"error": str(exc)[:1000]}, db=db)
@@ -1349,10 +1404,11 @@ Keep your report concise but technically rigorous."""
                 ], stream=False)
                 if not isinstance(response, str):
                     raise RuntimeError("Provider returned an unexpected response")
-            except Exception as exc:
+            except BaseException as exc:
+                # Includes CancelledError: never leave the project stuck in "chatting".
                 with get_reverse_session() as db:
                     project = db.get(ReverseProject, project_id)
-                    if project:
+                    if project and project.status == "chatting":
                         project.status = "completed"
                         project.updated_at = now()
                     add_audit(project_id, "iocs.regeneration_failed", {
