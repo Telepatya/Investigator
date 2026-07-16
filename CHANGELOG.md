@@ -30,6 +30,12 @@ migration, and verification details live in `docs/releases/`.
 - Reverse recursive-evidence matching now recognizes input paths embedded in a
   successful `python3 -c` extractor, preventing already-extracted overlays from
   being rejected repeatedly as unresolved.
+- Memory-backed process dossiers now download MemProcFS's WinDbg-compatible
+  `minidump/minidump.dmp` as the full process dump instead of treating the
+  sparse `memory.vmem` address-space view as the primary process dump.
+- Sparse `memory.vmem` process downloads have been removed. Minidump downloads
+  are requested only for the selected PID, and a failed PID now reports an
+  inline error without navigating away or affecting other process selections.
 - Reverse report finalization now persists exact report bytes before signing,
   uses Windows-compatible compact Ed25519 credentials, supports RSA key
   compatibility and signing retries, and cannot fail a completed analysis when

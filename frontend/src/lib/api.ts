@@ -340,11 +340,45 @@ export function memoryProcessDownloadUrl(
   caseId: string,
   sessionId: string,
   pid: number,
-  kind: "image" | "vmem" = "image",
+  kind: "image" | "minidump" = "image",
 ): string {
   return downloadUrl(
     `/cases/${caseId}/memory/${encodeURIComponent(sessionId)}/processes/${pid}/download?kind=${kind}`,
   );
+}
+
+async function saveDownloadResponse(res: Response, fallbackFilename: string) {
+  if (!res.ok) {
+    const text = await res.text();
+    try {
+      const parsed = JSON.parse(text) as { detail?: string };
+      throw new Error(parsed.detail || text || `Download failed: ${res.status}`);
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error(text || `Download failed: ${res.status}`);
+      throw error;
+    }
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get("content-disposition") || "";
+  const match = /filename="?([^";]+)"?/i.exec(disposition);
+  const filename = match?.[1] || fallbackFilename;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function downloadMemoryProcessMinidump(
+  caseId: string,
+  sessionId: string,
+  pid: number,
+) {
+  const res = await fetch(memoryProcessDownloadUrl(caseId, sessionId, pid, "minidump"));
+  await saveDownloadResponse(res, `process-${pid}.minidump.dmp`);
 }
 
 export function memoryModuleDownloadUrl(
@@ -376,19 +410,7 @@ export async function downloadMemoryVfsArchive(caseId: string, sessionId: string
       body: JSON.stringify({ paths }),
     },
   );
-  if (!res.ok) throw new Error(await res.text());
-  const blob = await res.blob();
-  const disposition = res.headers.get("content-disposition") || "";
-  const match = /filename="?([^";]+)"?/i.exec(disposition);
-  const filename = match?.[1] || "memprocfs-selection.zip";
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+  await saveDownloadResponse(res, "memprocfs-selection.zip");
 }
 
 export function uploadFile(

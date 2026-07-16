@@ -272,7 +272,7 @@ export interface MemoryProcessCandidate {
   handles_on_demand?: boolean;
   downloads: {
     image: boolean;
-    full_memory: boolean;
+    minidump: boolean;
     modules: boolean;
   };
 }

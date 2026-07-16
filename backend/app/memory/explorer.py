@@ -28,7 +28,6 @@ MEMORY_EXTENSIONS = {".raw", ".dmp", ".mem", ".vmem", ".bin", ".img", ".lime", "
 MAX_ARCHIVE_DEPTH = 6
 MAX_ARCHIVE_FILES = 1000
 MAX_MODULE_HASH_BYTES = 512 * 1024 * 1024
-MAX_PROCESS_VMEM_EXTRACT_BYTES = 512 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -102,7 +101,7 @@ def memory_process_candidates(session, entity_value: str) -> list[dict[str, Any]
             "handles_on_demand": True,
             "downloads": {
                 "image": True,
-                "full_memory": True,
+                "minidump": True,
                 "modules": True,
             },
         })
@@ -361,31 +360,46 @@ def list_process_modules(case_id: str, session_id: str, pid: int) -> dict[str, A
 
 def extract_process_image(case_id: str, session_id: str, pid: int, kind: str = "image") -> Path:
     dump = resolve_memory_dump(case_id, session_id)
-    if kind not in {"image", "vmem"}:
+    if kind not in {"image", "minidump"}:
         raise MemoryExplorerError("Unsupported process download kind")
     with _open_vmm(dump.path) as vmm:
         proc = _process(vmm, pid)
-        if kind == "vmem":
-            source = f"/pid/{pid}/memory.vmem"
+        if kind == "minidump":
+            source = f"/pid/{pid}/minidump/minidump.dmp"
             entry = _vfs_entry(vmm, source)
-            size = _entry_size(entry)
             if entry is None:
-                raise MemoryExplorerError("Full process memory is unavailable for this process", 404)
-            if size is None:
+                # `/pid` and `/name` are aliases in MemProcFS. Prefer the stable
+                # PID path, but tolerate builds/dumps that expose only `/name`.
+                try:
+                    name_entries = _vfs_list(vmm, "/name")
+                except MemoryExplorerError:
+                    name_entries = {}
+                for directory, candidate in name_entries.items():
+                    if not _entry_is_dir(candidate) or not directory.endswith(f"-{pid}"):
+                        continue
+                    candidate_source = f"/name/{directory}/minidump/minidump.dmp"
+                    candidate_entry = _vfs_entry(vmm, candidate_source)
+                    if candidate_entry is not None:
+                        source, entry = candidate_source, candidate_entry
+                        break
+            if entry is None:
                 raise MemoryExplorerError(
-                    "Full process memory size is unknown; refusing open-ended sparse VMEM extraction. "
-                    "Use Process image or module downloads instead.",
-                    413,
+                    "A full process minidump is unavailable. MemProcFS only generates it "
+                    "for supported active user-mode processes.",
+                    404,
                 )
-            if size > MAX_PROCESS_VMEM_EXTRACT_BYTES:
-                raise MemoryExplorerError(
-                    f"Full process memory is {size / (1024 * 1024):.0f} MB, above the "
-                    f"{MAX_PROCESS_VMEM_EXTRACT_BYTES // (1024 * 1024)} MB safety limit. "
-                    "Use Process image or module downloads instead.",
-                    413,
-                )
-            output = _cache_path(case_id, dump.dump_stem, "processes", f"{_safe_filename(_proc_name(proc, pid))}_{pid}.vmem.extracted")
-            info = _copy_vfs_file(vmm, source, output, entry)
+            output = _cache_path(
+                case_id,
+                dump.dump_stem,
+                "processes",
+                f"{_safe_filename(_proc_name(proc, pid))}_{pid}.minidump.dmp",
+            )
+            info = {
+                **_copy_vfs_file(vmm, source, output, entry),
+                "kind": "process_minidump",
+                "pid": pid,
+                "process": _proc_name(proc, pid),
+            }
         else:
             module = _main_module(proc)
             if not module:
