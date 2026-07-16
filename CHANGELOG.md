@@ -7,6 +7,29 @@ migration, and verification details live in `docs/releases/`.
 
 ### Fixed
 
+- Reverse follow-up chat now strips completion control markers in any supported
+  position, retries marker-only replies, and prevents sandbox tool-call payloads
+  (including legacy saved messages) from appearing as assistant answers.
+- Reverse analysis now pauses for explicit turn-extension approval when it
+  exhausts its turn budget or stops making progress without a final response,
+  instead of converting the last sandbox tool request into a corrupted report.
+- Reverse report finalization now recognizes Markdown completion headings and
+  preserves the preceding substantive report when a model follows it with a
+  bare completion marker; marker-only output can no longer create an empty report.
+- Reverse analysis and follow-up chat prompts now explicitly teach the model
+  the two-turn `write_file` then `run_cmd python3` workflow for custom static
+  parsers, with a concrete base64 example and sandbox safety constraints.
+- Gemini requests now use the SDK's asynchronous client with a five-minute
+  request timeout, keeping status polling and Stop responsive. Transient provider
+  deadlines pause Reverse runs for resume, while oversized transcript echoes are
+  rejected before parsing embedded tool calls.
+- Reverse completion is now artifact-adaptive: discovered PE overlays and
+  extractable installer/archive layers must be inspected recursively before
+  `ANALYSIS COMPLETE` is accepted, and speculative unresolved-layer claims are
+  rejected unless the model documents a concrete sandbox blocker.
+- Reverse recursive-evidence matching now recognizes input paths embedded in a
+  successful `python3 -c` extractor, preventing already-extracted overlays from
+  being rejected repeatedly as unresolved.
 - Reverse report finalization now persists exact report bytes before signing,
   uses Windows-compatible compact Ed25519 credentials, supports RSA key
   compatibility and signing retries, and cannot fail a completed analysis when

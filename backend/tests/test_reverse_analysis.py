@@ -159,7 +159,7 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
             patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={"file": "test"}),
             patch("app.reverse.analysis.sandbox_manager.execute", return_value={
-                "success": True, "stdout": "PE32 executable", "stderr": "", "returncode": 0,
+                "success": True, "stdout": "data", "stderr": "", "returncode": 0,
             }),
         ):
             run = await manager.start(project.id, "identify the format")
@@ -178,7 +178,7 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
                 ReverseMessage.role == "tool",
             ))
             self.assertEqual(len(tool_messages), 1)
-            self.assertIn("PE32 executable", tool_messages[0].content)
+            self.assertIn("data", tool_messages[0].content)
         report_path = contained_project_path(project.id, f"outputs/{run.id}-report.md", must_exist=True)
         self.assertIn("Static evidence is limited", report_path.read_text(encoding="utf-8"))
 
@@ -199,7 +199,7 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
             patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
             patch("app.reverse.analysis.sandbox_manager.execute", return_value={
-                "success": True, "stdout": "PE32 executable", "stderr": "", "returncode": 0,
+                "success": True, "stdout": "data", "stderr": "", "returncode": 0,
             }),
         ):
             run = await manager.start(project.id)
@@ -314,6 +314,77 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             ["chat.started", "chat.tool_executed", "chat.completed"],
         )
 
+    async def test_chat_strips_a_trailing_completion_marker(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+        run = ReverseRun(
+            id=str(uuid.uuid4()), project_id=project.id, status="completed",
+            provider="ollama", model="snapshot-model", report_markdown="# Report",
+        )
+        with get_reverse_session() as db:
+            db.add(run)
+            db.commit()
+        provider = _Provider([
+            "The installer contacts endpoints supplied by runtime configuration.\n\n"
+            "CHAT COMPLETE:",
+        ])
+        manager = ReverseAnalysisManager()
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+        ):
+            reply = await manager.chat(project.id, "Where are its endpoints configured?")
+        self.assertEqual(
+            reply.content,
+            "The installer contacts endpoints supplied by runtime configuration.",
+        )
+        self.assertNotIn("CHAT COMPLETE", reply.content)
+
+    async def test_completion_marker_overrides_future_tense_in_a_real_answer(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+        run = ReverseRun(
+            id=str(uuid.uuid4()), project_id=project.id, status="completed",
+            provider="ollama", model="snapshot-model", report_markdown="# Report",
+        )
+        with get_reverse_session() as db:
+            db.add(run)
+            db.commit()
+        provider = _Provider([
+            "CHAT COMPLETE:\nI'll summarize the supported execution flow below.",
+        ])
+        manager = ReverseAnalysisManager()
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+        ):
+            reply = await manager.chat(project.id, "Summarize the execution flow")
+        self.assertEqual(reply.content, "I'll summarize the supported execution flow below.")
+        self.assertEqual(provider.responses, [])
+
+    async def test_chat_retries_a_completion_marker_without_an_answer(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+        run = ReverseRun(
+            id=str(uuid.uuid4()), project_id=project.id, status="completed",
+            provider="ollama", model="snapshot-model", report_markdown="# Report",
+        )
+        with get_reverse_session() as db:
+            db.add(run)
+            db.commit()
+        provider = _Provider([
+            "CHAT COMPLETE:",
+            "CHAT COMPLETE:\nThe general flow is extraction, validation, then installation.",
+        ])
+        manager = ReverseAnalysisManager()
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+        ):
+            reply = await manager.chat(project.id, "Explain the execution flow")
+        self.assertEqual(
+            reply.content,
+            "The general flow is extraction, validation, then installation.",
+        )
+        self.assertEqual(provider.responses, [])
+
     def test_analyst_notes_are_tasking_in_prompt_and_echoed_in_report(self) -> None:
         prompt = ReverseAnalysisManager._system_prompt(
             ["run_cmd"], [], "Which URLs and staging endpoints are embedded?"
@@ -322,6 +393,18 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("## Analyst Questions", prompt)
         self.assertNotIn(
             "Analyst Questions", ReverseAnalysisManager._system_prompt(["run_cmd"], [])
+        )
+        helper_prompt = ReverseAnalysisManager._system_prompt(
+            ["run_cmd", "write_file"], [], "Decode the custom configuration format"
+        )
+        self.assertIn("CUSTOM PYTHON HELPER WORKFLOW", helper_prompt)
+        self.assertIn('"tool":"write_file"', helper_prompt)
+        self.assertIn('"tool":"run_cmd"', helper_prompt)
+        self.assertIn('"python3","/workspace/tools/inspect.py"', helper_prompt)
+        self.assertIn("two separate tool turns", helper_prompt)
+        self.assertIn(
+            "CUSTOM PYTHON HELPER WORKFLOW",
+            ReverseAnalysisManager._chat_system_prompt(),
         )
 
         from datetime import datetime, timezone
@@ -388,6 +471,55 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply.content, "The binary embeds a hardcoded staging URL.")
         self.assertEqual(reply.metadata_json["tool_uses"], 1)
 
+    async def test_chat_executes_argv_shorthand_shown_by_local_models(self) -> None:
+        project, artifact_id = self.project_with_artifact()
+        run = ReverseRun(
+            id=str(uuid.uuid4()), project_id=project.id, status="completed",
+            provider="ollama", model="snapshot-model", report_markdown="# Report",
+        )
+        with get_reverse_session() as db:
+            db.add(run)
+            db.commit()
+        provider = _Provider([
+            json.dumps([{"run_cmd": ["strings", f"/workspace/inputs/{artifact_id}"]}]),
+            "CHAT COMPLETE:\nNo download URL is embedded in the sample.",
+        ])
+        manager = ReverseAnalysisManager()
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sandbox_manager.execute", return_value={
+                "success": True, "stdout": "", "stderr": "", "returncode": 0,
+            }) as execute,
+        ):
+            reply = await manager.chat(project.id, "Find download URLs")
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[1].cmd[0], "strings")
+        self.assertEqual(reply.content, "No download URL is embedded in the sample.")
+
+    def test_chat_history_sanitizes_legacy_protocol_artifacts(self) -> None:
+        project, artifact_id = self.project_with_artifact()
+        with get_reverse_session() as db:
+            db.add_all([
+                ReverseMessage(
+                    project_id=project.id, phase="chat", role="assistant",
+                    content="Grounded answer.\n\nCHAT COMPLETE:",
+                ),
+                ReverseMessage(
+                    project_id=project.id, phase="chat", role="assistant",
+                    content=json.dumps([{
+                        "run_cmd": ["strings", f"/workspace/inputs/{artifact_id}"],
+                    }]),
+                ),
+            ])
+            db.commit()
+        contents = [
+            message["content"] for message in ReverseAnalysisManager.chat_messages(project.id)
+        ]
+        self.assertEqual(contents[0], "Grounded answer.")
+        self.assertNotIn("run_cmd", contents[1])
+        self.assertIn("stopped before reaching a final answer", contents[1])
+
     async def test_chat_never_stores_a_raw_tool_call_as_the_answer(self) -> None:
         project, _artifact_id = self.project_with_artifact()
         run = ReverseRun(
@@ -437,6 +569,63 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
         with get_reverse_session() as db:
             self.assertEqual(db.get(ReverseProject, project.id).status, "completed")
 
+    async def test_stop_cancels_a_pending_model_request_and_marks_run_stopped(self) -> None:
+        import asyncio
+
+        project, _artifact_id = self.project_with_artifact()
+
+        class _WaitingProvider:
+            def __init__(self):
+                self.started = asyncio.Event()
+
+            async def complete(self, _messages, stream=False):
+                self.started.set()
+                await asyncio.Event().wait()
+
+        provider = _WaitingProvider()
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+        ):
+            run = await manager.start(project.id)
+            await asyncio.wait_for(provider.started.wait(), timeout=1)
+            stopped = await asyncio.wait_for(manager.stop(project.id), timeout=1)
+        self.assertTrue(stopped)
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            self.assertEqual(stored.status, "stopped")
+            self.assertEqual(stored.error, "Stopped by analyst")
+
+    async def test_transient_provider_deadline_pauses_run_for_resume(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+
+        class _DeadlineProvider:
+            async def complete(self, _messages, stream=False):
+                raise RuntimeError(
+                    "504 DEADLINE_EXCEEDED: Deadline expired before operation could complete"
+                )
+
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=_DeadlineProvider()),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            self.assertEqual(stored.status, "stopped")
+            self.assertEqual(stored.turns_used, 0)
+            self.assertIn("resume the analysis", stored.error)
+            self.assertIn("DEADLINE_EXCEEDED", stored.error)
+
     async def test_structured_summary_is_not_duplicated_in_the_report(self) -> None:
         project, artifact_id = self.project_with_artifact()
         provider = _Provider([
@@ -458,7 +647,7 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
             patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
             patch("app.reverse.analysis.sandbox_manager.execute", return_value={
-                "success": True, "stdout": "PE32 executable", "stderr": "", "returncode": 0,
+                "success": True, "stdout": "data", "stderr": "", "returncode": 0,
             }),
         ):
             run = await manager.start(project.id)
@@ -534,7 +723,7 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
             patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
             patch("app.reverse.analysis.sandbox_manager.execute", return_value={
-                "success": True, "stdout": "PE32 executable", "stderr": "", "returncode": 0,
+                "success": True, "stdout": "data", "stderr": "", "returncode": 0,
             }),
         ):
             run = await manager.start(project.id)
@@ -586,7 +775,7 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
             patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
             patch("app.reverse.analysis.sandbox_manager.execute", return_value={
-                "success": True, "stdout": "PE32 executable", "stderr": "", "returncode": 0,
+                "success": True, "stdout": "data", "stderr": "", "returncode": 0,
             }),
         ):
             run = await manager.start(project.id)
@@ -597,7 +786,85 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stored.report_verification_status, "verified")
             self.assertNotIn("Confidence: low", stored.report_markdown)
 
-    async def test_three_duplicate_tool_requests_stop_churn_and_finalize(self) -> None:
+    async def test_markdown_completion_heading_finalizes_the_substantive_report(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+        response = (
+            "## Forensic Analysis Report\n\n"
+            "### Findings\n\nThe sample is a signed NSIS installer with network capability.\n\n"
+            "## ANALYSIS COMPLETE"
+        )
+        provider = _Provider([response, IOC_RESULT, VERIFIER_PASS])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sign_bytes", return_value="signature"),
+            patch("app.reverse.analysis.public_key_info", return_value={
+                "algorithm": "ed25519", "public_key_pem": "public",
+                "fingerprint_sha256": "f" * 64,
+            }),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            self.assertEqual(stored.status, "completed")
+            self.assertEqual(stored.turns_used, 1)
+            self.assertIn("signed NSIS installer", stored.report_markdown)
+            self.assertNotIn("ANALYSIS COMPLETE", stored.report_markdown)
+
+    async def test_bare_completion_marker_uses_the_prior_substantive_report(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+        response = (
+            "## Forensic Analysis Report\n\n"
+            "### Findings\n\nThe available evidence supports a benign installer assessment."
+        )
+        provider = _Provider([response, "ANALYSIS COMPLETE", IOC_RESULT, VERIFIER_PASS])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sign_bytes", return_value="signature"),
+            patch("app.reverse.analysis.public_key_info", return_value={
+                "algorithm": "ed25519", "public_key_pem": "public",
+                "fingerprint_sha256": "f" * 64,
+            }),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            self.assertEqual(stored.status, "completed")
+            self.assertEqual(stored.turns_used, 2)
+            self.assertIn("benign installer assessment", stored.report_markdown)
+            self.assertNotIn("ANALYSIS COMPLETE", stored.report_markdown)
+
+    async def test_bare_completion_markers_without_a_report_request_more_turns(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+        provider = _Provider(["ANALYSIS COMPLETE", "ANALYSIS COMPLETE", "ANALYSIS COMPLETE"])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            self.assertEqual(stored.status, "awaiting_turn_approval")
+            self.assertIsNone(stored.report_markdown)
+            self.assertIn("stopped making progress", stored.awaiting_reason)
+
+    async def test_three_duplicate_tool_requests_pause_instead_of_corrupting_report(self) -> None:
         project, artifact_id = self.project_with_artifact()
         request = file_tool(artifact_id)
         provider = _Provider([request, request, request, request, IOC_RESULT, VERIFIER_PASS])
@@ -617,9 +884,322 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
         execute.assert_called_once()
         with get_reverse_session() as db:
             stored = db.get(ReverseRun, run.id)
+            self.assertEqual(stored.status, "awaiting_turn_approval")
+            self.assertEqual(stored.turns_used, 4)
+            self.assertIn("stopped making progress", stored.awaiting_reason)
+            self.assertIsNone(stored.report_markdown)
+
+    async def test_oversized_prompt_echo_is_rejected_before_tool_execution(self) -> None:
+        project, artifact_id = self.project_with_artifact()
+        echoed = (
+            file_tool(artifact_id)
+            + "\nUSER: TOOL RESULTS:\n[]\nASSISTANT:\n" * 3
+            + "x" * 40_000
+        )
+        provider = _Provider([echoed, VALID_REPORT, IOC_RESULT, VERIFIER_PASS])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sign_bytes", return_value="signature"),
+            patch("app.reverse.analysis.public_key_info", return_value={
+                "algorithm": "ed25519", "public_key_pem": "public",
+                "fingerprint_sha256": "f" * 64,
+            }),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+            patch("app.reverse.analysis.sandbox_manager.execute") as execute,
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        execute.assert_not_called()
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            rejected = db.query(ReverseMessage).filter(
+                ReverseMessage.run_id == run.id,
+                ReverseMessage.phase == "analysis",
+                ReverseMessage.role == "assistant",
+                ReverseMessage.id > 0,
+            ).order_by(ReverseMessage.id).first()
+            self.assertEqual(stored.status, "completed")
+            self.assertEqual(stored.turns_used, 2)
+            self.assertIn("response_rejected", rejected.metadata_json)
+            self.assertLess(len(rejected.content), 5000)
+
+    async def test_turn_limit_requests_extension_instead_of_finalizing_tool_call(self) -> None:
+        self.cfg.reverse.analysis_max_turns = 1
+        project, artifact_id = self.project_with_artifact()
+        # Some local models echo a transcript and a completion marker after a
+        # tool request in the same response. The tool request must win: its
+        # result has not been observed yet, so this is not a valid final report.
+        provider = _Provider([
+            file_tool(artifact_id)
+            + "\n\nANALYSIS COMPLETE\n# Premature report embedded after the tool request",
+        ])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+            patch("app.reverse.analysis.sandbox_manager.execute", return_value={
+                "success": True, "stdout": "PE32 executable", "stderr": "",
+                "returncode": 0,
+            }),
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            current_project = db.get(ReverseProject, project.id)
+            events = list(db.query(ReverseProvenanceEntry).filter(
+                ReverseProvenanceEntry.project_id == project.id,
+            ))
+            self.assertEqual(stored.status, "awaiting_turn_approval")
+            self.assertEqual(current_project.status, "awaiting_turn_approval")
+            self.assertEqual(stored.turns_used, stored.max_turns)
+            self.assertIn("turn analysis limit", stored.awaiting_reason)
+            self.assertIsNone(stored.report_markdown)
+            self.assertEqual(events[-1].event_type, "analysis.extension_requested")
+
+    async def test_discovered_overlay_rejects_basic_report_until_recursively_inspected(self) -> None:
+        project, artifact_id = self.project_with_artifact()
+        sample = f"/workspace/inputs/{artifact_id}"
+        overlay = "/workspace/output/overlay.bin"
+        premature = (
+            "ANALYSIS COMPLETE\n\n# Findings\n\n"
+            "The binary contains an overlay (13,312 bytes) which likely contains "
+            "configuration data or secondary payloads."
+        )
+        final_report = VALID_REPORT.replace(
+            "Static evidence is limited.",
+            "The 13,312-byte overlay was extracted, classified as raw data, and inspected; "
+            "its printable content contains installer metadata and no nested executable.",
+        )
+        provider = _Provider([
+            json.dumps([{"tool": "run_cmd", "cmd": ["pecheck", sample]}]),
+            json.dumps([{
+                "tool": "run_cmd", "cmd": ["objdump", "-d", "--start-address=4096",
+                "--stop-address=4352", sample],
+            }]),
+            premature,
+            json.dumps([{
+                "tool": "run_cmd",
+                # Reproduce breaker's valid extraction shape: both paths are embedded
+                # inside the source argv item rather than passed as separate operands.
+                "cmd": [
+                    "python3", "-c",
+                    f"f=open('{sample}','rb');f.seek(56320);"
+                    f"open('{overlay}','wb').write(f.read(13312))",
+                ],
+            }]),
+            json.dumps([{"tool": "run_cmd", "cmd": ["file", overlay]}]),
+            json.dumps([{"tool": "run_cmd", "cmd": ["strings", "-n", "6", overlay]}]),
+            final_report,
+            IOC_RESULT,
+            VERIFIER_PASS,
+        ])
+        tool_results = [
+            {
+                "success": True,
+                "stdout": json.dumps({
+                    "overlay": {
+                        "offset": 56_320,
+                        "size": 13_312,
+                        "sha256": "a" * 64,
+                    },
+                }),
+                "stderr": "", "returncode": 0,
+            },
+            {
+                "success": True,
+                "stdout": "00001000 <entry>: push ebp; call 0x1040",
+                "stderr": "", "returncode": 0,
+            },
+            {
+                "success": True,
+                "stdout": "",
+                "stderr": "", "returncode": 0,
+            },
+            {
+                "success": True, "stdout": "data", "stderr": "", "returncode": 0,
+            },
+            {
+                "success": True, "stdout": "installer metadata", "stderr": "",
+                "returncode": 0,
+            },
+        ]
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sign_bytes", return_value="signature"),
+            patch("app.reverse.analysis.public_key_info", return_value={
+                "algorithm": "ed25519", "public_key_pem": "public",
+                "fingerprint_sha256": "f" * 64,
+            }),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+            patch(
+                "app.reverse.analysis.sandbox_manager.execute", side_effect=tool_results
+            ) as execute,
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        self.assertEqual(execute.call_count, 5)
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            rejection = db.query(ReverseMessage).filter(
+                ReverseMessage.run_id == run.id,
+                ReverseMessage.role == "system",
+            ).filter(ReverseMessage.metadata_json.is_not(None)).all()
+            rejected = [
+                row for row in rejection
+                if (row.metadata_json or {}).get("finalization_rejected")
+            ]
+            self.assertEqual(stored.status, "completed")
+            self.assertEqual(stored.turns_used, 7)
+            self.assertIn("overlay was extracted", stored.report_markdown)
+            self.assertNotIn("likely contains", stored.report_markdown)
+            self.assertEqual(len(rejected), 1)
+            self.assertIn("13,312-byte PE overlay", rejected[0].content)
+
+    async def test_executable_basic_checks_cannot_replace_code_inspection(self) -> None:
+        project, artifact_id = self.project_with_artifact()
+        sample = f"/workspace/inputs/{artifact_id}"
+        provider = _Provider([
+            file_tool(artifact_id),
+            VALID_REPORT,
+            json.dumps([{
+                "tool": "run_cmd", "cmd": [
+                    "objdump", "-d", "--start-address=4096", "--stop-address=4352", sample,
+                ],
+            }]),
+            VALID_REPORT.replace(
+                "Static evidence is limited.",
+                "Targeted entry-point disassembly established the initial control flow.",
+            ),
+            IOC_RESULT,
+            VERIFIER_PASS,
+        ])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sign_bytes", return_value="signature"),
+            patch("app.reverse.analysis.public_key_info", return_value={
+                "algorithm": "ed25519", "public_key_pem": "public",
+                "fingerprint_sha256": "f" * 64,
+            }),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+            patch("app.reverse.analysis.sandbox_manager.execute", side_effect=[
+                {
+                    "success": True, "stdout": "PE32 executable", "stderr": "",
+                    "returncode": 0,
+                },
+                {
+                    "success": True,
+                    "stdout": "00001000 <entry>: push ebp; call 0x1040",
+                    "stderr": "", "returncode": 0,
+                },
+            ]) as execute,
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        self.assertEqual(execute.call_count, 2)
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            rejected = db.query(ReverseMessage).filter(
+                ReverseMessage.run_id == run.id,
+                ReverseMessage.role == "system",
+            ).all()
             self.assertEqual(stored.status, "completed")
             self.assertEqual(stored.turns_used, 4)
-            self.assertIsNone(stored.awaiting_reason)
+            self.assertIn("entry-point disassembly", stored.report_markdown)
+            self.assertTrue(any(
+                "only reconnaissance/metadata" in row.content for row in rejected
+            ))
+
+    async def test_unresolved_overlay_at_turn_limit_requests_extension(self) -> None:
+        self.cfg.reverse.analysis_max_turns = 2
+        project, artifact_id = self.project_with_artifact()
+        sample = f"/workspace/inputs/{artifact_id}"
+        provider = _Provider([
+            json.dumps([{"tool": "run_cmd", "cmd": ["pecheck", sample]}]),
+            (
+                "ANALYSIS COMPLETE\n\n# Findings\n\nThe 13,312-byte PE overlay may "
+                "contain a secondary payload."
+            ),
+        ])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+            patch("app.reverse.analysis.sandbox_manager.execute", return_value={
+                "success": True,
+                "stdout": json.dumps({
+                    "overlay": {"offset": "0xdc00", "size": 13_312},
+                }),
+                "stderr": "", "returncode": 0,
+            }),
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            rejected = db.query(ReverseMessage).filter(
+                ReverseMessage.run_id == run.id,
+                ReverseMessage.role == "system",
+            ).all()
+            self.assertEqual(stored.status, "awaiting_turn_approval")
+            self.assertEqual(stored.turns_used, 2)
+            self.assertIsNone(stored.report_markdown)
+            self.assertIn("turn analysis limit", stored.awaiting_reason)
+            self.assertTrue(any(
+                (row.metadata_json or {}).get("finalization_rejected") for row in rejected
+            ))
+
+    async def test_approved_extension_resumes_same_run_and_finishes(self) -> None:
+        self.cfg.reverse.analysis_max_turns = 1
+        self.cfg.reverse.analysis_extension_turns = 3
+        project, artifact_id = self.project_with_artifact()
+        provider = _Provider([file_tool(artifact_id), VALID_REPORT, IOC_RESULT, VERIFIER_PASS])
+        manager = ReverseAnalysisManager()
+        active = SimpleNamespace(image_digest="image@sha256:test")
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sign_bytes", return_value="signature"),
+            patch("app.reverse.analysis.public_key_info", return_value={
+                "algorithm": "ed25519", "public_key_pem": "public",
+                "fingerprint_sha256": "f" * 64,
+            }),
+            patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
+            patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
+            patch("app.reverse.analysis.sandbox_manager.execute", return_value={
+                "success": True, "stdout": "data", "stderr": "",
+                "returncode": 0,
+            }),
+        ):
+            run = await manager.start(project.id)
+            await manager._tasks[project.id]
+            resumed = await manager.approve_extension(project.id)
+            await manager._tasks[project.id]
+        self.assertEqual(resumed.id, run.id)
+        with get_reverse_session() as db:
+            stored = db.get(ReverseRun, run.id)
+            self.assertEqual(stored.status, "completed")
+            self.assertEqual(stored.turns_used, 2)
+            self.assertEqual(stored.max_turns, 4)
+            self.assertIsNotNone(stored.report_markdown)
 
     async def test_verifier_failure_preserves_report_but_blocks_signing(self) -> None:
         project, artifact_id = self.project_with_artifact()
@@ -638,7 +1218,7 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             patch("app.reverse.analysis.sandbox_manager.ensure", return_value=active),
             patch("app.reverse.analysis.sandbox_manager.tool_versions", return_value={}),
             patch("app.reverse.analysis.sandbox_manager.execute", return_value={
-                "success": True, "stdout": "PE32 executable", "stderr": "", "returncode": 0,
+                "success": True, "stdout": "data", "stderr": "", "returncode": 0,
             }),
         ):
             run = await manager.start(project.id)

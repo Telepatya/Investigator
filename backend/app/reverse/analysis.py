@@ -31,6 +31,38 @@ from .tools import parse_tool_call, parse_tool_rejection
 
 logger = logging.getLogger(__name__)
 ACTIVE_STATUSES = {"queued", "running", "verifying", "stopping"}
+_ANALYSIS_CONTROL_PREFIX = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?"
+    r"(?:ANALYSIS COMPLETE|FINAL REPORT|ANALYSIS BLOCKED|BLOCKED)\b"
+    r"[ \t]*(?::|-)?[ \t]*",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_CHAT_CONTROL_MARKER = re.compile(
+    r"^[ \t]*(?:CHAT COMPLETE|CHAT BLOCKED|I HAVE FOUND THE ANSWER|"
+    r"INVESTIGATION COMPLETE)[ \t]*(?::|-)?[ \t]*",
+    flags=re.IGNORECASE | re.MULTILINE,
+)
+_CHAT_EMPTY_ANSWER = (
+    "The follow-up investigation ended before the model wrote a final answer. "
+    "Please try again or ask a narrower question."
+)
+_CHAT_TOOL_LEAK = (
+    "The follow-up investigation stopped before reaching a final answer: the "
+    "model kept requesting sandbox tools instead of concluding. Tool activity "
+    "that did run is recorded in the audit log; try a narrower question."
+)
+_PYTHON_HELPER_WORKFLOW = """CUSTOM PYTHON HELPER WORKFLOW:
+- You CAN create custom Python parsers, decoders, and extractors when built-in tools are insufficient.
+- Step 1: call `write_file` to write UTF-8 Python source as base64 under `/workspace/tools/` or `/workspace/output/`:
+  [{"tool":"write_file","path":"/workspace/tools/inspect.py","content_base64":"aW1wb3J0IHN5cwpwcmludChvcGVuKHN5cy5hcmd2WzFdLCAncmInKS5yZWFkKDIpLmhleCgpKQo="}]
+- Step 2: wait for that tool result. In your NEXT response, run the helper with an argv-only command:
+  [{"tool":"run_cmd","cmd":["python3","/workspace/tools/inspect.py","/workspace/inputs/<artifact-id>"]}]
+- These are two separate tool turns. Never place `write_file` and `run_cmd` in the same response.
+- Helpers may read and statically parse uploaded samples, but must never execute or import them.
+- Helpers cannot use networking, subprocesses, native loading, or read outside permitted workspace paths.
+- Inspect the helper's captured stdout/stderr, refine it with another `write_file` call if necessary, and cite its output as evidence.
+"""
+_STOP_CANCEL_TIMEOUT_SECONDS = 10
 
 
 def _snapshot_config(run: ReverseRun) -> AppConfig:
@@ -40,6 +72,266 @@ def _snapshot_config(run: ReverseRun) -> AppConfig:
     cfg.llm.temperature = run.temperature
     cfg.llm.max_tokens = run.max_tokens
     return cfg
+
+
+def _has_analysis_terminal_signal(response: str) -> bool:
+    return bool(_ANALYSIS_CONTROL_PREFIX.search(response))
+
+
+def _strip_analysis_control_markers(response: str) -> str:
+    return _ANALYSIS_CONTROL_PREFIX.sub("", response.strip()).strip()
+
+
+def _is_analysis_report_candidate(response: str) -> bool:
+    """A prior non-tool response substantial enough to finalize when confirmed."""
+    cleaned = _strip_analysis_control_markers(response)
+    return len(cleaned) >= 200 or bool(re.search(r"^#{1,6}\s+\S", cleaned, re.MULTILINE))
+
+
+def _reverse_model_response_issue(response: str, max_tokens: int) -> str | None:
+    """Reject runaway output and transcript echoes before parsing them as tool calls."""
+    char_limit = max(16_000, min(100_000, max_tokens * 8))
+    if len(response) > char_limit:
+        return f"response exceeded the {char_limit:,}-character safety limit"
+    if (
+        len(response) > 8_000
+        and response.count("USER: TOOL RESULTS:") >= 2
+        and response.count("ASSISTANT:") >= 2
+    ):
+        return "response echoed the analysis transcript instead of returning one operation"
+    return None
+
+
+def _is_transient_provider_error(exc: Exception) -> bool:
+    code = getattr(exc, "code", None)
+    if code in {429, 500, 502, 503, 504}:
+        return True
+    text = str(exc).upper()
+    return any(marker in text for marker in (
+        "DEADLINE_EXCEEDED",
+        "RESOURCE_EXHAUSTED",
+        "SERVICE_UNAVAILABLE",
+        "TEMPORARILY UNAVAILABLE",
+        "TOO MANY REQUESTS",
+    ))
+
+
+_UNRESOLVED_LAYER_CLAIM = re.compile(
+    r"(?:\b(?:overlay|embedded (?:data|payload|archive)|packed (?:data|payload|section)|"
+    r"secondary payload|installer script)\b.{0,180}\b(?:likely|possibly|may|might|could)\b|"
+    r"\b(?:likely|possibly|may|might|could)\b.{0,180}\b(?:overlay|embedded "
+    r"(?:data|payload|archive)|packed (?:data|payload|section)|secondary payload|"
+    r"installer script)\b)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def _tool_result(row: ReverseMessage) -> dict[str, Any]:
+    try:
+        value = json.loads(row.content)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if isinstance(value, list) and value:
+        value = value[0]
+    return value if isinstance(value, dict) else {}
+
+
+def _tool_succeeded(row: ReverseMessage) -> bool:
+    return _tool_result(row).get("success") is True
+
+
+def _target_argv(row: ReverseMessage) -> list[str]:
+    target = (row.metadata_json or {}).get("target")
+    if isinstance(target, list):
+        return [str(item) for item in target]
+    if isinstance(target, str):
+        return [target]
+    return []
+
+
+def _argv_mentions_path(argv: list[str], path: str) -> bool:
+    """Recognize both normal path operands and paths embedded in Python `-c` source."""
+    return any(item == path or path in item for item in argv[1:])
+
+
+def _layer_was_recursively_inspected(
+    rows: list[ReverseMessage], discovery_index: int, sample_path: str
+) -> bool:
+    """Require extraction plus structural and content inspection of an output artifact."""
+    extraction_index: int | None = None
+    for index, row in enumerate(rows[discovery_index + 1:], discovery_index + 1):
+        metadata = row.metadata_json or {}
+        argv = _target_argv(row)
+        if metadata.get("tool") != "run_cmd" or not argv or not _tool_succeeded(row):
+            continue
+        executable = argv[0].rsplit("/", 1)[-1].lower()
+        if not _argv_mentions_path(argv, sample_path):
+            continue
+        if executable in {"7z", "7za", "p7zip"} and any(
+            item.lower() in {"x", "e"} for item in argv[1:]
+        ):
+            extraction_index = index
+            break
+        if executable in {"unzip", "unrar"}:
+            extraction_index = index
+            break
+        if executable == "binwalk" and any(
+            item.lower() in {"-e", "--extract", "-me", "-em"} for item in argv[1:]
+        ):
+            extraction_index = index
+            break
+        if executable in {"python", "python3"}:
+            # A successful helper call alone is not enough. The checks below also
+            # require successful analysis of a file it materialized under output/.
+            extraction_index = index
+            break
+    if extraction_index is None:
+        return False
+
+    structural_tools = {"file", "binwalk", "7z", "7za", "p7zip", "pecheck"}
+    content_tools = {
+        "strings", "python", "python3", "pecheck", "readelf", "objdump", "yara",
+        "hexdump", "xxd",
+    }
+    structural = False
+    content = False
+    for row in rows[extraction_index + 1:]:
+        if not _tool_succeeded(row):
+            continue
+        metadata = row.metadata_json or {}
+        argv = _target_argv(row)
+        output_targeted = any(
+            item == "/workspace/output" or item.startswith("/workspace/output/")
+            for item in argv
+        )
+        if not output_targeted:
+            continue
+        if metadata.get("tool") == "read_file":
+            content = True
+            continue
+        if metadata.get("tool") != "run_cmd" or not argv:
+            continue
+        executable = argv[0].rsplit("/", 1)[-1].lower()
+        structural = structural or executable in structural_tools
+        content = content or executable in content_tools
+    return structural and content
+
+
+def _integer(value: Any) -> int:
+    try:
+        return int(value, 0) if isinstance(value, str) else int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _entrypoint_was_inspected(rows: list[ReverseMessage], sample_path: str) -> bool:
+    """Distinguish code-level inspection from hashes, strings, and PE metadata."""
+    for row in rows:
+        metadata = row.metadata_json or {}
+        argv = _target_argv(row)
+        if (
+            metadata.get("tool") != "run_cmd"
+            or not argv
+            or not _argv_mentions_path(argv, sample_path)
+            or not _tool_succeeded(row)
+        ):
+            continue
+        executable = argv[0].rsplit("/", 1)[-1].lower()
+        if executable == "objdump" and any(arg in {"-d", "-D"} for arg in argv[1:]):
+            return True
+        if executable in {"python", "python3"}:
+            stdout = str(_tool_result(row).get("stdout") or "")
+            if re.search(
+                r"\b(?:entry[ _-]?point|disassembl|function|basic block|instruction|"
+                r"opcode|call target)\b",
+                stdout,
+                re.I,
+            ):
+                return True
+    return False
+
+
+def _analysis_completion_blockers(
+    project_id: str, run_id: str, proposed_report: str
+) -> list[str]:
+    """Artifact-adaptive blockers for discovered but unresolved static layers."""
+    if re.search(r"^\s*(?:#{1,6}\s*)?ANALYSIS BLOCKED\b", proposed_report, re.I | re.M):
+        return []
+    with get_reverse_session() as db:
+        rows = list(db.scalars(select(ReverseMessage).where(
+            ReverseMessage.project_id == project_id,
+            ReverseMessage.run_id == run_id,
+            ReverseMessage.phase == "analysis",
+            ReverseMessage.role == "tool",
+        ).order_by(ReverseMessage.id)))
+    blockers: list[str] = []
+    executable_samples: set[str] = set()
+    container_samples: set[str] = set()
+    for index, row in enumerate(rows):
+        metadata = row.metadata_json or {}
+        target = metadata.get("target")
+        result = _tool_result(row)
+        if (
+            metadata.get("tool") == "run_cmd"
+            and isinstance(target, list)
+            and target
+            and str(target[0]).rsplit("/", 1)[-1].lower() == "pecheck"
+        ):
+            executable_samples.add(str(target[-1]))
+            stdout = result.get("stdout")
+            try:
+                pe_data = json.loads(stdout) if isinstance(stdout, str) else {}
+            except json.JSONDecodeError:
+                pe_data = {}
+            overlay = pe_data.get("overlay") if isinstance(pe_data, dict) else None
+            if isinstance(overlay, dict):
+                size = _integer(overlay.get("size"))
+                offset = _integer(overlay.get("offset"))
+                sample_path = str(target[-1])
+                if size > 0 and not _layer_was_recursively_inspected(
+                    rows, index, sample_path
+                ):
+                    blockers.append(
+                        f"The {size:,}-byte PE overlay at offset {offset:,} was discovered but "
+                        "not recursively inspected. Extract the exact bytes to /workspace/output, "
+                        "then run both structural classification and content analysis against the "
+                        "extracted artifact (and recurse into any meaningful child)."
+                    )
+        if (
+            metadata.get("tool") == "run_cmd"
+            and isinstance(target, list)
+            and len(target) >= 2
+            and str(target[0]).rsplit("/", 1)[-1].lower() == "file"
+        ):
+            stdout = str(result.get("stdout") or "")
+            sample_path = str(target[-1])
+            if re.search(r"\b(?:self-extracting archive|installer|archive data)\b", stdout, re.I):
+                container_samples.add(sample_path)
+                if not _layer_was_recursively_inspected(rows, index, sample_path):
+                    blockers.append(
+                        "The sample was identified as an extractable installer/archive, but its "
+                        "contents were not extracted, structurally classified, and inspected."
+                    )
+            elif re.search(
+                r"\b(?:PE32(?:\+)?|ELF\b.*\bexecutable|Mach-O\b.*\bexecutable)\b",
+                stdout,
+                re.I,
+            ):
+                executable_samples.add(sample_path)
+    for sample_path in sorted(executable_samples - container_samples):
+        if not _entrypoint_was_inspected(rows, sample_path):
+            blockers.append(
+                f"{sample_path} was identified as executable code, but the evidence contains "
+                "only reconnaissance/metadata. Inspect its entry point and relevant functions "
+                "with targeted disassembly or a Python parser that reports code-level findings."
+            )
+    if _UNRESOLVED_LAYER_CLAIM.search(proposed_report):
+        blockers.append(
+            "The proposed report still speculates about an inspectable layer using language such "
+            "as likely/may/possibly. Replace the hypothesis with tool-backed classification or "
+            "return ANALYSIS BLOCKED with the exact unavailable capability."
+        )
+    return list(dict.fromkeys(blockers))
 
 
 def _settings_snapshot(cfg: AppConfig) -> dict[str, Any]:
@@ -195,12 +487,6 @@ def _extract_report_section(text: str, section_name: str) -> str:
     return ""
 
 
-_COMPLETION_MARKER_RE = re.compile(
-    r"^\s*(?:ANALYSIS COMPLETE|ANALYSIS BLOCKED|FINAL REPORT)\s*[:\-]*\s*",
-    re.IGNORECASE,
-)
-
-
 def _first_paragraph(text: str, limit: int = 600) -> str:
     paragraph = ""
     for block in re.split(r"\n\s*\n", text):
@@ -233,7 +519,7 @@ def _render_report(
     section layout. This keeps the report free of repeated content while
     preserving every claim the model made.
     """
-    body = _COMPLETION_MARKER_RE.sub("", summary.strip(), count=1).strip() or summary.strip()
+    body = _strip_analysis_control_markers(summary) or summary.strip()
     parts = [
         "# Forensic Malware Analysis Report",
         "## Project Information\n"
@@ -411,6 +697,14 @@ class ReverseAnalysisManager:
             for item in catalog
         )
         enabled = set(enabled_tools)
+        python_workflow = (
+            _PYTHON_HELPER_WORKFLOW
+            if {"run_cmd", "write_file"}.issubset(enabled)
+            else (
+                "CUSTOM PYTHON HELPER WORKFLOW: unavailable because this project has not enabled "
+                "both `write_file` and `run_cmd`. Do not attempt it.\n"
+            )
+        )
         notes_directive = (
             "\nThe USER NOTES above are analyst tasking, not background: investigate what "
             "they ask and answer each question or request explicitly in your final report "
@@ -457,6 +751,8 @@ IMPORTANT EXECUTION MODEL (STRICT):
 - You may write Python parsers/decoders below `/workspace/output` or `/workspace/tools`, then run them with `python3`.
 - Python helpers may analyze artifacts but cannot use network, subprocesses, native loading, or execute uploaded samples.
 
+{python_workflow}
+
 AVAILABLE TOOLS:
 - `run_cmd`: Execute one allowed binary with argv format. Enabled: {'yes' if 'run_cmd' in enabled else 'no'}.
 - `read_file`: Read bounded file content. Enabled: {'yes' if 'read_file' in enabled else 'no'}.
@@ -474,6 +770,22 @@ ANALYSIS REQUIREMENTS:
 3. Static analysis (strings, imports, sections)
 4. Behavioral indicators
 5. Correlate each important claim with explicit evidence from tool outputs
+
+DEPTH AND RECURSIVE-ANALYSIS REQUIREMENTS:
+- Basic identification (`file`, hashes, one strings pass, imports/sections) is reconnaissance, not completion.
+- Adapt the investigation to discoveries. Inspect entry-point code and relevant functions, not only metadata.
+- If a tool reports a PE overlay, archive, installer payload, embedded executable, compressed stream,
+  packed section, resource payload, or generated configuration blob, extract or target that exact layer,
+  hash and classify it, and recursively analyze meaningful child artifacts.
+- For a PE overlay, use its reported offset/size with bounded `hexdump`/`xxd`, extraction via `7z` when
+  supported, or a custom Python helper that writes the exact bytes below `/workspace/output/`. A small
+  hex sample alone is not completion evidence. Run structural classification plus content/format-specific
+  analysis on the extracted output, and repeat the process for meaningful nested artifacts.
+- Do not finish with claims that a layer "likely", "may", "might", "possibly", or "could" contain
+  configuration/payloads when sandbox tools can inspect it. Investigate it. If an essential step is truly
+  impossible, return `ANALYSIS BLOCKED` with the attempted command and exact missing capability.
+- Continue until material executable/configuration layers and the analyst's questions are resolved with
+  evidence, or a concrete sandbox limitation prevents further static progress.
 
 FOR MALICIOUS SAMPLES, YOUR FINAL REPORT MUST INCLUDE:
 - **Threat Classification**: Malware family, type (trojan, ransomware, etc.)
@@ -494,6 +806,8 @@ Keep your report concise but technically rigorous."""
 
     async def _run(self, project_id: str, run_id: str) -> None:
         last_response = "Analysis failed"
+        report_candidate = ""
+        completion_confirmed = False
         no_progress_turns = 0
         executed_signatures: set[str] = set()
         try:
@@ -521,6 +835,8 @@ Keep your report concise but technically rigorous."""
                 prior_call = parse_tool_call(message.content)
                 if prior_call is not None:
                     executed_signatures.add(_tool_request_signature(prior_call))
+                elif _is_analysis_report_candidate(message.content):
+                    report_candidate = message.content
 
             while True:
                 with get_reverse_session() as db:
@@ -541,10 +857,29 @@ Keep your report concise but technically rigorous."""
                         "DO NOT repeat identical tool calls. Output at most ONE tool in your JSON array this "
                         "turn. Build on findings or conclude with 'ANALYSIS COMPLETE' / 'ANALYSIS BLOCKED'."
                     )})
-                response = await provider.complete(messages, stream=False)
+                try:
+                    response = await provider.complete(messages, stream=False)
+                except Exception as exc:
+                    if _is_transient_provider_error(exc):
+                        await self._mark_stopped(
+                            project_id,
+                            run_id,
+                            "The LLM provider timed out or was temporarily unavailable. "
+                            "All completed turns were preserved; resume the analysis to retry. "
+                            f"Provider error: {str(exc)[:1000]}",
+                        )
+                        return
+                    raise
                 if not isinstance(response, str):
                     raise RuntimeError("Provider returned an unexpected streaming response")
-                call = parse_tool_call(response)
+                raw_response = response
+                response_issue = _reverse_model_response_issue(response, run.max_tokens)
+                if response_issue:
+                    response = (
+                        f"[Model response rejected: {response_issue}]\n\n"
+                        + raw_response[:4000]
+                    )
+                call = None if response_issue else parse_tool_call(response)
                 last_response = response
 
                 with get_reverse_session() as db:
@@ -553,33 +888,117 @@ Keep your report concise but technically rigorous."""
                         return
                     run.turns_used += 1
                     run.updated_at = now()
+                    metadata = {"tool_request": bool(call)}
+                    if response_issue:
+                        metadata.update({
+                            "response_rejected": response_issue,
+                            "response_original_length": len(raw_response),
+                            "response_sha256": hashlib.sha256(raw_response.encode()).hexdigest(),
+                        })
                     db.add(ReverseMessage(
                         project_id=project_id,
                         run_id=run_id,
                         phase="analysis",
                         role="assistant",
                         content=response,
-                        metadata_json={"tool_request": bool(call)},
+                        metadata_json=metadata,
                     ))
+                    if response_issue:
+                        details = {
+                            "run_id": run_id,
+                            "reason": response_issue,
+                            "response_original_length": len(raw_response),
+                            "response_sha256": metadata["response_sha256"],
+                        }
+                        add_audit(project_id, "analysis.response_rejected", details, db=db)
+                        append_provenance(
+                            project_id, "analysis.response_rejected", details, db=db
+                        )
                     db.commit()
 
                 if call is None:
-                    completion_signals = (
-                        "ANALYSIS COMPLETE", "FINAL REPORT", "ANALYSIS BLOCKED", "BLOCKED",
-                    )
-                    if any(signal in response.upper() for signal in completion_signals):
-                        break
+                    if not response_issue:
+                        cleaned_response = _strip_analysis_control_markers(response)
+                        if _is_analysis_report_candidate(response):
+                            report_candidate = response
+                        terminal_candidate = ""
+                        if _has_analysis_terminal_signal(response) and cleaned_response:
+                            terminal_candidate = response
+                        elif _has_analysis_terminal_signal(response) and report_candidate:
+                            # A bare marker often follows a complete report that omitted or
+                            # Markdown-formatted the marker. Finalize the preserved substantive
+                            # response, never the marker-only response.
+                            terminal_candidate = report_candidate
+                        if terminal_candidate:
+                            blockers = _analysis_completion_blockers(
+                                project_id, run_id, terminal_candidate
+                            )
+                            if blockers:
+                                guidance = (
+                                    "FINALIZATION REJECTED: unresolved static-analysis work remains:\n- "
+                                    + "\n- ".join(blockers)
+                                    + "\nContinue the investigation with ONE allowed tool operation."
+                                )
+                                with get_reverse_session() as db:
+                                    db.add(ReverseMessage(
+                                        project_id=project_id,
+                                        run_id=run_id,
+                                        phase="analysis",
+                                        role="system",
+                                        content=guidance,
+                                        metadata_json={
+                                            "finalization_rejected": True,
+                                            "blockers": blockers,
+                                        },
+                                    ))
+                                    details = {
+                                        "run_id": run_id,
+                                        "blockers": blockers,
+                                        "turns_used": run.turns_used,
+                                    }
+                                    add_audit(
+                                        project_id,
+                                        "analysis.finalization_rejected",
+                                        details,
+                                        db=db,
+                                    )
+                                    append_provenance(
+                                        project_id,
+                                        "analysis.finalization_rejected",
+                                        details,
+                                        db=db,
+                                    )
+                                    db.commit()
+                                no_progress_turns = 0
+                                continue
+                            last_response = terminal_candidate
+                            completion_confirmed = True
+                            break
                     no_progress_turns += 1
-                    rejection = parse_tool_rejection(response)
-                    guidance = (
-                        f"Tool call denied: {rejection} Choose a different allowed operation, "
-                        "or conclude with 'ANALYSIS COMPLETE' / 'ANALYSIS BLOCKED'."
-                        if rejection else (
+                    rejection = None if response_issue else parse_tool_rejection(response)
+                    if response_issue:
+                        guidance = (
+                            f"Your previous response was rejected because it {response_issue}. "
+                            "Do not echo prior messages or tool results. Return exactly ONE tool "
+                            "object, or a complete final report."
+                        )
+                    elif _has_analysis_terminal_signal(response):
+                        guidance = (
+                            "A completion marker by itself is not a report. Return "
+                            "'ANALYSIS COMPLETE' followed by the full evidence-grounded report, "
+                            "or 'ANALYSIS BLOCKED' followed by the concrete blocker."
+                        )
+                    elif rejection:
+                        guidance = (
+                            f"Tool call denied: {rejection} Choose a different allowed operation, "
+                            "or conclude with 'ANALYSIS COMPLETE' / 'ANALYSIS BLOCKED'."
+                        )
+                    else:
+                        guidance = (
                             "Reply with a JSON array containing exactly ONE tool object, or if you are "
                             "done state 'ANALYSIS COMPLETE', or if no further progress is possible state "
                             "'ANALYSIS BLOCKED' with the concrete blocker."
                         )
-                    )
                     with get_reverse_session() as db:
                         db.add(ReverseMessage(
                             project_id=project_id,
@@ -652,6 +1071,29 @@ Keep your report concise but technically rigorous."""
                     db.commit()
                 if no_progress_turns >= 3:
                     break
+
+            if (
+                parse_tool_call(last_response) is not None
+                or not completion_confirmed
+            ):
+                with get_reverse_session() as db:
+                    run = db.get(ReverseRun, run_id)
+                    if not run:
+                        return
+                    if run.turns_used >= run.max_turns:
+                        reason = (
+                            f"Reached the {run.max_turns}-turn analysis limit before the model "
+                            "produced a final report. Approve more turns to continue from the "
+                            "preserved sandbox and evidence, or deny to request a final report."
+                        )
+                    else:
+                        reason = (
+                            "The model stopped making progress before producing a final report. "
+                            "Approve more turns to continue from the preserved sandbox and evidence, "
+                            "or deny to request a final report."
+                        )
+                await self._mark_awaiting_turn_approval(project_id, run_id, reason)
+                return
 
             await self._finalize(project_id, run_id, last_response)
         except asyncio.CancelledError:
@@ -743,7 +1185,10 @@ Keep your report concise but technically rigorous."""
                     "and outputs, that material claims and IOCs have support, and that uncertainty is disclosed. Do not "
                     "rewrite or shorten the report and do not enforce a template. Return ONLY a compact JSON object with "
                     "keys: status ('pass' or 'revise'), summary, unsupported_claims (array), missing_evidence (array), "
-                    "contradictions (array), and revision_instructions. Use revise only for material evidence problems."
+                    "contradictions (array), and revision_instructions. Use revise for any discovered overlay, archive, "
+                    "packed/embedded layer, or secondary payload that the report leaves as speculation instead of "
+                    "tool-backed classification, unless a concrete sandbox limitation is documented. Also revise if "
+                    "the report claims analysis completeness after only basic metadata/strings checks."
                 )},
                 {"role": "user", "content": (
                     f"HOST-RECORDED TOOL FLOW:\n{json.dumps(flow_manifest, ensure_ascii=False)}\n\n"
@@ -1044,6 +1489,31 @@ Keep your report concise but technically rigorous."""
             add_audit(project_id, "analysis.stopped", {"run_id": run_id, "reason": reason}, db=db)
             db.commit()
 
+    async def _mark_awaiting_turn_approval(
+        self, project_id: str, run_id: str, reason: str
+    ) -> None:
+        with get_reverse_session() as db:
+            run = db.get(ReverseRun, run_id)
+            project = db.get(ReverseProject, project_id)
+            if not run or not project:
+                return
+            run.status = "awaiting_turn_approval"
+            run.awaiting_reason = reason
+            run.updated_at = now()
+            project.status = "awaiting_turn_approval"
+            project.updated_at = now()
+            details = {
+                "run_id": run_id,
+                "turns_used": run.turns_used,
+                "max_turns": run.max_turns,
+                "reason": reason,
+            }
+            add_audit(project_id, "analysis.extension_requested", details, db=db)
+            append_provenance(
+                project_id, "analysis.extension_requested", details, db=db
+            )
+            db.commit()
+
     async def _mark_failed(self, project_id: str, run_id: str, error: str) -> None:
         safe_error = error[:2000]
         with get_reverse_session() as db:
@@ -1077,7 +1547,20 @@ Keep your report concise but technically rigorous."""
         task = self._tasks.get(project_id)
         if task and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(task, return_exceptions=True),
+                    timeout=_STOP_CANCEL_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Reverse task %s did not cancel within %s seconds",
+                    project_id,
+                    _STOP_CANCEL_TIMEOUT_SECONDS,
+                )
+                await self._mark_stopped(
+                    project_id, run_id, "Stopped by analyst; cancellation timed out"
+                )
         else:
             await self._mark_stopped(project_id, run_id, "Stopped by analyst")
         return True
@@ -1185,27 +1668,35 @@ Keep your report concise but technically rigorous."""
             "- One tool per response, encoded as a JSON array with exactly one object\n"
             "- If a tool is denied with NOT_IN_ALLOWLIST, do not retry blindly; explain the blocker\n"
             "- Uploaded samples must never be executed\n\n"
+            f"{_PYTHON_HELPER_WORKFLOW}\n"
             "AVAILABLE TOOLS:\n"
             "- run_cmd\n"
             "- read_file\n"
             "- write_file\n"
             "- list_dir\n\n"
             f"ALLOWED EXECUTABLES FOR run_cmd: {', '.join(sorted(EXECUTABLE_PATHS))}\n\n"
-            "When you have fully answered the question, begin the final answer with 'CHAT COMPLETE:'.\n"
-            "If further progress is impossible, begin with 'CHAT BLOCKED:' and explain the blocker.\n"
+            "When you have fully answered the question, put 'CHAT COMPLETE:' on the first line, "
+            "then write the complete answer. Never return the marker by itself.\n"
+            "If further progress is impossible, put 'CHAT BLOCKED:' on the first line, then "
+            "explain the blocker. Never return the marker by itself.\n"
             "When you need a tool, output only the JSON array for that single tool call."
         )
 
     @staticmethod
+    def _strip_chat_control_markers(response: str) -> str:
+        """Remove model-control markers wherever they start a response line."""
+        return _CHAT_CONTROL_MARKER.sub("", response.strip()).strip()
+
+    @staticmethod
     def _clean_chat_response(response: str) -> str:
-        cleaned = re.sub(
-            r"^\s*(?:CHAT COMPLETE|CHAT BLOCKED|I HAVE FOUND THE ANSWER|"
-            r"INVESTIGATION COMPLETE)\s*[:\-]*\s*",
-            "",
-            response.strip(),
-            flags=re.IGNORECASE,
-        )
-        return cleaned.strip() or "The model did not return a usable answer."
+        return ReverseAnalysisManager._strip_chat_control_markers(response) or _CHAT_EMPTY_ANSWER
+
+    @staticmethod
+    def _chat_content_for_display(content: str) -> str:
+        """Keep legacy protocol artifacts from leaking through the messages API."""
+        if parse_tool_call(content) is not None or parse_tool_rejection(content) is not None:
+            return _CHAT_TOOL_LEAK
+        return ReverseAnalysisManager._clean_chat_response(content)
 
     async def chat(self, project_id: str, message: str) -> ReverseMessage:
         async with self._lock(project_id):
@@ -1263,6 +1754,9 @@ Keep your report concise but technically rigorous."""
                     if call is None:
                         rejection = parse_tool_rejection(model_response)
                         stripped = model_response.strip()
+                        answer = self._strip_chat_control_markers(model_response)
+                        has_control_marker = bool(_CHAT_CONTROL_MARKER.search(model_response))
+                        marker_only = has_control_marker and not answer
                         invalid_tool_attempt = rejection is not None or (
                             (stripped.startswith("[") or stripped.startswith("```"))
                             and ("\"tool\"" in stripped or "'tool'" in stripped)
@@ -1274,19 +1768,32 @@ Keep your report concise but technically rigorous."""
                                 "i should inspect", "i'm going to",
                             )
                         )
-                        if not future_work and not invalid_tool_attempt:
+                        if (
+                            not invalid_tool_attempt
+                            and not marker_only
+                            and (has_control_marker or not future_work)
+                        ):
                             break
                         no_progress_turns += 1
                         if no_progress_turns >= 3:
                             break
-                        prompt.append({"role": "system", "content": (
-                            f"Tool call denied: {rejection} Choose a different allowed operation, "
-                            "or finish with CHAT COMPLETE / CHAT BLOCKED."
-                            if rejection else (
+                        if marker_only:
+                            correction = (
+                                "A completion marker by itself is not an answer. Write the full, "
+                                "evidence-grounded answer after CHAT COMPLETE:, or explain the "
+                                "blocker after CHAT BLOCKED:."
+                            )
+                        elif rejection:
+                            correction = (
+                                f"Tool call denied: {rejection} Choose a different allowed "
+                                "operation, or finish with CHAT COMPLETE / CHAT BLOCKED."
+                            )
+                        else:
+                            correction = (
                                 "Reply with exactly one tool call in a JSON array, or finish with "
                                 "CHAT COMPLETE / CHAT BLOCKED."
                             )
-                        )})
+                        prompt.append({"role": "system", "content": correction})
                         continue
 
                     signature = _tool_request_signature(call)
@@ -1341,11 +1848,7 @@ Keep your report concise but technically rigorous."""
                         )})
                 if parse_tool_call(response) is not None or parse_tool_rejection(response) is not None:
                     # Never surface a raw tool-call JSON blob as the chat answer.
-                    response = (
-                        "The follow-up investigation stopped before reaching a final answer: the "
-                        "model kept requesting sandbox tools instead of concluding. Tool activity "
-                        "that did run is recorded in the audit log; try a narrower question."
-                    )
+                    response = _CHAT_TOOL_LEAK
                 else:
                     response = self._clean_chat_response(response)
             except BaseException as exc:
@@ -1458,7 +1961,11 @@ Keep your report concise but technically rigorous."""
                 ReverseMessage.phase == "chat",
             ).order_by(ReverseMessage.id)))
             return [{
-                "id": row.id, "role": row.role, "content": row.content,
+                "id": row.id, "role": row.role,
+                "content": (
+                    ReverseAnalysisManager._chat_content_for_display(row.content)
+                    if row.role == "assistant" else row.content
+                ),
                 "phase": row.phase, "metadata": row.metadata_json or {},
                 "created_at": row.created_at,
             } for row in rows]
