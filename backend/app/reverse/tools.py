@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -81,18 +82,56 @@ def _extract_array(text: str) -> list[Any] | None:
     return None
 
 
+_TOOL_ALIASES = {
+    "run_command": "run_cmd",
+    "execute_command": "run_cmd",
+    "shell_command": "run_cmd",
+}
+# Argument each tool receives when the model uses the shorthand
+# {"<tool_name>": <value>} shape instead of {"tool": ..., ...}.
+_PRIMARY_ARGUMENT = {
+    "run_cmd": "cmd",
+    "read_file": "path",
+    "write_file": "path",
+    "list_dir": "path",
+}
+
+
+def _split_command(value: str) -> list[str] | str:
+    try:
+        return shlex.split(value)
+    except ValueError:
+        return value  # schema validation rejects it with a clear reason
+
+
 def _normalize_request(raw: dict[str, Any]) -> dict[str, Any]:
     if "tool" not in raw and isinstance(raw.get("name"), str):
         raw["tool"] = raw.pop("name")
-    aliases = {
-        "run_command": "run_cmd",
-        "execute_command": "run_cmd",
-        "shell_command": "run_cmd",
-    }
-    raw["tool"] = aliases.get(raw.get("tool"), raw.get("tool"))
+    if "tool" not in raw:
+        # Shorthand shape: {"run_cmd": "strings /workspace/inputs/x"} or
+        # {"read_file": {"path": ...}} with the tool name as the only key.
+        for key, tool_id in ({t: t for t in _PRIMARY_ARGUMENT} | _TOOL_ALIASES).items():
+            if key not in raw:
+                continue
+            value = raw.pop(key)
+            raw["tool"] = tool_id
+            if isinstance(value, dict):
+                for item_key, item in value.items():
+                    raw.setdefault(item_key, item)
+            elif value is not None:
+                raw.setdefault(_PRIMARY_ARGUMENT[tool_id], value)
+            break
+    raw["tool"] = _TOOL_ALIASES.get(raw.get("tool"), raw.get("tool"))
     if raw.get("tool") == "run_cmd" and "cmd" not in raw and "command" in raw:
-        command = raw.pop("command")
-        raw["cmd"] = command if isinstance(command, list) else [command]
+        raw["cmd"] = raw.pop("command")
+    if raw.get("tool") == "run_cmd":
+        cmd = raw.get("cmd")
+        # Accept a whole command line as one string; execution stays shell-free
+        # and the argv still passes host and container policy validation.
+        if isinstance(cmd, str):
+            raw["cmd"] = _split_command(cmd)
+        elif isinstance(cmd, list) and len(cmd) == 1 and isinstance(cmd[0], str) and " " in cmd[0]:
+            raw["cmd"] = _split_command(cmd[0])
     if raw.get("tool") == "write_file" and "content_base64" not in raw and "content" in raw:
         raw["content_base64"] = raw.pop("content")
     return raw

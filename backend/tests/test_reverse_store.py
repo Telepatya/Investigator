@@ -179,6 +179,36 @@ class ReverseStoreTests(unittest.TestCase):
             "tool": "run_cmd", "cmd": ["file", artifact],
         })))
 
+    def test_tool_parser_normalizes_common_shorthand_shapes(self) -> None:
+        artifact = "/workspace/inputs/11111111-1111-4111-8111-111111111111"
+        # Tool name as the object key with a whole command line as one string.
+        shorthand = parse_tool_call(json.dumps([{"run_cmd": f"strings {artifact}"}]))
+        self.assertIsNotNone(shorthand)
+        self.assertEqual(shorthand.cmd, ["strings", artifact])
+        # cmd given as a single string instead of an argv array.
+        string_cmd = parse_tool_call(json.dumps([{
+            "tool": "run_cmd", "cmd": f"strings -n 6 {artifact}",
+        }]))
+        self.assertEqual(string_cmd.cmd, ["strings", "-n", "6", artifact])
+        # One-element argv containing the whole command line.
+        packed = parse_tool_call(json.dumps([{
+            "tool": "run_cmd", "cmd": [f"file {artifact}"],
+        }]))
+        self.assertEqual(packed.cmd, ["file", artifact])
+        # Shorthand with a nested argument object.
+        nested = parse_tool_call(json.dumps([{
+            "read_file": {"path": "/workspace/output/carved.bin", "max_bytes": 512},
+        }]))
+        self.assertEqual(nested.tool, "read_file")
+        self.assertEqual(nested.max_bytes, 512)
+        # Normalization never bypasses the command policy.
+        self.assertIsNone(parse_tool_call(json.dumps([{"run_cmd": "curl http://evil.example"}])))
+        self.assertEqual(
+            parse_tool_rejection(json.dumps([{"run_cmd": "curl http://evil.example"}])),
+            "NOT_IN_ALLOWLIST:curl",
+        )
+        self.assertIsNone(parse_tool_call(json.dumps([{"run_cmd": "sh -c id"}])))
+
     def test_v1_store_migrates_report_signature_and_verification_state(self) -> None:
         dispose_reverse_db()
         path = reverse_db_path()

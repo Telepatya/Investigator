@@ -1325,11 +1325,12 @@ Keep your report concise but technically rigorous."""
                             f"SYSTEM REMINDER (Iteration {iteration + 1}/12): Use at most ONE tool "
                             "per turn, do not repeat calls, and conclude with CHAT COMPLETE or CHAT BLOCKED."
                         )})
-                if parse_tool_call(response) is not None:
+                if parse_tool_call(response) is not None or parse_tool_rejection(response) is not None:
+                    # Never surface a raw tool-call JSON blob as the chat answer.
                     response = (
-                        "The follow-up investigation could not reach a final answer within its "
-                        "tool budget. The tool activity that did run is recorded in the audit log; "
-                        "try a narrower question."
+                        "The follow-up investigation stopped before reaching a final answer: the "
+                        "model kept requesting sandbox tools instead of concluding. Tool activity "
+                        "that did run is recorded in the audit log; try a narrower question."
                     )
                 else:
                     response = self._clean_chat_response(response)

