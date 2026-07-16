@@ -13,6 +13,7 @@ from unittest.mock import patch
 import app.config as config
 from app.reverse.analysis import (
     ReverseAnalysisManager,
+    _render_report,
     _tool_request_for_provenance,
 )
 from app.reverse.database import (
@@ -311,6 +312,53 @@ class ReverseAnalysisTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [entry.event_type for entry in events],
             ["chat.started", "chat.tool_executed", "chat.completed"],
+        )
+
+    def test_analyst_notes_are_tasking_in_prompt_and_echoed_in_report(self) -> None:
+        prompt = ReverseAnalysisManager._system_prompt(
+            ["run_cmd"], [], "Which URLs and staging endpoints are embedded?"
+        )
+        self.assertIn("USER NOTES: Which URLs and staging endpoints are embedded?", prompt)
+        self.assertIn("## Analyst Questions", prompt)
+        self.assertNotIn(
+            "Analyst Questions", ReverseAnalysisManager._system_prompt(["run_cmd"], [])
+        )
+
+        from datetime import datetime, timezone
+        project = SimpleNamespace(
+            id="11111111-1111-4111-8111-111111111111", name="notes",
+            analysis_note="Which URLs and staging endpoints are embedded?",
+        )
+        run = SimpleNamespace(
+            created_at=datetime.now(timezone.utc), provider="ollama", model="m",
+            image_digest=None, tool_versions={},
+        )
+        report = _render_report(project, run, [], "ANALYSIS COMPLETE\n\n## Findings\n\nNone.")
+        self.assertIn("## Analyst Tasking", report)
+        self.assertIn("Which URLs and staging endpoints are embedded?", report)
+        project.analysis_note = None
+        self.assertNotIn(
+            "## Analyst Tasking",
+            _render_report(project, run, [], "ANALYSIS COMPLETE\n\n## Findings\n\nNone."),
+        )
+
+    async def test_replay_reuses_the_original_analyst_notes(self) -> None:
+        from unittest.mock import AsyncMock
+
+        project, _artifact_id = self.project_with_artifact()
+        with get_reverse_session() as db:
+            row = db.get(ReverseProject, project.id)
+            row.analysis_note = "Which URLs and staging endpoints are embedded?"
+            db.add(ReverseRun(
+                id=str(uuid.uuid4()), project_id=project.id, status="completed",
+                provider="ollama", model="snapshot-model",
+            ))
+            db.commit()
+        manager = ReverseAnalysisManager()
+        with patch.object(ReverseAnalysisManager, "start", new_callable=AsyncMock) as start:
+            await manager.replay(project.id)
+        self.assertEqual(
+            start.call_args.args[1], "Which URLs and staging endpoints are embedded?"
         )
 
     async def test_chat_executes_shorthand_tool_calls_instead_of_echoing_them(self) -> None:

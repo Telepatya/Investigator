@@ -252,6 +252,9 @@ def _render_report(
             f"- **Content Type**: {artifact['content_type']}\n"
             f"- **Sandbox Path**: `{artifact['sandbox_path']}`",
         )
+    tasking = (project.analysis_note or "").strip()
+    if tasking:
+        parts.append(f"## Analyst Tasking\n\n{tasking}")
     parts.append("---")
     has_iocs = bool(
         _extract_report_section(body, "Indicators of Compromise")
@@ -408,6 +411,13 @@ class ReverseAnalysisManager:
             for item in catalog
         )
         enabled = set(enabled_tools)
+        notes_directive = (
+            "\nThe USER NOTES above are analyst tasking, not background: investigate what "
+            "they ask and answer each question or request explicitly in your final report "
+            "under a dedicated '## Analyst Questions' section, citing tool evidence or "
+            "stating clearly that the evidence was insufficient.\n"
+            if notes.strip() else ""
+        )
         return f"""You are a forensic malware analyst in an isolated sandbox. Analyze the provided files comprehensively.
 
 ENVIRONMENT & CONSTRAINTS:
@@ -457,7 +467,7 @@ Available files:
 {files}
 
 USER NOTES: {notes or '(none)'}
-
+{notes_directive}
 ANALYSIS REQUIREMENTS:
 1. File identification and metadata
 2. Unpacking/deobfuscation if needed
@@ -1150,12 +1160,16 @@ Keep your report concise but technically rigorous."""
             ).order_by(ReverseRun.created_at.desc()).limit(1))
             if not previous:
                 raise ValueError("No prior Reverse analysis to replay")
+            project = db.get(ReverseProject, project_id)
+            # Replay must reproduce the captured run, including the original
+            # analyst notes, not replace them with replay boilerplate.
+            notes = (project.analysis_note or "") if project else ""
             snapshot = ReverseRun(
                 id=previous.id, project_id=project_id, provider=previous.provider,
                 model=previous.model, temperature=previous.temperature,
                 max_tokens=previous.max_tokens, max_turns=previous.max_turns,
             )
-        return await self.start(project_id, "Deterministic replay of the previous analysis settings.", snapshot=snapshot)
+        return await self.start(project_id, notes, snapshot=snapshot)
 
     @staticmethod
     def _chat_system_prompt() -> str:
