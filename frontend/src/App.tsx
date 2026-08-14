@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Binary, Clock, Folder, Moon, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
+import { Binary, Clock, Folder, Moon, ScrollText, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
 import { clsx } from "clsx";
-import { CodeBlock, DetailDrawer, IconButton, SeverityBadge } from "./components/common";
+import { CodeBlock, DetailDrawer, IconButton, SeverityBadge, Spinner } from "./components/common";
 import { FlagAsFinding } from "./components/FlagAsFinding";
 import { useTheme } from "./lib/theme";
 import { api } from "./lib/api";
@@ -17,6 +17,7 @@ const RELEASE_LABEL = "Public Beta";
 const NAV = [
   { to: "/", label: "Cases", icon: <Folder size={19} /> },
   { to: "/reverse", label: "Reverse", icon: <Binary size={19} /> },
+  { to: "/rules", label: "Rules", icon: <ScrollText size={19} /> },
   { to: "/settings", label: "Settings", icon: <Settings size={19} /> },
 ];
 
@@ -184,7 +185,9 @@ export default function App() {
         </header>
 
         <main className="mx-auto w-full max-w-[1680px] flex-1 px-3 pb-6 lg:px-6">
-          <Outlet />
+          <Suspense fallback={<Spinner label="Loading…" />}>
+            <Outlet />
+          </Suspense>
         </main>
       </div>
 
@@ -263,6 +266,7 @@ function SidebarItem({
   const active =
     (item.label === "Settings" && pathname.startsWith("/settings")) ||
     (item.label === "Reverse" && pathname.startsWith("/reverse")) ||
+    (item.label === "Rules" && pathname.startsWith("/rules")) ||
     (item.label === "Cases" && (pathname === "/" || pathname.startsWith("/cases/")));
 
   return (

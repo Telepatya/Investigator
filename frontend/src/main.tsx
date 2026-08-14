@@ -23,6 +23,9 @@ import ReverseProjectPage from "./pages/ReverseProjectPage";
 // initial load of the case list, dashboard, or settings.
 const TimelinePage = lazy(() => import("./pages/TimelinePage"));
 const EntityMapPage = lazy(() => import("./pages/EntityMapPage"));
+// The rules catalog and its editor are only needed when the analyst opens the
+// Rules page, so they stay out of the initial bundle too.
+const RulesPage = lazy(() => import("./pages/RulesPage"));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -44,6 +47,7 @@ const router = createBrowserRouter([
       { index: true, element: <CasesPage /> },
       { path: "reverse", element: <ReversePage /> },
       { path: "reverse/:projectId", element: <ReverseProjectPage /> },
+      { path: "rules", element: <RulesPage /> },
       { path: "settings", element: <SettingsPage /> },
       {
         path: "cases/:caseId",

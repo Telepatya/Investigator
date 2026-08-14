@@ -17,6 +17,32 @@ events are computed at ingestion time. Upgrade code does not reinterpret old
 rows. Re-ingest the original evidence to receive parser corrections and rebuild
 detections when release notes instruct you to do so.
 
+## Global rules database
+
+Detection-rule state is application-wide rather than per-case, so it lives in its
+own database at `~/.investigator/rules/rules.db`, created by
+`backend/app/rules/database.py` the first time a rule is changed. Until then the
+file does not exist and the engine uses its built-in rule tables directly.
+
+It carries an explicit `rules_schema_version` row and a stepwise, forward-only
+migration ladder, and it refuses to open a database written by a newer build
+rather than guessing at an unknown schema. Include `~/.investigator/rules/` in
+the backup described below: it holds every rule an analyst has disabled, every
+severity override, and every custom Sigma rule they have written.
+
+Rule state and per-case suppression are separate and never written into each
+other:
+
+- A rule disabled here is removed from the rule set before a detection run, so no
+  finding is produced. Re-enabling it requires rebuilding a case's detections for
+  the finding to come back.
+- A rule disabled inside a case (`case_meta["disabled_rules"]`) still produces its
+  finding and demotes it to `info`, and stays reversible without a rebuild.
+
+Custom rules are stored with a SHA-256 of their source. A row whose source no
+longer matches its digest — which only happens if the database was edited by
+hand — is reported and skipped rather than executed.
+
 ## User procedure before upgrading
 
 1. Stop Investigator and confirm no `python -m app.main` process is using the

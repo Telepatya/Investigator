@@ -18,6 +18,10 @@ import type {
   Provider,
   ProviderTestResult,
   Report,
+  RuleDetail,
+  RuleImportResponse,
+  RuleListResponse,
+  RuleValidateResponse,
   TimelineEvt,
 } from "./types";
 
@@ -451,6 +455,57 @@ export function uploadFile(
     xhr.onerror = () => reject(new Error("Upload failed"));
     xhr.send(form);
   });
+}
+
+export const rulesApi = {
+  list: (params: { q?: string; source?: string; kind?: string; platform?: string; severity?: string } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params).filter(([, value]) => Boolean(value)) as [string, string][],
+    ).toString();
+    return req<RuleListResponse>(`/rules${query ? `?${query}` : ""}`);
+  },
+  get: (ruleId: string) => req<RuleDetail>(`/rules/${encodeURIComponent(ruleId)}`),
+  updateBuiltin: (
+    ruleId: string,
+    body: { enabled?: boolean; severity_override?: string | null; clear_severity?: boolean; note?: string },
+  ) =>
+    req<{ ok: boolean; revision: number }>(`/rules/builtin/${encodeURIComponent(ruleId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  createCustom: (yamlSource: string, enabled = true) =>
+    req<{ ok: boolean; revision: number }>("/rules/custom", {
+      method: "POST",
+      body: JSON.stringify({ yaml_source: yamlSource, enabled }),
+    }),
+  updateCustom: (ruleId: string, body: { yaml_source?: string; enabled?: boolean }) =>
+    req<{ ok: boolean; revision: number }>(`/rules/custom/${encodeURIComponent(ruleId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteCustom: (ruleId: string) =>
+    req<{ ok: boolean; revision: number }>(`/rules/custom/${encodeURIComponent(ruleId)}`, {
+      method: "DELETE",
+    }),
+  validate: (yamlSource: string) =>
+    req<RuleValidateResponse>("/rules/validate", {
+      method: "POST",
+      body: JSON.stringify({ yaml_source: yamlSource }),
+    }),
+  fork: (ruleId: string, disableBuiltin: boolean) =>
+    req<{ id: string; slug: string; yaml_source: string; revision: number }>(
+      `/rules/builtin/${encodeURIComponent(ruleId)}/fork`,
+      { method: "POST", body: JSON.stringify({ disable_builtin: disableBuiltin }) },
+    ),
+  import: (yamlSource: string) =>
+    req<RuleImportResponse>("/rules/import", {
+      method: "POST",
+      body: JSON.stringify({ yaml_source: yamlSource }),
+    }),
+};
+
+export function rulesExportUrl(): string {
+  return `${BASE}/rules/export/bundle`;
 }
 
 export function wsUrl(path: string): string {

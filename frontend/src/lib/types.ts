@@ -583,3 +583,69 @@ export interface ReverseSettings {
   enabled_tools: string[];
   available_tools: { id: string; description: string }[];
 }
+
+// --- Detection rules ---------------------------------------------------------
+
+export interface RuleSummary {
+  id: string;
+  title: string;
+  kind: string;
+  platform: string;
+  severity: Severity;
+  techniques: string[];
+  source: "builtin" | "custom";
+  enabled: boolean;
+  family: string | null;
+  is_family: boolean;
+  editable: string[];
+  forkable: boolean;
+  severity_override: Severity | null;
+  /** Ids the per-case suppression system uses for this rule. */
+  legacy_rule_ids: string[];
+  /** False when no literal prefilter could be derived, so the rule runs on every subject. */
+  gated: boolean;
+  compile_status: string;
+  compile_error: string | null;
+  warnings: string[];
+}
+
+export interface RuleDetail extends RuleSummary {
+  description: string;
+  logic: string;
+  yaml_source: string;
+  logsource: string;
+  unmapped_fields: string[];
+  note: string;
+  origin: string;
+  source_builtin_id: string | null;
+}
+
+export interface RuleListResponse {
+  revision: number;
+  rules: RuleSummary[];
+  total: number;
+  builtin_total: number;
+  custom_total: number;
+  disabled_total: number;
+  ungated_total: number;
+  ungated_limit: number;
+}
+
+export interface RuleValidateResponse {
+  ok: boolean;
+  error: string | null;
+  title: string;
+  severity: Severity;
+  techniques: string[];
+  logsource: string;
+  literals: string[];
+  gated: boolean;
+  warnings: string[];
+  unmapped_fields: string[];
+}
+
+export interface RuleImportResponse {
+  imported: { index: number; id: string; slug: string }[];
+  rejected: { index: number; error: string }[];
+  revision: number;
+}

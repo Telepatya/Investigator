@@ -20,6 +20,7 @@ usage are covered in the [README](../README.md); security reporting is covered i
   - [Long-running operation coordination](#long-running-operation-coordination)
   - [Ingestion and memory analysis](#ingestion-and-memory-analysis)
   - [Detection and analyst findings](#detection-and-analyst-findings)
+  - [Global rule management](#global-rule-management)
   - [Entity graph and dossiers](#entity-graph-and-dossiers)
   - [AI orchestration](#ai-orchestration)
   - [API and WebSockets](#api-and-websockets)
@@ -204,6 +205,7 @@ Investigator/
 |   |   |-- ingest/                parsers, normalization, evidence lifecycle
 |   |   |-- memory/                MemProcFS, YARA, forensic extraction
 |   |   |-- detect/                rules, overrides, manual findings, graphs
+|   |   |-- rules/                 rule catalog, global state, Sigma compiler
 |   |   |-- llm/                   providers, tools, prompts, orchestration
 |   |   |-- reverse/               projects, analysis, sandbox policy, provenance
 |   |   |-- store/                 registry, operation locks, SQLAlchemy storage
@@ -443,6 +445,51 @@ fields regardless of whether they came from syslog, auditd, journald, or Sentine
 `case_meta`. These overrides survive a findings-table rebuild and are applied after
 detector output is materialized.
 
+### Global rule management
+
+`app/rules/` manages detection rules application-wide, separately from the per-case
+overrides above.
+
+`registry.py` reads the rule tables in `app/detect/rules.py` and presents them as one
+catalog of addressable rules. It holds references to the already-compiled patterns
+and compiles nothing. Rules are grouped by the slug of their description, because
+several tables carry more than one pattern under a single description and the
+per-case override system already treats those as one rule. Each entry also records
+the legacy id `overrides.rule_id_for()` derives from the finding title, which is what
+existing cases have persisted. Tables whose members all collapse to one legacy id —
+LOLBins, parent/child pairs, masquerade paths, execution directories — expose a
+family switch plus per-member rules, so a member can be toggled individually while an
+existing per-case disable of the family id keeps working.
+
+`profile.py` snapshots the active rule set once per detection run. With no
+customization it returns the module tables themselves, by identity, so behavior and
+memory are unchanged and the run costs one extra `stat`. Filtering only ever removes
+entries, which is why the literal command-line prefilters remain valid superset gates
+and are left untouched. Global state is also applied centrally in `_add_finding`,
+which is the only place that sees every finding and therefore the only way to cover
+detections written as imperative engine code; a shared legacy id is suppressed there
+only once every rule that can emit it is disabled.
+
+`sigma_compile.py` parses analyst rules with pySigma and compiles the condition tree
+into nested closures. There is no `eval`, no `exec`, and no generated source. pySigma
+resolves value modifiers before compilation, so `contains`, `all`, `base64offset` and
+`windash` arrive as ordinary string or expansion values. Constructs this build cannot
+execute are refused by name at save time rather than stored as a rule that silently
+never matches. Compilation also derives the literal strings a subject must contain
+for the rule to have any chance of matching; those become a prefilter gate, and a
+rule with no derivable literal is counted against a hard cap because it must be
+evaluated against every process and event.
+
+`safe_regex.py` bounds analyst-supplied regular expressions. The verdict is measured
+against adversarial subjects derived from the pattern itself rather than inferred
+syntactically, so ordinary patterns pass while catastrophically backtracking ones are
+rejected, and matching is capped by subject length.
+
+The two mechanisms are deliberately different, and the distinction is what the Rules
+page communicates: a globally disabled rule is removed before the run and produces
+nothing, while a per-case disabled rule still produces its finding and demotes it to
+`info` reversibly.
+
 `app/detect/manual.py` implements durable analyst-created findings:
 
 - intent is stored as JSON in `case_meta`, then materialized as `Finding` rows;
@@ -526,6 +573,7 @@ Model output remains advisory and never replaces raw evidence.
 | `cases_router` | Case CRUD, uploads, evidence, events, timeline/facets, findings, manual findings, detection rebuild, ATT&CK matrix, entity graph/dossiers, process and memory exploration. |
 | `analysis_router` | AI analysis start/progress, reports, chat history/streaming, entity investigation streaming. |
 | `settings_router` | Provider/model configuration, keyring operations, model discovery/testing, general settings. |
+| `rules_router` | Detection-rule catalog, enable/disable and severity overrides, custom Sigma rule CRUD, validation, fork, import/export. |
 
 | WebSocket | Purpose |
 | --- | --- |

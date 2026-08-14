@@ -5,6 +5,35 @@ migration, and verification details live in `docs/releases/`.
 
 ## Unreleased
 
+### Added
+
+- A **Rules** page (top-level, between Reverse and Settings) lists every detection
+  rule the engine runs — 324 built-in rules catalogued from the detection tables,
+  plus any custom rules — and lets each one be enabled or disabled, with a
+  severity override on built-ins. Changes apply to new analyses; rebuild a case's
+  detections to apply them to existing findings.
+- Custom detection rules can be written in Sigma, through a GUI form or a YAML
+  editor, validated before saving, and imported or exported as Sigma bundles.
+  Rules are parsed with pySigma so public Sigma rules can be used as written, and
+  are compiled to in-memory matchers rather than evaluated as generated code.
+- Built-in rules can be forked into an editable Sigma approximation, which
+  disables the original and states plainly that the fork is an approximation to
+  review. Stateful correlation and threshold detections are marked as not
+  forkable rather than silently producing a rule that cannot express them.
+- Global rule state is stored in a new versioned database at
+  `~/.investigator/rules/rules.db`. Back it up with the rest of `~/.investigator/`;
+  see `docs/MIGRATIONS.md`.
+
+### Changed
+
+- Disabling a detection rule globally now removes it from the rule set before a
+  run, so it costs nothing instead of producing a finding that is demoted
+  afterwards. The existing per-case rule suppression is unchanged and still
+  demotes findings reversibly.
+- Analyst-supplied regular expressions in rules are bounded: a pattern is
+  measured against adversarial input and rejected if it backtracks
+  catastrophically, and matching is capped by subject length.
+
 ### Fixed
 
 - Updated the locked `cryptography`, `pyasn1`, React Router, PostCSS, and Nano ID
