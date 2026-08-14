@@ -157,10 +157,26 @@ class ReverseSandboxManager:
                     time.sleep(0.05)
                 else:
                     raise SandboxUnavailable("Reverse sandbox did not become ready")
+                protocol = container.exec_run(
+                    ["reverse-stage", "protocol-version"],
+                    user="reverse",
+                    workdir="/workspace",
+                )
+                protocol_output = protocol.output
+                if isinstance(protocol_output, tuple):
+                    protocol_output = protocol_output[0]
+                protocol_version = (protocol_output or b"").decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                if protocol.exit_code != 0 or protocol_version != "2":
+                    raise SandboxUnavailable(
+                        "Reverse sandbox image is outdated or incompatible; "
+                        "rebuild investigator-reverse:latest"
+                    )
                 prepared = container.exec_run(
                     [
-                        "mkdir", "-p", "/workspace/inputs", "/workspace/output",
-                        "/workspace/tools",
+                        "mkdir", "-p", "/workspace/inputs", "/workspace/context",
+                        "/workspace/output", "/workspace/tools",
                     ],
                     user="reverse",
                     workdir="/workspace",
@@ -169,7 +185,7 @@ class ReverseSandboxManager:
                     raise SandboxUnavailable("Reverse sandbox workspace could not be prepared")
                 self._copy_inputs(container, project_id)
                 sealed_inputs = container.exec_run(
-                    ["chmod", "0500", "/workspace/inputs"],
+                    ["chmod", "0500", "/workspace/inputs", "/workspace/context"],
                     user="reverse",
                     workdir="/workspace",
                 )
@@ -189,13 +205,13 @@ class ReverseSandboxManager:
 
     def _copy_inputs(self, container, project_id: str) -> None:
         with get_reverse_session() as db:
-            artifacts = list(
-                db.query(ReverseArtifact).filter(
-                    ReverseArtifact.project_id == project_id,
-                    ReverseArtifact.artifact_type == "upload",
-                )
-            )
+            artifacts = list(db.query(ReverseArtifact).filter(
+                ReverseArtifact.project_id == project_id,
+                ReverseArtifact.artifact_type.in_(("upload", "context")),
+            ).order_by(ReverseArtifact.created_at, ReverseArtifact.id))
         for artifact in artifacts:
+            namespace = "context" if artifact.artifact_type == "context" else "inputs"
+            sandbox_name = artifact.name if namespace == "context" else artifact.id
             source = contained_project_path(project_id, artifact.relative_path, must_exist=True)
             digest = hashlib.sha256()
             offset = 0
@@ -204,7 +220,10 @@ class ReverseSandboxManager:
                     digest.update(chunk)
                     encoded = base64.urlsafe_b64encode(chunk).decode()
                     result = container.exec_run(
-                        ["reverse-stage", "write", artifact.id, str(offset), encoded],
+                        [
+                            "reverse-stage", "write", namespace, sandbox_name,
+                            str(offset), encoded,
+                        ],
                         user="reverse",
                         workdir="/workspace",
                     )
@@ -215,7 +234,7 @@ class ReverseSandboxManager:
                 raise SandboxUnavailable(f"Stored artifact {artifact.id} failed host integrity checks")
             sealed = container.exec_run(
                 [
-                    "reverse-stage", "seal", artifact.id,
+                    "reverse-stage", "seal", namespace, sandbox_name,
                     str(artifact.file_size), artifact.sha256,
                 ],
                 user="reverse",

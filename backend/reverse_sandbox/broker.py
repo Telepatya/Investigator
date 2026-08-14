@@ -28,6 +28,77 @@ MAX_WRITE_BYTES = 1_000_000
 MAX_BROKER_OUTPUT = 2_000_000
 
 
+def json_structured_summary(stdout: bytes, executable: str) -> dict | None:
+    """Preserve routing-critical MiniDump facts when human-readable JSON is bounded."""
+    try:
+        payload = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or not payload.get("success"):
+        return None
+    if executable == "pyinstaller-inspect":
+        entries = payload.get("entries") if isinstance(payload.get("entries"), list) else []
+        return {
+            key: payload.get(key)
+            for key in (
+                "success", "format", "file_size", "sha256", "cookie_offset",
+                "cookie_size", "cookie_end", "package_length", "package_base",
+                "toc_offset", "toc_length", "python_version", "runtime_python",
+                "bytecode_runtime_compatible", "invariants", "warnings", "extraction",
+            )
+        } | {"entries": entries[:512], "entry_count": len(entries)}
+    if executable != "minidump-info":
+        return None
+    modules = payload.get("modules") if isinstance(payload.get("modules"), list) else []
+    ranges = (
+        payload.get("memory_ranges")
+        if isinstance(payload.get("memory_ranges"), list)
+        else []
+    )
+    candidates = (
+        payload.get("embedded_pe_candidates")
+        if isinstance(payload.get("embedded_pe_candidates"), list)
+        else []
+    )
+    protections: dict[str, int] = {}
+    relevant_ranges = []
+    for item in ranges:
+        if not isinstance(item, dict):
+            continue
+        protection = str(item.get("protection") or "unknown")
+        protections[protection] = protections.get(protection, 0) + 1
+        if "EXECUTE" in protection.upper() or item.get("type") == 0x20000:
+            relevant_ranges.append({
+                key: item.get(key)
+                for key in ("start", "start_hex", "end", "size", "protection", "state", "type")
+            })
+    return {
+        "success": True,
+        "format": payload.get("format"),
+        "stream_count": payload.get("stream_count"),
+        "streams": payload.get("streams"),
+        "architecture": payload.get("architecture"),
+        "flags": payload.get("flags"),
+        "modules": [{
+            key: item.get(key)
+            for key in ("index", "base", "base_hex", "size", "name")
+        } for item in modules if isinstance(item, dict)],
+        "threads": payload.get("threads"),
+        "memory_range_count": len(ranges),
+        "memory_protection_counts": protections,
+        "relevant_memory_ranges": relevant_ranges[:128],
+        "embedded_pe_candidates": [{
+            key: item.get(key)
+            for key in (
+                "index", "base", "base_hex", "image_size", "entry_point",
+                "entry_rva", "bitness", "listed_module", "private", "protection",
+            )
+        } for item in candidates if isinstance(item, dict)],
+        "missing_backing_ranges": payload.get("missing_backing_ranges"),
+        "analysis_blocked": payload.get("analysis_blocked"),
+    }
+
+
 def fail(message: str, code: int = 2) -> None:
     print(json.dumps({"success": False, "error": message[:4000]}))
     raise SystemExit(code)
@@ -100,7 +171,7 @@ def run_cmd(request: dict) -> dict:
             "error": f"Command timed out after {timeout} seconds",
             "duration": time.monotonic() - started,
         }
-    return {
+    result = {
         "success": completed.returncode == 0,
         "stdout": completed.stdout[:MAX_BROKER_OUTPUT].decode("utf-8", errors="replace"),
         "stderr": completed.stderr[:MAX_BROKER_OUTPUT].decode("utf-8", errors="replace"),
@@ -111,6 +182,11 @@ def run_cmd(request: dict) -> dict:
             len(completed.stdout) > MAX_BROKER_OUTPUT or len(completed.stderr) > MAX_BROKER_OUTPUT
         ),
     }
+    if executable in {"minidump-info", "pyinstaller-inspect"} and completed.returncode == 0:
+        summary = json_structured_summary(completed.stdout, executable)
+        if summary is not None:
+            result["structured_summary"] = summary
+    return result
 
 
 def read_file(request: dict) -> dict:
@@ -184,6 +260,8 @@ def list_dir(request: dict) -> dict:
 
 
 def versions() -> None:
+    from importlib.metadata import PackageNotFoundError, version
+
     commands = {
         "python": ["/usr/bin/python3", "--version"],
         "file": ["/usr/bin/file", "--version"],
@@ -201,6 +279,16 @@ def versions() -> None:
             result[name] = lines[0][:200] if lines else "unknown"
         except Exception:
             result[name] = "unavailable"
+    for package in (
+        "lief", "capstone", "flare-capa", "flare-floss", "dnfile", "dncil", "pyelftools", "xdis"
+    ):
+        try:
+            result[package] = version(package)
+        except PackageNotFoundError:
+            result[package] = "unavailable"
+    result["minidump-info"] = "investigator-v1"
+    result["minidump-extract"] = "investigator-v1"
+    result["pyinstaller-inspect"] = "investigator-v1"
     print(json.dumps(result, sort_keys=True))
 
 

@@ -11,11 +11,13 @@ import sys
 from pathlib import Path
 
 INPUTS = Path("/workspace/inputs")
+CONTEXT = Path("/workspace/context")
 ARTIFACT_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.I,
 )
 MAX_CHUNK = 48 * 1024
+PROTOCOL_VERSION = "2"
 
 
 def fail(message: str) -> None:
@@ -23,11 +25,21 @@ def fail(message: str) -> None:
     raise SystemExit(2)
 
 
-def target_for(artifact_id: str) -> Path:
-    if not ARTIFACT_RE.fullmatch(artifact_id):
-        fail("Invalid artifact id")
-    root = INPUTS.resolve(strict=True)
-    target = root / artifact_id
+CONTEXT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def target_for(namespace: str, name: str) -> Path:
+    if namespace == "inputs":
+        if not ARTIFACT_RE.fullmatch(name):
+            fail("Invalid artifact id")
+        root = INPUTS.resolve(strict=True)
+    elif namespace == "context":
+        if not CONTEXT_NAME_RE.fullmatch(name):
+            fail("Invalid context filename")
+        root = CONTEXT.resolve(strict=True)
+    else:
+        fail("Invalid staging namespace")
+    target = root / name
     try:
         target.resolve(strict=False).relative_to(root)
     except ValueError:
@@ -37,8 +49,8 @@ def target_for(artifact_id: str) -> Path:
     return target
 
 
-def write_chunk(artifact_id: str, offset_text: str, encoded: str) -> None:
-    target = target_for(artifact_id)
+def write_chunk(namespace: str, name: str, offset_text: str, encoded: str) -> None:
+    target = target_for(namespace, name)
     try:
         offset = int(offset_text)
         chunk = base64.b64decode(encoded, altchars=b"-_", validate=True)
@@ -59,8 +71,8 @@ def write_chunk(artifact_id: str, offset_text: str, encoded: str) -> None:
         os.close(descriptor)
 
 
-def seal(artifact_id: str, size_text: str, expected_sha256: str) -> None:
-    target = target_for(artifact_id)
+def seal(namespace: str, name: str, size_text: str, expected_sha256: str) -> None:
+    target = target_for(namespace, name)
     try:
         expected_size = int(size_text)
     except ValueError:
@@ -79,11 +91,14 @@ def seal(artifact_id: str, size_text: str, expected_sha256: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) == 5 and sys.argv[1] == "write":
-        write_chunk(sys.argv[2], sys.argv[3], sys.argv[4])
+    if len(sys.argv) == 2 and sys.argv[1] == "protocol-version":
+        print(PROTOCOL_VERSION)
         return
-    if len(sys.argv) == 5 and sys.argv[1] == "seal":
-        seal(sys.argv[2], sys.argv[3], sys.argv[4])
+    if len(sys.argv) == 6 and sys.argv[1] == "write":
+        write_chunk(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        return
+    if len(sys.argv) == 6 and sys.argv[1] == "seal":
+        seal(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
         return
     fail("Invalid staging request")
 

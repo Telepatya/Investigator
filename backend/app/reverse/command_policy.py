@@ -9,6 +9,7 @@ from typing import Any
 
 WORKSPACE = "/workspace"
 INPUTS = "/workspace/inputs"
+CONTEXT = "/workspace/context"
 OUTPUT = "/workspace/output"
 TOOLS = "/workspace/tools"
 
@@ -56,11 +57,21 @@ EXECUTABLE_PATHS: dict[str, str] = {
     "objdump": "/usr/bin/objdump",
     "nm": "/usr/bin/nm",
     "pecheck": "/usr/local/bin/pecheck",
+    "pedisasm": "/usr/local/bin/pedisasm",
+    "minidump-info": "/usr/local/bin/minidump-info",
+    "minidump-extract": "/usr/local/bin/minidump-extract",
+    "dotnet-inspect": "/usr/local/bin/dotnet-inspect",
+    "elf-inspect": "/usr/local/bin/elf-inspect",
+    "lief-info": "/usr/local/bin/lief-info",
+    "pyinstaller-inspect": "/usr/local/bin/pyinstaller-inspect",
+    "capa": "/usr/local/bin/capa",
+    "floss": "/usr/local/bin/floss",
     "yara": "/usr/bin/yara",
 }
 
 MUTATING_EXECUTABLES = {
     "mkdir", "mv", "chmod", "rm", "binwalk", "7z", "7za", "p7zip", "unzip", "unrar", "upx",
+    "minidump-extract", "pyinstaller-inspect",
 }
 BLOCKED_TEXT = ("/proc/", "/sys/", "/dev/", "/etc/", "../", "..\\")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -79,6 +90,14 @@ def normalize_workspace_path(value: str, cwd: str = WORKSPACE) -> str:
 def _mutation_targets(executable: str, args: list[str], cwd: str) -> list[str]:
     targets: list[str] = []
     output_next = False
+    if executable in {"minidump-extract", "pyinstaller-inspect"}:
+        for index, arg in enumerate(args[:-1]):
+            if arg == "--output":
+                return [normalize_workspace_path(args[index + 1], cwd)]
+        for arg in args:
+            if arg.startswith("--output="):
+                return [normalize_workspace_path(arg.split("=", 1)[1], cwd)]
+        return []
     for index, arg in enumerate(args):
         if output_next:
             targets.append(arg)
@@ -129,6 +148,8 @@ def validate_run_command(cmd: list[str], cwd: str = WORKSPACE) -> tuple[bool, st
                 normalize_workspace_path(arg, normalized_cwd)
             except ValueError as exc:
                 return False, str(exc)
+    if executable in {"capa", "floss"} and any("://" in arg for arg in cmd[1:]):
+        return False, "Static malware tools accept only local workspace inputs; URLs are denied"
     if executable == "find" and any(
         arg in {"-exec", "-execdir", "-ok", "-okdir", "-delete"} for arg in cmd[1:]
     ):
@@ -151,8 +172,11 @@ def validate_run_command(cmd: list[str], cwd: str = WORKSPACE) -> tuple[bool, st
             if not (script.startswith(OUTPUT + "/") or script.startswith(TOOLS + "/")):
                 return False, "Python may execute only model-authored helpers under output/tools"
     if executable in MUTATING_EXECUTABLES:
-        if normalized_cwd == INPUTS or normalized_cwd.startswith(INPUTS + "/"):
-            return False, "Mutating commands cannot use the sealed input directory as cwd"
+        if (
+            normalized_cwd == INPUTS or normalized_cwd.startswith(INPUTS + "/")
+            or normalized_cwd == CONTEXT or normalized_cwd.startswith(CONTEXT + "/")
+        ):
+            return False, "Mutating commands cannot use sealed input/context directories as cwd"
         if executable in {"7z", "7za", "p7zip", "unrar"}:
             operation = next((arg for arg in cmd[1:] if not arg.startswith("-")), "")
             if operation not in {"e", "l", "t", "x"}:
@@ -163,8 +187,12 @@ def validate_run_command(cmd: list[str], cwd: str = WORKSPACE) -> tuple[bool, st
             targets = _mutation_targets(executable, cmd[1:], normalized_cwd)
         except ValueError as exc:
             return False, str(exc)
-        if any(path == INPUTS or path.startswith(INPUTS + "/") for path in targets):
-            return False, "Commands cannot mutate sealed input artifacts"
+        if any(
+            path == INPUTS or path.startswith(INPUTS + "/")
+            or path == CONTEXT or path.startswith(CONTEXT + "/")
+            for path in targets
+        ):
+            return False, "Commands cannot mutate sealed input/context artifacts"
         if executable == "upx" and "-d" in cmd[1:] and not any(
             arg.startswith("-o") for arg in cmd[1:]
         ):

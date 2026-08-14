@@ -180,15 +180,23 @@ boundary than ordinary case evidence:
   for identification, unpacking/deobfuscation, static analysis, behavioral
   indicators, evidence correlation, and comprehensive malicious-sample reporting,
   but the host imposes no fixed file-format checklist or report schema. Exact
-  duplicate operations and three consecutive no-progress turns stop churn.
+  duplicate operations are blocked. Semantic retry state and normalized failure
+  fingerprints activate a diagnostic pivot after two matching failures or three
+  operations without novel evidence; only the stalled method is paused, and an
+  independent bounds/header/size/hash/runtime check clears the pivot.
 - Follow-up Reverse chat uses the same guarded four-operation tool loop for up to
   12 turns. Its tool requests and result hashes are added to audit/provenance
   history; it does not gain a broader command or Python policy than analysis.
-- Reports receive a separate IOC-enumeration LLM pass, then an
-  independent flow/evidence verifier before signing. The verifier never rewrites,
-  shortens, or template-normalizes the report; it only records pass or needs-review
-  state. A provider/verifier outage leaves
-  a clearly marked, retryable unverified report rather than a false verified state.
+- The fixed `pyinstaller-inspect` analyzer only parses bytes. It validates cookie,
+  package, TOC, entry, compression, and output-path invariants; selected bytecode is
+  decoded with `xdis` rather than imported or executed by the container runtime.
+- Reports receive a separate structured IOC-enumeration pass and an independent,
+  goal-driven evidence review. Material claims and IOCs cite stable tool-message
+  references, whose project-scoped API exposes the retained bounded output and
+  hash without broadening sandbox access. The reviewer can request targeted
+  analysis or a report-only revision, but cannot introduce evidence. Review is
+  capped at two passes and records passed, passed-with-warnings, or failed status
+  independently of the complete, partial, or blocked analysis outcome.
 - Remote LLM providers may receive bounded strings, headers, hashes, report text,
   and tool output from Reverse artifacts. The same evidence-leaves-the-machine
   warning and global provider choice shown in Settings applies.
@@ -196,9 +204,10 @@ boundary than ordinary case evidence:
   artifact hashes, and a tamper-evident provenance chain. The per-install signing
   private key is generated into the OS credential vault and is never packaged.
   New installations use a compact Ed25519 key that fits Windows Credential
-  Manager; existing RSA keys remain readable. Report bytes are committed before
-  signing, so a vault outage leaves a completed report with an explicit,
-  retryable signature state rather than failing the analysis. Signed events
+  Manager; existing RSA keys remain readable. Exact report bytes are committed
+  and signed regardless of outcome or review warnings, so a vault outage leaves
+  a published report with an explicit, retryable signature state rather than
+  failing the analysis. Signed events
   retain the public key and fingerprint needed for independent verification.
 - Model-authored Python is untrusted code, not an additional trusted analyzer.
   The model writes reviewable helpers below `/workspace/output` or

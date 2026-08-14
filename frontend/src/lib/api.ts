@@ -147,6 +147,11 @@ export const api = {
   },
   getEntityDossier: (id: string, entityId: string, signal?: AbortSignal) =>
     req<EntityDossier>(`/cases/${id}/entity-dossier?entity_id=${encodeURIComponent(entityId)}`, { signal }),
+  sendMemoryProcessToReverse: (caseId: string, sessionId: string, pid: number) =>
+    req<import("./types").ReverseProcessHandoff>(
+      `/cases/${caseId}/memory/${encodeURIComponent(sessionId)}/processes/${pid}/reverse`,
+      { method: "POST" },
+    ),
 
   // Evidence
   listEvidence: (id: string) => req<{ files: EvidenceFile[] }>(`/cases/${id}/evidence`),
@@ -277,6 +282,8 @@ export const api = {
     req<{ ok: boolean }>(`/reverse/projects/${id}/analysis/stop`, { method: "POST" }),
   resumeReverseAnalysis: (id: string) =>
     req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/resume`, { method: "POST" }),
+  continueReverseInvestigation: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/continue`, { method: "POST" }),
   decideReverseExtension: (id: string, decision: "approve" | "deny") =>
     req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/turn-extension/${decision}`, { method: "POST" }),
   replayReverseAnalysis: (id: string) =>
@@ -289,6 +296,10 @@ export const api = {
     req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/sign`, { method: "POST" }),
   retryReverseReportVerification: (id: string) =>
     req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/verify`, { method: "POST" }),
+  reviewReverseReport: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/review`, { method: "POST" }),
+  getReverseEvidence: (id: string, messageId: number) =>
+    req<import("./types").ReverseEvidence>(`/reverse/projects/${id}/evidence/${messageId}`),
   recoverReverseReport: (id: string) =>
     req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/recover`, { method: "POST" }),
   getReverseMessages: (id: string) =>

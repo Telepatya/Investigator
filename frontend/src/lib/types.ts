@@ -178,6 +178,7 @@ export interface EntityEdge {
   id: string;
   source: string;
   target: string;
+  assumption?: string;
   verb: string;
   severity: Severity;
   count: number;
@@ -365,6 +366,7 @@ export interface ReverseProject {
   updated_at: string;
   artifact_count: number;
   latest_run_status: string | null;
+  analysis_note: string | null;
 }
 
 export interface ReverseArtifact {
@@ -375,7 +377,20 @@ export interface ReverseArtifact {
   content_type: string;
   file_size: number;
   sha256: string;
+  source_case_id: string | null;
+  source_session_id: string | null;
+  source_pid: number | null;
+  source_process_name: string | null;
+  source_vfs_path: string | null;
+  source_kind: string | null;
+  source_hashes: Record<string, string> | null;
   created_at: string;
+}
+
+export interface ReverseProcessHandoff {
+  project_id: string;
+  status: "ready";
+  artifact_ids: string[];
 }
 
 export interface ReverseRun {
@@ -389,6 +404,8 @@ export interface ReverseRun {
   max_turns: number;
   turns_used: number;
   awaiting_reason: string | null;
+  analysis_outcome: "complete" | "partial" | "blocked" | "legacy" | null;
+  analysis_state: ReverseAnalysisState;
   error: string | null;
   image_digest: string | null;
   tool_versions: Record<string, string>;
@@ -397,6 +414,9 @@ export interface ReverseRun {
   report_verification_status: string;
   report_verification_summary: string | null;
   report_verification_error: string | null;
+  report_review_status: string;
+  report_review_passes: number;
+  report_review_details: Record<string, unknown>;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -409,6 +429,7 @@ export interface ReverseStatus {
   active: boolean;
   can_resume: boolean;
   can_recover_report: boolean;
+  can_continue_investigation: boolean;
 }
 
 export interface ReverseReport {
@@ -416,12 +437,96 @@ export interface ReverseReport {
   run_id: string;
   content: string;
   iocs: string | null;
+  structured_iocs: ReverseIoc[];
+  analysis_outcome: "complete" | "partial" | "blocked" | "legacy" | null;
+  analysis_state: ReverseAnalysisState;
   signature_status: string;
   signature_error: string | null;
   verification_status: string;
   verification_summary: string | null;
   verification_error: string | null;
   verification_details: Record<string, unknown>;
+  review_status: string;
+  review_passes: number;
+  review_history: Record<string, unknown>[];
+}
+
+export interface ReverseCoverageItem {
+  id?: string;
+  objective?: string;
+  text?: string;
+  status: string;
+  summary?: string;
+  confidence?: string;
+  evidence_ids?: number[];
+}
+
+export interface ReverseAnalysisState {
+  version?: number;
+  objectives?: ReverseCoverageItem[];
+  coverage?: ReverseCoverageItem[];
+  findings?: Record<string, unknown>[];
+  unresolved_items?: string[];
+  next_steps?: string[];
+  review_summary?: string;
+  latest_checkpoint_markdown?: string;
+  latest_checkpoint_turn?: number;
+  progress_controller?: ReverseProgressController;
+}
+
+export interface ReverseProgressAttempt {
+  trace_id: number;
+  family: string;
+  semantic_key: string;
+  target: string;
+  success: boolean;
+  failure_fingerprint?: string | null;
+  evidence_hash?: string | null;
+  novel_evidence: boolean;
+}
+
+export interface ReverseProgressController {
+  version: number;
+  no_evidence_streak: number;
+  diagnostic: {
+    active: boolean;
+    family?: string;
+    semantic_key?: string;
+    failure_fingerprint?: string | null;
+    trigger?: string;
+    required_pivot?: string;
+    activated_at_trace?: number;
+    cleared_at_trace?: number;
+  };
+  attempts: ReverseProgressAttempt[];
+}
+
+export interface ReverseIoc {
+  type: string;
+  value: string;
+  confidence: string;
+  evidence_ids: number[];
+}
+
+export interface ReverseEvidence {
+  id: number;
+  project_id: string;
+  run_id: string;
+  tool: string | null;
+  target: unknown;
+  success: boolean | null;
+  returncode: number | null;
+  stdout: string;
+  stderr: string;
+  error: string | null;
+  output_truncated: boolean;
+  stdout_original_length: number | null;
+  stdout_returned_length: number | null;
+  stderr_original_length: number | null;
+  stderr_returned_length: number | null;
+  output_note: string | null;
+  output_sha256: string;
+  created_at: string;
 }
 
 export interface ReverseTraceEntry {

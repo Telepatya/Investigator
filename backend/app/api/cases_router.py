@@ -39,6 +39,8 @@ from app.memory.explorer import (
     list_process_modules,
     list_vfs,
 )
+from app.reverse.handoff import ProcessHandoffError, handoff_process_to_reverse
+from app.reverse.schemas import ReverseProcessHandoffResponse
 from app.models.schemas import CaseCreate
 from app.store import cases as case_store
 from app.store.database import Event, Finding, MemoryResult
@@ -1003,6 +1005,25 @@ def download_memory_process(case_id: str, session_id: str, pid: int, kind: str =
         return _memory_file_response(validated_case_id, local)
     except MemoryExplorerError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@router.post(
+    "/{case_id}/memory/{session_id}/processes/{pid}/reverse",
+    response_model=ReverseProcessHandoffResponse,
+)
+def send_memory_process_to_reverse(
+    case_id: str, session_id: str, pid: int
+) -> ReverseProcessHandoffResponse:
+    validated_case_id = _validated_case_id(case_id)
+    validated_session_id = _validated_memory_session_id(session_id)
+    try:
+        return ReverseProcessHandoffResponse.model_validate(
+            handoff_process_to_reverse(validated_case_id, validated_session_id, pid)
+        )
+    except MemoryExplorerError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    except ProcessHandoffError as exc:
+        raise HTTPException(500, str(exc)) from exc
 
 
 @router.get("/{case_id}/memory/{session_id}/processes/{pid}/modules/download")

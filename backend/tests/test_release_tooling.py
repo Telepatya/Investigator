@@ -39,7 +39,9 @@ class ReleaseToolingTests(unittest.TestCase):
             data = json.loads(first.read_text(encoding="utf-8"))
             self.assertEqual(data["bomFormat"], "CycloneDX")
             purls = {component["purl"] for component in data["components"]}
+            self.assertEqual(len(purls), len(data["components"]))
             self.assertTrue(any(purl.startswith("pkg:pypi/fastapi@") for purl in purls))
+            self.assertTrue(any(purl.startswith("pkg:pypi/lief@") for purl in purls))
             self.assertTrue(any(purl.startswith("pkg:npm/react@") for purl in purls))
             self.assertTrue(any(purl.startswith("pkg:docker/ubuntu@22.04") for purl in purls))
             self.assertTrue(any(

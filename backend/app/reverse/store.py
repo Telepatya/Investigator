@@ -60,7 +60,7 @@ def project_dir(project_id: str) -> Path:
 
 def ensure_project_dirs(project_id: str) -> Path:
     root = project_dir(project_id)
-    for name in ("uploads", "outputs", "logs", "staging"):
+    for name in ("uploads", "context", "outputs", "logs", "staging"):
         (root / name).mkdir(parents=True, exist_ok=True)
     return root
 
@@ -141,7 +141,106 @@ def project_response(project: ReverseProject, artifact_count: int = 0, latest_ru
         "updated_at": project.updated_at,
         "artifact_count": artifact_count,
         "latest_run_status": latest_run_status,
+        "analysis_note": project.analysis_note,
     }
+
+
+def import_artifact(
+    project_id: str,
+    source: Path,
+    *,
+    name: str,
+    artifact_type: str,
+    content_type: str,
+    source_metadata: dict[str, Any] | None = None,
+) -> ReverseArtifact:
+    """Atomically import a trusted local file and record bounded source provenance."""
+    project_id = validate_project_id(project_id)
+    safe_name = safe_filename(name)
+    source = source.resolve(strict=True)
+    if not source.is_file():
+        raise ValueError("Artifact source is not a regular file")
+    if artifact_type not in {"upload", "context"}:
+        raise ValueError("Unsupported imported artifact type")
+    cfg = load_config().reverse
+    size = source.stat().st_size
+    if size <= 0:
+        raise ValueError("Artifact source is empty")
+    if size > cfg.max_upload_bytes:
+        raise ValueError("Artifact exceeds the Reverse per-file limit")
+    artifact_id = str(uuid.uuid4())
+    directory = "context" if artifact_type == "context" else "uploads"
+    relative = f"{directory}/{artifact_id}"
+    target = contained_project_path(project_id, relative)
+    staging = contained_project_path(
+        project_id, f"staging/{UPLOAD_STAGING_PREFIX}{uuid.uuid4().hex}"
+    )
+    digest = hashlib.sha256()
+    metadata = source_metadata or {}
+    try:
+        with source.open("rb") as src, staging.open("xb") as dst:
+            while chunk := src.read(4 * 1024 * 1024):
+                digest.update(chunk)
+                dst.write(chunk)
+        with get_reverse_session() as db:
+            project = db.get(ReverseProject, project_id)
+            if not project:
+                raise KeyError(project_id)
+            current_bytes = db.scalar(
+                select(func.coalesce(func.sum(ReverseArtifact.file_size), 0)).where(
+                    ReverseArtifact.project_id == project_id
+                )
+            ) or 0
+            if int(current_bytes) + size > cfg.max_project_bytes:
+                raise ValueError("Artifacts exceed the Reverse project size limit")
+        os.replace(staging, target)
+        row = ReverseArtifact(
+            id=artifact_id,
+            project_id=project_id,
+            name=safe_name,
+            relative_path=relative,
+            artifact_type=artifact_type,
+            content_type=content_type,
+            file_size=size,
+            sha256=digest.hexdigest(),
+            source_case_id=metadata.get("case_id"),
+            source_session_id=metadata.get("session_id"),
+            source_pid=metadata.get("pid"),
+            source_process_name=metadata.get("process_name"),
+            source_vfs_path=metadata.get("vfs_path"),
+            source_kind=metadata.get("source_kind"),
+            source_hashes=metadata.get("hashes"),
+        )
+        with get_reverse_session() as db:
+            db.add(row)
+            project = db.get(ReverseProject, project_id)
+            if project:
+                project.updated_at = now()
+            evidence = {
+                "artifact_id": artifact_id,
+                "name": safe_name,
+                "artifact_type": artifact_type,
+                "size": size,
+                "sha256": row.sha256,
+                "source": {
+                    "case_id": row.source_case_id,
+                    "session_id": row.source_session_id,
+                    "pid": row.source_pid,
+                    "process_name": row.source_process_name,
+                    "vfs_path": row.source_vfs_path,
+                    "kind": row.source_kind,
+                    "hashes": row.source_hashes,
+                },
+            }
+            add_audit(project_id, "artifact.imported", evidence, db=db)
+            append_provenance(project_id, "artifact.imported", evidence, db=db)
+            db.commit()
+            db.refresh(row)
+        return row
+    except Exception:
+        staging.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        raise
 
 
 def update_project(project_id: str, **changes) -> ReverseProject:

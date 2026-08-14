@@ -137,8 +137,12 @@ clears that association and records an audit event but preserves Reverse work.
 Each analysis run snapshots the shared Investigator provider/model settings and
 the sandbox image digest/tool versions. The orchestration is an adaptive
 prompt-and-tool loop: one `run_cmd`, `read_file`, `write_file`,
-or `list_dir` operation per turn, completion/blocking signals, duplicate
-suppression, and a three-turn no-progress stop. Host and container share the same
+or `list_dir` operation per turn, optional completion/checkpoint signals, exact
+duplicate suppression, and an evidence-aware progress controller. The controller
+persists semantic method/target keys, normalized failure fingerprints, output
+novelty, and diagnostic state. A repeated failure or three no-evidence operations
+requires an independent invariant check before the same semantic method can run
+again. Host and container share the same
 argv/executable/path policy. Containers have no network or host
 mounts, run as a non-root user with all capabilities dropped, use a read-only root
 filesystem and bounded tmpfs, and are destroyed after the configured idle TTL.
@@ -148,26 +152,40 @@ The model may use `write_file` to create a Python parser/decoder below output or
 tools and invoke it through `run_cmd` with `python3`. The broker routes Python
 through a fixed audited runner that denies networking, child processes, native
 loading, root-filesystem access, and sample mutation.
+The fixed `pyinstaller-inspect` tool derives CArchive offsets from the cookie end,
+validates package/TOC/entry bounds and compression headers, reports embedded-versus-
+runtime Python compatibility, and can disassemble selected raw marshalled code with
+`xdis`. Its extraction output remains restricted to `/workspace/output`.
 
 Follow-up Reverse chat uses a 12-turn analyst loop and the same four
 operations, command policy, duplicate suppression, and evidence feedback. A chat
 answer can therefore inspect the sealed sample or create a bounded helper instead
 of relying only on the previously generated report.
 
-There is no host checklist or report-format gate. The analysis prompt directs
-the model to identify, unpack/deobfuscate, inspect structure and behavior, write
-custom helpers when useful, correlate claims with tool evidence, and explicitly
-finish or declare a concrete blocker. This preserves model judgment about which
-reverse-engineering avenues matter for the actual sample.
+There is no host checklist, artifact-specific completion gate, completion-marker
+requirement, or report-format gate. Each run persists objectives, supported
+findings, unresolved work, next steps, and the latest substantive draft. Turn
+extensions resume that state; declining an extension publishes the strongest
+saved draft as partial or blocked instead of replacing it with a limitations-only
+fallback. Manual Stop remains resumable.
+An `ANALYSIS CHECKPOINT` is persisted separately from the publication draft and
+returns to the tool loop, preventing useful interim prose from triggering an early
+review cycle.
+An analyst can also continue a completed partial, blocked, or warning-bearing run.
+The operation preserves the current report as a content-addressed output artifact,
+keeps it readable and signed during the resumed tool loop, and only replaces the
+published report when new bytes have completed review and signing.
 
-Finalization uses a permissive report generator and dedicated IOC
-enumeration prompt. A separate flow verifier records whether the report matches
-the tool trace but never rewrites the analyst output. The final text and verifier state are visible and durable;
-verifier failures are marked and retryable instead of being treated as success.
-Only then are exact UTF-8 report bytes atomically committed and signed with the
-compact per-install Ed25519 key. Signing failures remain retryable without
-rerunning the model; public verification material is retained with the signed
-provenance event.
+Finalization extracts structured IOCs and gives a goal-driven reviewer the full
+compact tool chronology, objective coverage, cited output, and relevant failure
+evidence. The reviewer chooses publish, report-only revision, or targeted
+continued analysis. Review is capped at two passes, and its passed,
+passed-with-warnings, or failed result is independent from the complete, partial,
+or blocked analysis outcome. Material claims use stable `[trace:<message-id>]`
+references that resolve through a project-scoped evidence API. Exact UTF-8 report
+bytes are atomically committed and signed regardless of outcome or remaining
+review warnings. A later revision invalidates the prior signature state and signs
+the revised bytes; signing failures remain retryable without rerunning analysis.
 
 ## Repository layout
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -129,6 +131,171 @@ class ReverseApiTests(unittest.TestCase):
         rejected = self.client.put(path, json={"enabled_tools": ["shell"]})
         self.assertEqual(rejected.status_code, 400, rejected.text)
         self.assertEqual(self.client.get(path).json()["enabled_tools"], ["run_cmd", "read_file"])
+
+    def test_process_reverse_handoff_endpoint_returns_ready_workspace(self) -> None:
+        case = self.client.post("/api/cases", json={"name": "memory", "description": ""}).json()
+        response_payload = {
+            "project_id": "11111111-1111-4111-8111-111111111111",
+            "status": "ready",
+            "artifact_ids": ["a", "b", "c", "d"],
+        }
+        with patch(
+            "app.api.cases_router.handoff_process_to_reverse", return_value=response_payload
+        ) as handoff:
+            response = self.client.post(
+                f"/api/cases/{case['id']}/memory/mem-dump/processes/2244/reverse"
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), response_payload)
+        handoff.assert_called_once_with(case["id"], "mem-dump", 2244)
+
+    def test_analysis_status_uses_terminal_run_as_authoritative_state(self) -> None:
+        from app.reverse.database import ReverseProject, ReverseRun, get_reverse_session
+
+        project = self.create_project()
+        run_id = str(uuid.uuid4())
+        with get_reverse_session() as db:
+            row = db.get(ReverseProject, project["id"])
+            row.status = "awaiting_turn_approval"
+            row.active_run_id = run_id
+            db.add(ReverseRun(
+                id=run_id,
+                project_id=project["id"],
+                status="completed",
+                provider="test",
+                model="test",
+                report_markdown="# Complete",
+            ))
+            db.commit()
+        response = self.client.get(
+            f"/api/reverse/projects/{project['id']}/analysis/status"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "completed")
+        self.assertEqual(response.json()["run"]["status"], "completed")
+
+    def test_trace_evidence_is_project_scoped_and_returns_retained_output(self) -> None:
+        from app.reverse.database import (
+            ReverseMessage,
+            ReverseRun,
+            get_reverse_session,
+        )
+
+        project = self.create_project()
+        other = self.create_project(name="other")
+        run_id = str(uuid.uuid4())
+        with get_reverse_session() as db:
+            db.add(ReverseRun(
+                id=run_id,
+                project_id=project["id"],
+                status="running",
+                provider="test",
+                model="test",
+            ))
+            message = ReverseMessage(
+                project_id=project["id"],
+                run_id=run_id,
+                phase="analysis",
+                role="tool",
+                content=json.dumps([{
+                    "success": True,
+                    "stdout": "PE32 executable",
+                    "stderr": "",
+                    "returncode": 0,
+                    "output_truncated": True,
+                }]),
+                metadata_json={"tool": "run_cmd", "target": ["file", "/workspace/input"]},
+            )
+            db.add(message)
+            failed = ReverseMessage(
+                project_id=project["id"],
+                run_id=run_id,
+                phase="analysis",
+                role="tool",
+                content=json.dumps([{
+                    "success": False,
+                    "stdout": "",
+                    "stderr": "unsupported format",
+                    "returncode": 2,
+                }]),
+                metadata_json={"tool": "run_cmd", "target": ["parser", "/workspace/input"]},
+            )
+            db.add(failed)
+            db.commit()
+            db.refresh(message)
+            db.refresh(failed)
+            message_id = message.id
+            failed_id = failed.id
+
+        response = self.client.get(
+            f"/api/reverse/projects/{project['id']}/evidence/{message_id}"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["stdout"], "PE32 executable")
+        self.assertTrue(response.json()["output_truncated"])
+        self.assertEqual(len(response.json()["output_sha256"]), 64)
+        failed_response = self.client.get(
+            f"/api/reverse/projects/{project['id']}/evidence/{failed_id}"
+        )
+        self.assertEqual(failed_response.status_code, 200, failed_response.text)
+        self.assertFalse(failed_response.json()["success"])
+        self.assertEqual(failed_response.json()["stderr"], "unsupported format")
+        missing = self.client.get(
+            f"/api/reverse/projects/{project['id']}/evidence/999999"
+        )
+        self.assertEqual(missing.status_code, 404)
+        cross_project = self.client.get(
+            f"/api/reverse/projects/{other['id']}/evidence/{message_id}"
+        )
+        self.assertEqual(cross_project.status_code, 404)
+
+    def test_legacy_review_values_are_normalized_and_history_is_exposed(self) -> None:
+        from app.reverse.database import (
+            ReverseMessage,
+            ReverseProject,
+            ReverseRun,
+            get_reverse_session,
+        )
+
+        project = self.create_project()
+        run_id = str(uuid.uuid4())
+        with get_reverse_session() as db:
+            project_row = db.get(ReverseProject, project["id"])
+            project_row.status = "completed"
+            project_row.active_run_id = run_id
+            db.add(ReverseRun(
+                id=run_id,
+                project_id=project["id"],
+                status="completed",
+                provider="test",
+                model="test",
+                report_markdown="# Historical report",
+                report_verification_status="needs_review",
+            ))
+            db.add(ReverseMessage(
+                project_id=project["id"],
+                run_id=run_id,
+                phase="verification",
+                role="assistant",
+                content="Legacy warning",
+                metadata_json={"status": "revise", "pass_number": 1},
+            ))
+            db.commit()
+
+        status = self.client.get(
+            f"/api/reverse/projects/{project['id']}/analysis/status"
+        )
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(
+            status.json()["run"]["report_verification_status"],
+            "passed_with_warnings",
+        )
+        self.assertEqual(status.json()["run"]["analysis_outcome"], "legacy")
+        self.assertTrue(status.json()["can_continue_investigation"])
+        report = self.client.get(f"/api/reverse/projects/{project['id']}/report")
+        self.assertEqual(report.status_code, 200, report.text)
+        self.assertEqual(report.json()["verification_status"], "passed_with_warnings")
+        self.assertEqual(report.json()["review_history"][0]["pass_number"], 1)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ from sqlalchemy import delete, func, select
 
 from app.config import UPLOAD_STAGING_PREFIX, load_config
 
-from .analysis import ACTIVE_STATUSES, analysis_manager
+from .analysis import ACTIVE_STATUSES, analysis_manager, can_continue_investigation
 from .database import (
     ReverseArtifact,
     ReverseAuditEvent,
@@ -34,6 +34,7 @@ from .schemas import (
     ReverseArtifactResponse,
     ReverseChatMessage,
     ReverseChatRequest,
+    ReverseEvidenceResponse,
     ReverseProjectCreate,
     ReverseProjectResponse,
     ReverseProjectUpdate,
@@ -85,14 +86,19 @@ def _run_response(run: ReverseRun) -> ReverseRunResponse:
         max_turns=run.max_turns,
         turns_used=run.turns_used,
         awaiting_reason=run.awaiting_reason,
+        analysis_outcome=run.analysis_outcome or ("legacy" if run.report_markdown else None),
+        analysis_state=run.analysis_state or {},
         error=run.error,
         image_digest=run.image_digest,
         tool_versions=run.tool_versions or {},
         report_signature_status=run.report_signature_status,
         report_signature_error=run.report_signature_error,
-        report_verification_status=run.report_verification_status,
+        report_verification_status=_review_status(run.report_verification_status),
         report_verification_summary=run.report_verification_summary,
         report_verification_error=run.report_verification_error,
+        report_review_status=_review_status(run.report_verification_status),
+        report_review_passes=run.report_review_passes or 0,
+        report_review_details=run.report_verification_details or {},
         created_at=run.created_at,
         updated_at=run.updated_at,
         completed_at=run.completed_at,
@@ -229,8 +235,19 @@ def _artifact_response(row: ReverseArtifact) -> ReverseArtifactResponse:
     return ReverseArtifactResponse(
         id=row.id, project_id=row.project_id, name=row.name,
         artifact_type=row.artifact_type, content_type=row.content_type,
-        file_size=row.file_size, sha256=row.sha256, created_at=row.created_at,
+        file_size=row.file_size, sha256=row.sha256,
+        source_case_id=row.source_case_id, source_session_id=row.source_session_id,
+        source_pid=row.source_pid, source_process_name=row.source_process_name,
+        source_vfs_path=row.source_vfs_path, source_kind=row.source_kind,
+        source_hashes=row.source_hashes, created_at=row.created_at,
     )
+
+
+def _review_status(status: str | None) -> str:
+    return {
+        "verified": "passed",
+        "needs_review": "passed_with_warnings",
+    }.get(status or "pending", status or "pending")
 
 
 @router.get("/projects/{project_id}/artifacts", response_model=list[ReverseArtifactResponse])
@@ -392,7 +409,11 @@ async def analysis_status(project_id: str) -> ReverseStatusResponse:
             ).order_by(ReverseMessage.id.desc()).limit(1))
         return ReverseStatusResponse(
             project_id=project.id,
-            status=project.status,
+            status=(
+                run.status
+                if run and run.status in {"completed", "failed", "stopped"}
+                else project.status
+            ),
             run=_run_response(run) if run else None,
             active=analysis_manager.is_active(project.id),
             can_resume=bool(run and run.status in {"stopped", "failed", "awaiting_turn_approval"}),
@@ -400,6 +421,7 @@ async def analysis_status(project_id: str) -> ReverseStatusResponse:
                 final_message
                 and (final_message.metadata_json or {}).get("tool_request") is False
             ),
+            can_continue_investigation=can_continue_investigation(run),
         )
 
 
@@ -418,6 +440,22 @@ async def resume_analysis(project_id: str) -> ReverseRunResponse:
         raise HTTPException(409, str(exc)) from exc
     except SandboxUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
+
+
+@router.post(
+    "/projects/{project_id}/analysis/continue",
+    response_model=ReverseRunResponse,
+)
+async def continue_analysis(project_id: str) -> ReverseRunResponse:
+    _project_or_404(project_id)
+    try:
+        return _run_response(await analysis_manager.continue_investigation(project_id))
+    except SandboxUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.post("/projects/{project_id}/analysis/turn-extension/approve", response_model=ReverseRunResponse)
@@ -459,15 +497,27 @@ async def get_report(project_id: str) -> ReverseReportResponse:
         ).order_by(ReverseRun.created_at.desc()).limit(1))
         if not run or not run.report_markdown:
             raise HTTPException(404, "Reverse report not found")
+        review_rows = list(db.scalars(select(ReverseMessage).where(
+            ReverseMessage.project_id == project.id,
+            ReverseMessage.run_id == run.id,
+            ReverseMessage.phase == "verification",
+            ReverseMessage.role == "assistant",
+        ).order_by(ReverseMessage.id)))
         return ReverseReportResponse(
             project_id=project.id, run_id=run.id,
             content=run.report_markdown, iocs=run.iocs_markdown,
+            structured_iocs=run.structured_iocs or [],
+            analysis_outcome=run.analysis_outcome or "legacy",
+            analysis_state=run.analysis_state or {},
             signature_status=run.report_signature_status,
             signature_error=run.report_signature_error,
-            verification_status=run.report_verification_status,
+            verification_status=_review_status(run.report_verification_status),
             verification_summary=run.report_verification_summary,
             verification_error=run.report_verification_error,
             verification_details=run.report_verification_details or {},
+            review_status=_review_status(run.report_verification_status),
+            review_passes=run.report_review_passes or 0,
+            review_history=[row.metadata_json or {} for row in review_rows],
         )
 
 
@@ -491,6 +541,59 @@ async def retry_report_verification(project_id: str) -> ReverseRunResponse:
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@router.post("/projects/{project_id}/report/review", response_model=ReverseRunResponse)
+async def retry_report_review(project_id: str) -> ReverseRunResponse:
+    """Preferred evidence-aware review route; /verify remains a compatibility alias."""
+    return await retry_report_verification(project_id)
+
+
+@router.get(
+    "/projects/{project_id}/evidence/{message_id}",
+    response_model=ReverseEvidenceResponse,
+)
+async def get_report_evidence(project_id: str, message_id: int) -> ReverseEvidenceResponse:
+    with get_reverse_session() as db:
+        project = _project_or_404(project_id, db)
+        row = db.get(ReverseMessage, message_id)
+        if (
+            not row
+            or row.project_id != project.id
+            or row.phase != "analysis"
+            or row.role != "tool"
+            or not row.run_id
+        ):
+            raise HTTPException(404, "Reverse evidence reference not found")
+        try:
+            result = json.loads(row.content)
+        except (json.JSONDecodeError, TypeError):
+            result = {}
+        if isinstance(result, list) and result:
+            result = result[0]
+        if not isinstance(result, dict):
+            result = {}
+        metadata = row.metadata_json or {}
+        return ReverseEvidenceResponse(
+            id=row.id,
+            project_id=project.id,
+            run_id=row.run_id,
+            tool=metadata.get("tool"),
+            target=metadata.get("target"),
+            success=result.get("success"),
+            returncode=result.get("returncode"),
+            stdout=str(result.get("stdout") or ""),
+            stderr=str(result.get("stderr") or ""),
+            error=str(result.get("error") or "") or None,
+            output_truncated=bool(result.get("output_truncated") or result.get("truncated")),
+            stdout_original_length=result.get("stdout_original_length"),
+            stdout_returned_length=result.get("stdout_returned_length"),
+            stderr_original_length=result.get("stderr_original_length"),
+            stderr_returned_length=result.get("stderr_returned_length"),
+            output_note=str(result.get("output_note") or "") or None,
+            output_sha256=hashlib.sha256(row.content.encode()).hexdigest(),
+            created_at=row.created_at,
+        )
 
 
 @router.post("/projects/{project_id}/report/recover", response_model=ReverseRunResponse)

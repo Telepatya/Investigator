@@ -13,6 +13,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_LOCK = ROOT / "backend" / "requirements-memory.lock"
+REVERSE_PYTHON_LOCK = ROOT / "backend" / "reverse_sandbox" / "requirements.lock"
 NPM_LOCK = ROOT / "frontend" / "package-lock.json"
 REVERSE_DOCKERFILE = ROOT / "backend" / "reverse_sandbox" / "Dockerfile"
 PYTHON_PACKAGE_RE = re.compile(
@@ -20,7 +21,7 @@ PYTHON_PACKAGE_RE = re.compile(
 )
 
 
-def python_components(path: Path) -> list[dict[str, Any]]:
+def python_components(path: Path, source_lock: str = "backend/requirements-memory.lock") -> list[dict[str, Any]]:
     components: dict[str, dict[str, Any]] = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         match = PYTHON_PACKAGE_RE.match(raw_line.strip())
@@ -37,7 +38,7 @@ def python_components(path: Path) -> list[dict[str, Any]]:
             "purl": purl,
             "properties": [
                 {"name": "investigator:ecosystem", "value": "python"},
-                {"name": "investigator:source-lock", "value": "backend/requirements-memory.lock"},
+                {"name": "investigator:source-lock", "value": source_lock},
             ],
         }
         if marker:
@@ -138,9 +139,28 @@ def reverse_sandbox_components(path: Path) -> list[dict[str, Any]]:
     return components
 
 
+def merge_components(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge shared dependencies without losing their lock-file provenance."""
+    merged: dict[str, dict[str, Any]] = {}
+    for component in items:
+        purl = component["purl"]
+        current = merged.get(purl)
+        if current is None:
+            merged[purl] = component
+            continue
+        properties = current.setdefault("properties", [])
+        for prop in component.get("properties", []):
+            if prop not in properties:
+                properties.append(prop)
+    return list(merged.values())
+
+
 def build_sbom(version: str) -> dict[str, Any]:
-    components = (
+    components = merge_components(
         python_components(PYTHON_LOCK)
+        + python_components(
+            REVERSE_PYTHON_LOCK, "backend/reverse_sandbox/requirements.lock"
+        )
         + npm_components(NPM_LOCK)
         + reverse_sandbox_components(REVERSE_DOCKERFILE)
     )

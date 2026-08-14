@@ -174,11 +174,26 @@ under `~/.investigator/reverse/`; private provenance and provider keys remain in
 the operating-system credential vault. Reverse uses an adaptive
 malware-analysis prompt and one-operation loop (`run_cmd`, `read_file`,
 `write_file`, and `list_dir`) instead of a fixed checklist or rigid report
-template. A separate IOC extraction pass and non-rewriting flow verifier run
-before the final report is signed. Follow-up chat uses the same tool-capable
+template. Findings cite expandable `[trace:<message-id>]` evidence, and a
+goal-driven reviewer may request more analysis or revise unsupported report
+language before publishing. Reports expose complete, partial, or blocked
+analysis outcomes separately from review warnings and signature integrity; every
+published report is signed even when review is unavailable or leaves warnings.
+Follow-up chat uses the same tool-capable
 12-turn loop, so it can inspect the sealed artifacts instead of answering
 solely from report text.
-Verifier status is visible on the Report tab and can be retried independently.
+Review and signature status are visible on the Report tab and can be retried
+independently. Unfinished reports can resume the same investigation from either
+the workspace or report view; the previously published signed bytes are retained
+as a downloadable snapshot while the continuation runs.
+Reverse also persists semantic attempt history and normalized failure fingerprints.
+Two matching failures, or three operations that add no new evidence, activate a
+diagnostic pivot that asks the analyst model to validate bounds, headers, sizes,
+hashes, or runtime compatibility before retrying the stalled method. Substantive
+`ANALYSIS CHECKPOINT` responses are saved without prematurely entering report
+review. The sandbox includes a bounded `pyinstaller-inspect` analyzer that validates
+CArchive layout, safely extracts selected entries, and uses `xdis` for cross-version
+Python bytecode disassembly without importing or executing the sample.
 When built-in analyzers are insufficient, approved Reverse projects also let the
 model create Python parsers/decoders and run them against the sealed sample
 inside the same networkless, non-root sandbox. This does not enable a shell,

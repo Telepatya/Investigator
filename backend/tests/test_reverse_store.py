@@ -227,11 +227,16 @@ class ReverseStoreTests(unittest.TestCase):
         columns = {row[1] for row in connection.execute("PRAGMA table_info(reverse_runs)")}
         version = connection.execute("SELECT version FROM reverse_schema_version").fetchone()[0]
         connection.close()
-        self.assertEqual(version, 6)
+        self.assertEqual(version, 8)
         self.assertIn("report_signature_status", columns)
         self.assertIn("report_signature_error", columns)
         self.assertIn("report_verification_status", columns)
         self.assertIn("report_verification_details", columns)
+        self.assertIn("analysis_outcome", columns)
+        self.assertIn("analysis_state", columns)
+        self.assertIn("report_draft_markdown", columns)
+        self.assertIn("structured_iocs", columns)
+        self.assertIn("report_review_passes", columns)
 
     def test_v5_store_removes_retired_tool_approvals(self) -> None:
         project = create_project("legacy tools")
@@ -252,7 +257,7 @@ class ReverseStoreTests(unittest.TestCase):
             "SELECT COUNT(*) FROM reverse_tool_approvals WHERE tool_id = 'strings_scan'"
         ).fetchone()[0]
         connection.close()
-        self.assertEqual(version, 6)
+        self.assertEqual(version, 8)
         self.assertEqual(retired, 0)
 
 

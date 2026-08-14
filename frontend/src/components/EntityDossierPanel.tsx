@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "react-router-dom";
 import {
   Sparkles,
   ArrowRight,
@@ -12,6 +13,7 @@ import {
   Database,
   Crosshair,
   Share2,
+  Binary,
 } from "lucide-react";
 import {
   api,
@@ -165,14 +167,19 @@ function MemoryProcessDetails({
   caseId: string;
   processes: MemoryProcessCandidate[];
 }) {
+  const navigate = useNavigate();
   const [index, setIndex] = useState(0);
   const [showHandles, setShowHandles] = useState(false);
   const [minidumpDownloads, setMinidumpDownloads] = useState<
     Record<string, { loading: boolean; error?: string }>
   >({});
+  const [reverseHandoffs, setReverseHandoffs] = useState<
+    Record<string, { loading: boolean; error?: string }>
+  >({});
   const proc = processes[index] ?? processes[0];
   const procKey = proc ? `${proc.session_id}-${proc.pid}` : "";
   const minidumpDownload = minidumpDownloads[procKey];
+  const reverseHandoff = reverseHandoffs[procKey];
   const { data, isLoading, error } = useQuery({
     queryKey: ["memory-process-modules", caseId, proc?.session_id, proc?.pid],
     queryFn: () => api.getMemoryProcessModules(caseId, proc.session_id, proc.pid),
@@ -269,10 +276,52 @@ function MemoryProcessDetails({
             )}
             {minidumpDownload?.loading ? "Preparing minidump..." : "Process minidump"}
           </button>
+          <button
+            className="btn-primary text-xs"
+            disabled={Boolean(reverseHandoff?.loading)}
+            onClick={async () => {
+              setReverseHandoffs((current) => ({
+                ...current,
+                [procKey]: { loading: true },
+              }));
+              try {
+                const ready = await api.sendMemoryProcessToReverse(
+                  caseId,
+                  proc.session_id,
+                  proc.pid,
+                );
+                setReverseHandoffs((current) => ({
+                  ...current,
+                  [procKey]: { loading: false },
+                }));
+                navigate(`/reverse/${ready.project_id}`);
+              } catch (handoffError) {
+                setReverseHandoffs((current) => ({
+                  ...current,
+                  [procKey]: {
+                    loading: false,
+                    error: (handoffError as Error).message,
+                  },
+                }));
+              }
+            }}
+          >
+            {reverseHandoff?.loading ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <Binary size={14} />
+            )}
+            {reverseHandoff?.loading ? "Preparing Reverse..." : "Send to Reverse"}
+          </button>
         </div>
         {minidumpDownload?.error && (
           <div className="text-xs text-sev-high" role="alert">
             Minidump for pid {proc.pid} failed: {minidumpDownload.error}
+          </div>
+        )}
+        {reverseHandoff?.error && (
+          <div className="text-xs text-sev-high" role="alert">
+            Reverse handoff for pid {proc.pid} failed: {reverseHandoff.error}
           </div>
         )}
       </div>

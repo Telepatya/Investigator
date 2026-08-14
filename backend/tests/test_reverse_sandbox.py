@@ -4,9 +4,13 @@ import base64
 import hashlib
 import json
 import os
+import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,12 +33,17 @@ class _Image:
 
 class _Container:
     id = "container-id"
-    status = "created"
 
     class _Result:
         exit_code = 0
+        output = b"2\n"
 
-    def exec_run(self, *_args, **_kwargs):
+    def __init__(self):
+        self.status = "created"
+        self.calls = []
+
+    def exec_run(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
         return self._Result()
 
     def start(self):
@@ -42,6 +51,9 @@ class _Container:
 
     def reload(self):
         return None
+
+    def remove(self, **_kwargs):
+        self.status = "removed"
 
     def put_archive(self, _path, _data):
         return True
@@ -55,13 +67,15 @@ class _Images:
 class _Containers:
     def __init__(self):
         self.kwargs = None
+        self.container = None
 
     def get(self, _name):
         raise RuntimeError("not found")
 
     def create(self, _image, **kwargs):
         self.kwargs = kwargs
-        return _Container()
+        self.container = _Container()
+        return self.container
 
 
 class _Docker:
@@ -115,6 +129,50 @@ class ReverseSandboxTests(unittest.TestCase):
         self.assertTrue(bounded.endswith("FINAL-BLOCK"))
         self.assertIn("middle omitted", bounded)
 
+    def test_context_sidecar_is_staged_by_safe_name_and_sealed(self) -> None:
+        project = create_project("context sandbox")
+        artifact_id = str(uuid.uuid4())
+        payload = b'{"context_digest":"lead"}'
+        relative = f"context/{artifact_id}"
+        contained_project_path(project.id, relative).write_bytes(payload)
+        with get_reverse_session() as db:
+            db.add(ReverseArtifact(
+                id=artifact_id, project_id=project.id, name="process-context.json",
+                relative_path=relative, artifact_type="context", content_type="application/json",
+                file_size=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
+            ))
+            db.commit()
+        fake = _Docker()
+        manager = ReverseSandboxManager()
+        with patch.object(manager, "_docker", return_value=fake):
+            manager.ensure(project.id)
+        commands = [call[0][0] for call in fake.containers.container.calls]
+        self.assertTrue(any(command[:4] == [
+            "reverse-stage", "write", "context", "process-context.json"
+        ] for command in commands))
+        self.assertTrue(any(command[:4] == [
+            "reverse-stage", "seal", "context", "process-context.json"
+        ] for command in commands))
+
+    def test_outdated_staging_protocol_is_rejected_before_artifact_copy(self) -> None:
+        project = create_project("outdated sandbox")
+        fake = _Docker()
+        manager = ReverseSandboxManager()
+
+        class _OldResult:
+            exit_code = 2
+            output = b"Invalid staging request\n"
+
+        fake.containers.create(_Image()).exec_run = lambda *_args, **_kwargs: _OldResult()
+        container = fake.containers.container
+        fake.containers.create = lambda *_args, **_kwargs: container
+        with patch.object(manager, "_docker", return_value=fake):
+            with self.assertRaisesRegex(
+                Exception, "sandbox image is outdated or incompatible"
+            ):
+                manager.ensure(project.id)
+        self.assertEqual(container.status, "removed")
+
     def test_indirect_command_execution_bypasses_are_rejected_on_the_host(self) -> None:
         denied = [
             ["find", "/workspace", "-exec", "sh", "-c", "id", ";"],
@@ -134,6 +192,59 @@ class ReverseSandboxTests(unittest.TestCase):
             "cmd": ["binwalk", "sample"],
             "cwd": "/workspace/inputs",
         }])))
+
+    def test_pyinstaller_inspector_command_has_bounded_output_mutation(self) -> None:
+        allowed = parse_tool_call(json.dumps([{
+            "tool": "run_cmd",
+            "cmd": [
+                "pyinstaller-inspect", "/workspace/inputs/sample", "--extract", "loki",
+                "--output", "/workspace/output/loki.bin",
+            ],
+        }]))
+        denied = parse_tool_call(json.dumps([{
+            "tool": "run_cmd",
+            "cmd": [
+                "pyinstaller-inspect", "/workspace/inputs/sample", "--extract", "loki",
+                "--output", "/workspace/inputs/loki.bin",
+            ],
+        }]))
+        denied_equals = parse_tool_call(json.dumps([{
+            "tool": "run_cmd",
+            "cmd": [
+                "pyinstaller-inspect", "/workspace/inputs/sample", "--extract", "loki",
+                "--output=/workspace/context/loki.bin",
+            ],
+        }]))
+        self.assertIsNotNone(allowed)
+        self.assertIsNone(denied)
+        self.assertIsNone(denied_equals)
+
+    def test_pyinstaller_inspector_uses_cookie_end_for_package_base(self) -> None:
+        payload = b"synthetic Python 3.7 marshalled payload"
+        packed = zlib.compress(payload, 9)
+        name = b"loki\0"
+        entry_size = 18 + len(name)
+        toc = struct.pack("!iIIIBc", entry_size, 0, len(packed), len(payload), 1, b"s") + name
+        cookie = struct.pack(
+            "!8sIIII64s", b"MEI\x0c\x0b\x0a\x0b\x0e",
+            len(packed) + len(toc) + 88, len(packed), len(toc), 307, b"python37.dll\0",
+        )
+        prefix = b"MZ" + (b"\0" * 86)
+        archive = prefix + packed + toc + cookie
+        sample = self.root / "synthetic-pyinstaller.exe"
+        sample.write_bytes(archive)
+        script = Path(__file__).parents[1] / "reverse_sandbox" / "pyinstaller_inspect.py"
+        completed = subprocess.run(
+            [sys.executable, str(script), str(sample)], capture_output=True, text=True,
+            check=False, timeout=10,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["package_base"], len(prefix))
+        self.assertEqual(result["cookie_size"], 88)
+        self.assertEqual(result["python_version"], "3.7")
+        self.assertFalse(result["bytecode_runtime_compatible"])
+        self.assertTrue(result["entries"][0]["zlib_header_plausible"])
 
     @unittest.skipUnless(
         os.environ.get("INVESTIGATOR_DOCKER_TESTS") == "1",

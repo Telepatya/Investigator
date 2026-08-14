@@ -7,6 +7,35 @@ migration, and verification details live in `docs/releases/`.
 
 ### Fixed
 
+- Updated the locked `cryptography`, `pyasn1`, React Router, PostCSS, and Nano ID
+  dependencies to patched releases after repository audit findings.
+- Reverse completion is now goal-driven instead of artifact-specific: overlays,
+  entry points, MiniDumps, wording, headings, and completion markers no longer
+  trigger host-side finalization rejections. Substantive drafts persist across
+  extensions, and declining more turns publishes the best supported partial or
+  blocked report rather than a limitations-only replacement.
+- Reverse reports now separate complete, partial, and blocked analysis outcomes
+  from passed, passed-with-warnings, and failed review status. The reviewer can
+  request targeted continued analysis or up to two evidence-preserving report
+  revisions, and every published report is signed regardless of review warnings.
+- Material findings and structured IOCs can cite stable `[trace:<message-id>]`
+  evidence. Project-scoped evidence responses include the recorded operation,
+  retained bounded output, truncation metadata, success state, and output hash;
+  the Reverse UI exposes citations, objective coverage, unresolved work, review
+  history, and signature integrity independently.
+- Partial, blocked, and warning-bearing Reverse reports now expose a Continue
+  investigation action. Continuing resumes the same evidence state, adds turns
+  when its tranche is exhausted, and preserves the currently published signed
+  report as a downloadable content-addressed snapshot until replacement bytes
+  are reviewed and signed.
+- Reverse now detects analysis mistakes through persisted semantic attempts,
+  normalized failure fingerprints, and evidence novelty. Two equivalent failures
+  or three no-evidence operations activate a visible diagnostic pivot, while
+  `ANALYSIS CHECKPOINT` preserves findings without prematurely reviewing a report.
+- The sandbox adds bounded PyInstaller CArchive inspection with cookie-end package
+  base calculation, TOC/entry/compression invariants, selected extraction, runtime
+  compatibility warnings, and cross-version bytecode disassembly through `xdis`.
+
 - Reverse follow-up chat now strips completion control markers in any supported
   position, retries marker-only replies, and prevents sandbox tool-call payloads
   (including legacy saved messages) from appearing as assistant answers.
@@ -23,13 +52,6 @@ migration, and verification details live in `docs/releases/`.
   request timeout, keeping status polling and Stop responsive. Transient provider
   deadlines pause Reverse runs for resume, while oversized transcript echoes are
   rejected before parsing embedded tool calls.
-- Reverse completion is now artifact-adaptive: discovered PE overlays and
-  extractable installer/archive layers must be inspected recursively before
-  `ANALYSIS COMPLETE` is accepted, and speculative unresolved-layer claims are
-  rejected unless the model documents a concrete sandbox blocker.
-- Reverse recursive-evidence matching now recognizes input paths embedded in a
-  successful `python3 -c` extractor, preventing already-extracted overlays from
-  being rejected repeatedly as unresolved.
 - Memory-backed process dossiers now download MemProcFS's WinDbg-compatible
   `minidump/minidump.dmp` as the full process dump instead of treating the
   sparse `memory.vmem` address-space view as the primary process dump.

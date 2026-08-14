@@ -32,6 +32,7 @@ class ReverseProjectResponse(BaseModel):
     updated_at: datetime
     artifact_count: int = 0
     latest_run_status: str | None = None
+    analysis_note: str | None = None
 
 
 class ReverseArtifactResponse(BaseModel):
@@ -42,7 +43,20 @@ class ReverseArtifactResponse(BaseModel):
     content_type: str
     file_size: int
     sha256: str
+    source_case_id: str | None = None
+    source_session_id: str | None = None
+    source_pid: int | None = None
+    source_process_name: str | None = None
+    source_vfs_path: str | None = None
+    source_kind: str | None = None
+    source_hashes: dict[str, str] | None = None
     created_at: datetime
+
+
+class ReverseProcessHandoffResponse(BaseModel):
+    project_id: str
+    status: Literal["ready"]
+    artifact_ids: list[str]
 
 
 class ReverseAnalysisRequest(BaseModel):
@@ -64,6 +78,8 @@ class ReverseRunResponse(BaseModel):
     max_turns: int
     turns_used: int
     awaiting_reason: str | None
+    analysis_outcome: str | None = None
+    analysis_state: dict[str, Any] = Field(default_factory=dict)
     error: str | None
     image_digest: str | None
     tool_versions: dict[str, Any]
@@ -72,6 +88,9 @@ class ReverseRunResponse(BaseModel):
     report_verification_status: str
     report_verification_summary: str | None
     report_verification_error: str | None
+    report_review_status: str
+    report_review_passes: int = 0
+    report_review_details: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
@@ -84,6 +103,7 @@ class ReverseStatusResponse(BaseModel):
     active: bool = False
     can_resume: bool = False
     can_recover_report: bool = False
+    can_continue_investigation: bool = False
 
 
 class ReverseReportResponse(BaseModel):
@@ -91,12 +111,39 @@ class ReverseReportResponse(BaseModel):
     run_id: str
     content: str
     iocs: str | None = None
+    structured_iocs: list[dict[str, Any]] = Field(default_factory=list)
+    analysis_outcome: str | None = None
+    analysis_state: dict[str, Any] = Field(default_factory=dict)
     signature_status: str
     signature_error: str | None = None
     verification_status: str
     verification_summary: str | None = None
     verification_error: str | None = None
     verification_details: dict[str, Any] = Field(default_factory=dict)
+    review_status: str
+    review_passes: int = 0
+    review_history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ReverseEvidenceResponse(BaseModel):
+    id: int
+    project_id: str
+    run_id: str
+    tool: str | None = None
+    target: Any = None
+    success: bool | None = None
+    returncode: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+    output_truncated: bool = False
+    stdout_original_length: int | None = None
+    stdout_returned_length: int | None = None
+    stderr_original_length: int | None = None
+    stderr_returned_length: int | None = None
+    output_note: str | None = None
+    output_sha256: str
+    created_at: datetime
 
 
 class ReverseChatRequest(BaseModel):

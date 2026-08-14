@@ -148,6 +148,29 @@ def list_process_handles(
         session.close()
 
 
+def export_process_handles(case_id: str, session_id: str, pid: int) -> list[dict[str, Any]]:
+    """Return the complete cached/on-demand handle set for one exact memory process."""
+    from app.store import cases as case_store
+    from app.store.database import Process
+    from sqlalchemy import select
+
+    session = case_store.get_session(case_id)
+    try:
+        proc = session.scalars(
+            select(Process).where(Process.session_id == session_id, Process.pid == int(pid))
+        ).first()
+        if not proc:
+            raise MemoryExplorerError("Memory-backed process not found", 404)
+        events = _handle_events_for_process(session, proc)
+        if not events:
+            _collect_and_cache_process_handles(case_id, session, proc)
+            session.commit()
+            events = _handle_events_for_process(session, proc)
+        return _process_handle_rows(proc, events)[0]
+    finally:
+        session.close()
+
+
 def _collect_and_cache_process_handles(case_id: str, session, proc) -> None:
     from app.store import cases as case_store
     from app.memory.pipeline import _grade_handle
@@ -358,7 +381,14 @@ def list_process_modules(case_id: str, session_id: str, pid: int) -> dict[str, A
     return {"session_id": session_id, "pid": pid, "process": process_info, "modules": modules}
 
 
-def extract_process_image(case_id: str, session_id: str, pid: int, kind: str = "image") -> Path:
+def extract_process_image(
+    case_id: str,
+    session_id: str,
+    pid: int,
+    kind: str = "image",
+    *,
+    exact_vfs_path: bool = False,
+) -> Path:
     dump = resolve_memory_dump(case_id, session_id)
     if kind not in {"image", "minidump"}:
         raise MemoryExplorerError("Unsupported process download kind")
@@ -367,7 +397,7 @@ def extract_process_image(case_id: str, session_id: str, pid: int, kind: str = "
         if kind == "minidump":
             source = f"/pid/{pid}/minidump/minidump.dmp"
             entry = _vfs_entry(vmm, source)
-            if entry is None:
+            if entry is None and not exact_vfs_path:
                 # `/pid` and `/name` are aliases in MemProcFS. Prefer the stable
                 # PID path, but tolerate builds/dumps that expose only `/name`.
                 try:
@@ -384,8 +414,8 @@ def extract_process_image(case_id: str, session_id: str, pid: int, kind: str = "
                         break
             if entry is None:
                 raise MemoryExplorerError(
-                    "A full process minidump is unavailable. MemProcFS only generates it "
-                    "for supported active user-mode processes.",
+                    f"The MemProcFS minidump for exactly pid {pid} is unavailable at {source}. "
+                    "MemProcFS only generates it for supported active user-mode processes.",
                     404,
                 )
             output = _cache_path(

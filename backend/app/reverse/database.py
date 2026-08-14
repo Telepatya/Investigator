@@ -13,7 +13,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from app.config import get_reverse_dir
 from app.store.database import SerializedWriteSession
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 
 def utcnow() -> datetime:
@@ -51,6 +51,13 @@ class ReverseArtifact(ReverseBase):
     content_type: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
     file_size: Mapped[int] = mapped_column(Integer)
     sha256: Mapped[str] = mapped_column(String(64), index=True)
+    source_case_id: Mapped[str | None] = mapped_column(String(8), nullable=True, index=True)
+    source_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_pid: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    source_process_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    source_vfs_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    source_kind: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_hashes: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -70,14 +77,19 @@ class ReverseRun(ReverseBase):
     turns_used: Mapped[int] = mapped_column(Integer, default=0)
     awaiting_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     stop_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    analysis_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    analysis_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    report_draft_markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
     iocs_markdown: Mapped[str | None] = mapped_column(Text, nullable=True)
+    structured_iocs: Mapped[list] = mapped_column(JSON, default=list)
     report_signature_status: Mapped[str] = mapped_column(String(32), default="pending")
     report_signature_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_verification_status: Mapped[str] = mapped_column(String(32), default="pending")
     report_verification_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_verification_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_verification_details: Mapped[dict] = mapped_column(JSON, default=dict)
+    report_review_passes: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     image_digest: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tool_versions: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -270,7 +282,77 @@ def init_reverse_db() -> sessionmaker:
                         "WHERE tool_id NOT IN ('run_cmd', 'read_file', 'write_file', 'list_dir')"
                     )
                     version = 6
+                if version < 7:
+                    columns = {
+                        str(item[1])
+                        for item in conn.exec_driver_sql("PRAGMA table_info(reverse_artifacts)")
+                    }
+                    additions = {
+                        "source_case_id": "VARCHAR(8)",
+                        "source_session_id": "VARCHAR(64)",
+                        "source_pid": "INTEGER",
+                        "source_process_name": "VARCHAR(256)",
+                        "source_vfs_path": "VARCHAR(1024)",
+                        "source_kind": "VARCHAR(64)",
+                        "source_hashes": "JSON",
+                    }
+                    for name, sql_type in additions.items():
+                        if name not in columns:
+                            conn.exec_driver_sql(
+                                f"ALTER TABLE reverse_artifacts ADD COLUMN {name} {sql_type}"
+                            )
+                    for name in (
+                        "source_case_id", "source_session_id", "source_pid", "source_kind"
+                    ):
+                        conn.exec_driver_sql(
+                            f"CREATE INDEX IF NOT EXISTS ix_reverse_artifacts_{name} "
+                            f"ON reverse_artifacts ({name})"
+                        )
+                    version = 7
+                if version < 8:
+                    columns = {
+                        str(item[1])
+                        for item in conn.exec_driver_sql("PRAGMA table_info(reverse_runs)")
+                    }
+                    additions = {
+                        "analysis_outcome": "VARCHAR(32)",
+                        "analysis_state": "JSON NOT NULL DEFAULT '{}'",
+                        "report_draft_markdown": "TEXT",
+                        "structured_iocs": "JSON NOT NULL DEFAULT '[]'",
+                        "report_review_passes": "INTEGER NOT NULL DEFAULT 0",
+                    }
+                    for name, sql_type in additions.items():
+                        if name not in columns:
+                            conn.exec_driver_sql(
+                                f"ALTER TABLE reverse_runs ADD COLUMN {name} {sql_type}"
+                            )
+                    version = 8
                 conn.exec_driver_sql("UPDATE reverse_schema_version SET version = ?", (version,))
+            project_columns = {
+                str(item[1])
+                for item in conn.exec_driver_sql("PRAGMA table_info(reverse_projects)")
+            }
+            run_columns = {
+                str(item[1])
+                for item in conn.exec_driver_sql("PRAGMA table_info(reverse_runs)")
+            }
+            if {"status", "active_run_id", "updated_at"} <= project_columns and {
+                "id", "status"
+            } <= run_columns:
+                # A terminal run is authoritative. Repair projects left in an interactive
+                # state by a late extension/status write from an older backend process.
+                conn.exec_driver_sql(
+                    "UPDATE reverse_projects SET "
+                    "status = (SELECT status FROM reverse_runs "
+                    "          WHERE reverse_runs.id = reverse_projects.active_run_id), "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE active_run_id IS NOT NULL "
+                    "AND EXISTS (SELECT 1 FROM reverse_runs "
+                    "            WHERE reverse_runs.id = reverse_projects.active_run_id "
+                    "            AND reverse_runs.status IN ('completed', 'failed', 'stopped')) "
+                    "AND status != (SELECT status FROM reverse_runs "
+                    "               WHERE reverse_runs.id = reverse_projects.active_run_id)"
+                )
         return _factory
 
 
