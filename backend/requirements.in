@@ -3,6 +3,11 @@ uvicorn[standard]>=0.32.0
 sqlalchemy>=2.0.36
 aiosqlite>=0.20.0
 pydantic>=2.10.0
+# Sigma rule parsing for analyst-authored detection rules. PyYAML is declared
+# explicitly (it was previously only a transitive dependency) because the rules
+# subsystem loads rule text with yaml.safe_load directly.
+pysigma>=0.11,<2
+PyYAML>=6.0.2
 pydantic-settings>=2.6.0
 python-multipart>=0.0.17
 httpx>=0.28.0

@@ -129,6 +129,12 @@ def get_reverse_dir() -> Path:
     return path
 
 
+def get_rules_dir() -> Path:
+    path = DEFAULT_CONFIG_DIR / "rules"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def validate_case_id_component(case_id: str) -> str:
     value = str(case_id or "")
     if not _CASE_ID_COMPONENT_RE.fullmatch(value):

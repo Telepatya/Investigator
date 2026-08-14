@@ -29,6 +29,8 @@ from app.reverse.analysis import analysis_manager
 from app.reverse.database import dispose_reverse_db, init_reverse_db
 from app.reverse.router import router as reverse_router
 from app.reverse.sandbox import sandbox_manager
+from app.rules.database import dispose_rules_db
+from app.rules.router import router as rules_router
 from app.reverse.store import (
     cleanup_staging_files,
     recover_interrupted_chats,
@@ -96,6 +98,7 @@ async def lifespan(app: FastAPI):
         await analysis_manager.shutdown()
         await asyncio.to_thread(sandbox_manager.shutdown)
         dispose_reverse_db()
+        dispose_rules_db()
         dispose_all_db_engines()
 
 
@@ -143,6 +146,7 @@ app.include_router(settings_router.router)
 app.include_router(cases_router.router)
 app.include_router(analysis_router.router)
 app.include_router(reverse_router)
+app.include_router(rules_router)
 
 
 @app.get("/api/health")
