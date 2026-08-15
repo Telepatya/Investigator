@@ -107,6 +107,8 @@ export default function RulesPage() {
 
   const shown = filtered.slice(0, visible);
   const summary = rules.data;
+  // Default to available while loading so the buttons do not flicker disabled.
+  const sigmaReady = summary?.sigma_available ?? true;
 
   return (
     <PageShell>
@@ -119,11 +121,12 @@ export default function RulesPage() {
             <a className="btn-ghost" href={rulesExportUrl()} title="Download custom rules as Sigma">
               <Download size={15} /> Export
             </a>
-            <button className="btn-ghost" onClick={() => setImportOpen(true)}>
+            <button className="btn-ghost" disabled={!sigmaReady} onClick={() => setImportOpen(true)}>
               <Upload size={15} /> Import
             </button>
             <button
               className="btn-primary"
+              disabled={!sigmaReady}
               onClick={() => {
                 setSelectedId(null);
                 setEditorOpen(true);
@@ -134,6 +137,20 @@ export default function RulesPage() {
           </div>
         }
       />
+
+      {summary && !summary.sigma_available && (
+        <div className="card flex items-start gap-3 border-amber-400/30 bg-amber-400/10 p-4 text-sm text-amber-300">
+          <AlertTriangle size={18} className="mt-0.5 shrink-0" />
+          <div>
+            <div className="font-semibold">Custom Sigma rules are unavailable</div>
+            <div className="mt-1 text-xs">
+              {summary.sigma_error} Every built-in rule below still works — you can enable,
+              disable, and re-prioritise them as usual. Only writing, importing, and forking
+              Sigma rules needs the package.
+            </div>
+          </div>
+        </div>
+      )}
 
       {summary && summary.ungated_total > 0 && (
         <div className="card flex items-start gap-3 border-amber-400/30 bg-amber-400/10 p-4 text-sm text-amber-300">
@@ -309,6 +326,7 @@ export default function RulesPage() {
       {selectedId && (
         <RuleDetailDrawer
           ruleId={selectedId}
+          sigmaReady={sigmaReady}
           onClose={() => setSelectedId(null)}
           onEdit={() => setEditorOpen(true)}
           onDelete={(rule) => setPendingDelete(rule)}
@@ -377,11 +395,13 @@ function FilterChip({
 
 function RuleDetailDrawer({
   ruleId,
+  sigmaReady,
   onClose,
   onEdit,
   onDelete,
 }: {
   ruleId: string;
+  sigmaReady: boolean;
   onClose: () => void;
   onEdit: () => void;
   onDelete: (rule: RuleSummary) => void;
@@ -504,7 +524,12 @@ function RuleDetailDrawer({
               </>
             )}
             {rule.source === "builtin" && rule.forkable && (
-              <button className="btn-primary" onClick={() => setForkOpen(true)}>
+              <button
+                className="btn-primary"
+                disabled={!sigmaReady}
+                title={sigmaReady ? undefined : "Forking needs the pysigma package"}
+                onClick={() => setForkOpen(true)}
+              >
                 <GitFork size={15} /> Fork to Sigma
               </button>
             )}

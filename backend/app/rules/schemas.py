@@ -55,6 +55,9 @@ class RuleListResponse(BaseModel):
     disabled_total: int
     ungated_total: int
     ungated_limit: int = limits.MAX_UNFILTERED_RULES
+    # Built-in rule management works without pySigma; authoring custom rules does not.
+    sigma_available: bool = True
+    sigma_error: str = ""
 
 
 class BuiltinRuleUpdate(BaseModel):

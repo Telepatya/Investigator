@@ -153,6 +153,7 @@ app.include_router(rules_router)
 async def health() -> dict:
     from app.memory.memprocfs_runner import is_memprocfs_available
     from app.memory.yara_scanner import get_scanner
+    from app.rules.sigma_compile import sigma_available
     reverse = await asyncio.to_thread(sandbox_manager.health)
     return {
         "status": "ok",
@@ -162,6 +163,8 @@ async def health() -> dict:
         "credit": APP_CREDIT,
         "memprocfs": is_memprocfs_available(),
         "yara": get_scanner().available(),
+        # Custom Sigma rule authoring; built-in rule management works without it.
+        "sigma": sigma_available(),
         "reverse": {
             **reverse,
             "store_ready": True,

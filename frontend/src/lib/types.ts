@@ -629,6 +629,9 @@ export interface RuleListResponse {
   disabled_total: number;
   ungated_total: number;
   ungated_limit: number;
+  /** Built-in rule management works without pySigma; custom Sigma authoring does not. */
+  sigma_available: boolean;
+  sigma_error: string;
 }
 
 export interface RuleValidateResponse {

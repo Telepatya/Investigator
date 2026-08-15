@@ -33,31 +33,57 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import yaml
-from sigma.collection import SigmaCollection
-from sigma.conditions import (
-    ConditionAND,
-    ConditionFieldEqualsValueExpression,
-    ConditionNOT,
-    ConditionOR,
-    ConditionValueExpression,
-)
-from sigma.exceptions import SigmaError as PySigmaError
-from sigma.rule import SigmaRule
-from sigma.types import (
-    SigmaBool,
-    SigmaCasedString,
-    SigmaCIDRExpression,
-    SigmaCompareExpression,
-    SigmaExists,
-    SigmaExpansion,
-    SigmaFieldReference,
-    SigmaNull,
-    SigmaNumber,
-    SigmaQueryExpression,
-    SigmaRegularExpression,
-    SigmaString,
-    SpecialChars,
-)
+
+# pySigma is required to author custom rules, but not to manage the built-in ones:
+# the catalog, the enable/disable state, the severity overrides, and the profile the
+# engine runs are all plain Python. A missing package must therefore degrade this
+# module, not take down a DFIR workstation's cases, evidence, and timeline with it.
+#
+# Every pySigma name below is referenced only inside a function body, and this module
+# uses ``from __future__ import annotations``, so annotations are never evaluated.
+# Nothing at import time needs the package to be present.
+try:
+    from sigma.collection import SigmaCollection
+    from sigma.conditions import (
+        ConditionAND,
+        ConditionFieldEqualsValueExpression,
+        ConditionNOT,
+        ConditionOR,
+        ConditionValueExpression,
+    )
+    from sigma.exceptions import SigmaError as PySigmaError
+    from sigma.rule import SigmaRule
+    from sigma.types import (
+        SigmaBool,
+        SigmaCasedString,
+        SigmaCIDRExpression,
+        SigmaCompareExpression,
+        SigmaExists,
+        SigmaExpansion,
+        SigmaFieldReference,
+        SigmaNull,
+        SigmaNumber,
+        SigmaQueryExpression,
+        SigmaRegularExpression,
+        SigmaString,
+        SpecialChars,
+    )
+
+    SIGMA_AVAILABLE = True
+    SIGMA_IMPORT_ERROR = ""
+except ImportError as _sigma_import_error:  # pragma: no cover - exercised by tests
+    SigmaCollection = None
+    ConditionAND = ConditionFieldEqualsValueExpression = None
+    ConditionNOT = ConditionOR = ConditionValueExpression = None
+    PySigmaError = Exception
+    SigmaRule = None
+    SigmaBool = SigmaCasedString = SigmaCIDRExpression = SigmaCompareExpression = None
+    SigmaExists = SigmaExpansion = SigmaFieldReference = SigmaNull = None
+    SigmaNumber = SigmaQueryExpression = SigmaRegularExpression = None
+    SigmaString = SpecialChars = None
+
+    SIGMA_AVAILABLE = False
+    SIGMA_IMPORT_ERROR = str(_sigma_import_error)
 
 from app.rules import limits
 from app.rules.fieldmap import MatchCtx, is_known_field, logsource_predicate
@@ -94,6 +120,35 @@ class SigmaUnsupportedError(SigmaRuleError):
 
 class SigmaLimitError(SigmaRuleError):
     """A cap from ``app.rules.limits`` was exceeded."""
+
+
+class SigmaUnavailableError(SigmaRuleError):
+    """pySigma is not installed, so custom rules cannot be compiled.
+
+    Subclasses ``SigmaRuleError`` deliberately: every caller that already handles a
+    bad rule by skipping it — notably ``store._compile_stored`` — then handles a
+    missing package the same way, rather than failing a whole detection run.
+    """
+
+
+# pip's own name for the distribution, so the message can be acted on directly.
+SIGMA_INSTALL_HINT = (
+    "Sigma rule support requires the 'pysigma' package. Reinstall backend "
+    "dependencies (python run.py) to pick it up."
+)
+
+
+def sigma_available() -> bool:
+    """Whether custom Sigma rules can be compiled on this installation.
+
+    Mirrors ``app.memory.memprocfs_runner.is_memprocfs_available``, this project's
+    pattern for reporting an optional dependency.
+    """
+    return SIGMA_AVAILABLE
+
+
+def sigma_unavailable_reason() -> str:
+    return "" if SIGMA_AVAILABLE else f"{SIGMA_INSTALL_HINT} ({SIGMA_IMPORT_ERROR})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -486,6 +541,8 @@ def _slugify(text: str) -> str:
 
 def parse_rules(yaml_source: str) -> list[SigmaRule]:
     """Parse a Sigma document, rejecting anything this build cannot execute."""
+    if not SIGMA_AVAILABLE:
+        raise SigmaUnavailableError(sigma_unavailable_reason())
     text = str(yaml_source or "")
     if not text.strip():
         raise SigmaSyntaxError("Rule source is empty")

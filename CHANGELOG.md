@@ -23,6 +23,23 @@ migration, and verification details live in `docs/releases/`.
 - Global rule state is stored in a new versioned database at
   `~/.investigator/rules/rules.db`. Back it up with the rest of `~/.investigator/`;
   see `docs/MIGRATIONS.md`.
+- Sigma parsing adds `pysigma` and its dependencies (`jq`, `diskcache`, `jinja2`,
+  `markupsafe`, `pyparsing`, `types-pyyaml`, `diskcache-stubs`) to the locked
+  backend requirements. `jq` is a native extension; it ships wheels for Windows
+  x64, macOS, and Linux, but not for 32-bit or ARM64 Windows.
+- If `pysigma` is unavailable, the backend still starts and every built-in rule
+  remains listed, togglable, and re-prioritisable. Only authoring, validating,
+  importing, and forking custom Sigma rules is disabled, with the reason shown on
+  the Rules page and reported as `sigma` in `/api/health`.
+- CI now fails when `requirements.in` and the lock files disagree.
+
+### Fixed
+
+- The backend failed to start with `ModuleNotFoundError: No module named 'sigma'`
+  because `pysigma` was added to `requirements.in` without regenerating the lock
+  files, and installs run `pip --require-hashes --no-deps` against the locks. All
+  three locks now include it, and a missing rule dependency can no longer stop the
+  application from starting.
 
 ### Changed
 

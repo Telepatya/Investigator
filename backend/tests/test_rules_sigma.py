@@ -7,9 +7,7 @@ from __future__ import annotations
 # silently never firing, that the regex guard rejects catastrophic patterns while
 # passing the ones real rules use, and that the derived literal prefilter is sound.
 
-import re
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 from app.rules import limits

@@ -471,7 +471,13 @@ detections written as imperative engine code; a shared legacy id is suppressed t
 only once every rule that can emit it is disabled.
 
 `sigma_compile.py` parses analyst rules with pySigma and compiles the condition tree
-into nested closures. There is no `eval`, no `exec`, and no generated source. pySigma
+into nested closures. pySigma is required for **custom** rules only: the catalog, the
+enable/disable state, the severity overrides, and the profile the engine runs are plain
+Python. The import is guarded, so an installation without the package still starts, still
+manages every built-in rule, and still runs detections — it reports `sigma: false` from
+`/api/health`, refuses rule authoring with `503`, and says so on the Rules page. This
+matters because `app/main.py` imports the rules router at module scope, so an unguarded
+dependency there would stop the whole workstation, not just one feature. There is no `eval`, no `exec`, and no generated source. pySigma
 resolves value modifiers before compilation, so `contains`, `all`, `base64offset` and
 `windash` arrive as ordinary string or expansion values. Constructs this build cannot
 execute are refused by name at save time rather than stored as a rule that silently

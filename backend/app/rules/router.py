@@ -14,7 +14,7 @@ import re
 from fastapi import APIRouter, HTTPException, Response
 
 from app.rules import fork as fork_module
-from app.rules import limits, profile, store
+from app.rules import profile, store
 from app.rules.database import CustomRule
 from app.rules.registry import BUILTIN_RULES, RULES_BY_ID, RuleSpec
 from app.rules.schemas import (
@@ -31,7 +31,14 @@ from app.rules.schemas import (
     RuleValidateRequest,
     RuleValidateResponse,
 )
-from app.rules.sigma_compile import SigmaRuleError, compile_rule, parse_rules
+from app.rules.sigma_compile import (
+    SigmaRuleError,
+    SigmaUnavailableError,
+    compile_rule,
+    parse_rules,
+    sigma_available,
+    sigma_unavailable_reason,
+)
 
 router = APIRouter(prefix="/api/rules", tags=["rules"])
 
@@ -152,6 +159,8 @@ def list_rules(
         custom_total=len(custom_rows),
         disabled_total=disabled_total,
         ungated_total=ungated_total,
+        sigma_available=sigma_available(),
+        sigma_error=sigma_unavailable_reason(),
     )
 
 
@@ -226,6 +235,8 @@ def update_builtin(rule_id: str, body: BuiltinRuleUpdate) -> MutationResponse:
 def create_custom(body: CustomRuleCreate) -> MutationResponse:
     try:
         result = store.create_custom_rule(body.yaml_source, enabled=body.enabled)
+    except SigmaUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
     except SigmaRuleError as exc:
         raise HTTPException(400, str(exc)) from exc
     except ValueError as exc:
@@ -246,6 +257,8 @@ def update_custom(rule_id: str, body: CustomRuleUpdate) -> MutationResponse:
             yaml_source=changes.get("yaml_source"),
             enabled=changes.get("enabled"),
         )
+    except SigmaUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
     except SigmaRuleError as exc:
         raise HTTPException(400, str(exc)) from exc
     except ValueError as exc:
@@ -266,6 +279,8 @@ def delete_custom(rule_id: str) -> MutationResponse:
 @router.post("/validate", response_model=RuleValidateResponse)
 def validate_rule(body: RuleValidateRequest) -> RuleValidateResponse:
     """Compile a rule without storing it, so the editor can report before saving."""
+    if not sigma_available():
+        return RuleValidateResponse(ok=False, error=sigma_unavailable_reason())
     try:
         parsed = parse_rules(body.yaml_source)
         if len(parsed) != 1:
@@ -305,6 +320,8 @@ def fork_builtin(rule_id: str, body: ForkRequest) -> ForkResponse:
         result = store.create_custom_rule(
             yaml_source, origin="fork", source_builtin_id=spec.id, enabled=False
         )
+    except SigmaUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
     except SigmaRuleError as exc:
         # The generated rule failed to compile: that is a defect in the fork
         # template, not analyst error, and must not be stored half-working.
@@ -334,6 +351,8 @@ def import_rules(body: RuleValidateRequest) -> RuleImportResponse:
     """
     try:
         result = store.import_rules(body.yaml_source)
+    except SigmaUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     profile.invalidate_cache()
