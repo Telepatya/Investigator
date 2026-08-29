@@ -1,4 +1,4 @@
-export type Provider = "ollama" | "openai" | "gemini" | "anthropic";
+export type Provider = "ollama" | "openai" | "openrouter" | "gemini" | "anthropic";
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
 export type CaseStatus = "created" | "ingesting" | "analyzing" | "ready" | "error";
 
@@ -27,6 +27,7 @@ export interface LLMConfig {
   provider: Provider;
   model: string;
   ollama_base_url: string;
+  openrouter_base_url: string;
   temperature: number;
   max_tokens: number;
   analysis_max_tool_calls: number;

@@ -12,7 +12,7 @@ import keyring
 from pydantic import BaseModel, Field
 
 SERVICE_NAME = "investigator-dfir"
-CONFIG_SCHEMA_VERSION = 3
+CONFIG_SCHEMA_VERSION = 4
 UPLOAD_STAGING_PREFIX = ".investigator-upload-"
 DEFAULT_CONFIG_DIR = Path.home() / ".investigator"
 DEFAULT_CASES_DIR = DEFAULT_CONFIG_DIR / "cases"
@@ -21,13 +21,14 @@ _CASE_ID_COMPONENT_RE = re.compile(r"^[0-9a-fA-F]{8}$")
 _UPLOAD_NAME_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ ()%+-]{0,254}$")
 
 
-ProviderType = Literal["ollama", "openai", "gemini", "anthropic"]
+ProviderType = Literal["ollama", "openai", "openrouter", "gemini", "anthropic"]
 
 
 class LLMSettings(BaseModel):
     provider: ProviderType = "ollama"
     model: str = "llama3.2"
     ollama_base_url: str = "http://localhost:11434"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
     temperature: float = 0.2
     max_tokens: int = 4096
     analysis_max_tool_calls: int = Field(default=8, ge=0, le=20)
@@ -80,6 +81,9 @@ def load_config() -> AppConfig:
             save_config(cfg)
         if previous_version < 3:
             cfg.reverse.enabled_tools = ["run_cmd", "read_file", "write_file", "list_dir"]
+            cfg.config_version = CONFIG_SCHEMA_VERSION
+            save_config(cfg)
+        if previous_version < 4:
             cfg.config_version = CONFIG_SCHEMA_VERSION
             save_config(cfg)
         return cfg

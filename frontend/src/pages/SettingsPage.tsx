@@ -19,6 +19,7 @@ import { PageShell, PageTitle, Section } from "../components/common";
 const PROVIDERS: { id: Provider; name: string; icon: ReactNode; local: boolean }[] = [
   { id: "ollama", name: "Ollama (Local)", icon: <Server size={18} />, local: true },
   { id: "openai", name: "OpenAI (ChatGPT)", icon: <Cloud size={18} />, local: false },
+  { id: "openrouter", name: "OpenRouter", icon: <Cloud size={18} />, local: false },
   { id: "anthropic", name: "Anthropic (Claude)", icon: <Cloud size={18} />, local: false },
   { id: "gemini", name: "Google (Gemini)", icon: <Cloud size={18} />, local: false },
 ];
@@ -27,6 +28,7 @@ export default function SettingsPage() {
   const [provider, setProvider] = useState<Provider>("ollama");
   const [model, setModel] = useState("");
   const [ollamaUrl, setOllamaUrl] = useState("http://localhost:11434");
+  const [openRouterUrl, setOpenRouterUrl] = useState("https://openrouter.ai/api/v1");
   const [temperature, setTemperature] = useState(0.2);
   const [maxTokens, setMaxTokens] = useState(4096);
   const [analysisToolCalls, setAnalysisToolCalls] = useState(8);
@@ -52,6 +54,7 @@ export default function SettingsPage() {
       setProvider(cfg.provider);
       setModel(cfg.model);
       setOllamaUrl(cfg.ollama_base_url);
+      setOpenRouterUrl(cfg.openrouter_base_url);
       setTemperature(cfg.temperature);
       setMaxTokens(cfg.max_tokens);
       setAnalysisToolCalls(cfg.analysis_max_tool_calls);
@@ -90,9 +93,14 @@ export default function SettingsPage() {
     setTesting(true);
     setTestResult(null);
     try {
-      // save key first if provided so the test can use it
+      // Persist provider-specific connection details before testing them.
+      await api.updateLLMConfig({
+        provider,
+        ...(provider === "ollama" ? { ollama_base_url: ollamaUrl } : {}),
+        ...(provider === "openrouter" ? { openrouter_base_url: openRouterUrl } : {}),
+        ...(apiKey ? { api_key: apiKey } : {}),
+      });
       if (apiKey) {
-        await api.updateLLMConfig({ provider, api_key: apiKey });
         setHasKey(true);
         setApiKey("");
       }
@@ -114,6 +122,7 @@ export default function SettingsPage() {
       provider,
       model,
       ollama_base_url: ollamaUrl,
+      openrouter_base_url: openRouterUrl,
       temperature,
       max_tokens: maxTokens,
       analysis_max_tool_calls: analysisToolCalls,
@@ -141,7 +150,7 @@ export default function SettingsPage() {
       />
 
       <Section title="AI Provider">
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-5">
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-5">
           {PROVIDERS.map((p) => (
             <button
               key={p.id}
@@ -187,6 +196,18 @@ export default function SettingsPage() {
               value={ollamaUrl}
               onChange={(e) => setOllamaUrl(e.target.value)}
               onBlur={() => loadModels("ollama")}
+            />
+          </div>
+        )}
+
+        {provider === "openrouter" && (
+          <div className="mb-4">
+            <label className="label">OpenRouter API URL</label>
+            <input
+              className="input"
+              value={openRouterUrl}
+              onChange={(e) => setOpenRouterUrl(e.target.value)}
+              onBlur={() => loadModels("openrouter")}
             />
           </div>
         )}

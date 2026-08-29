@@ -8,7 +8,7 @@
 > Interfaces and stored data may change before 1.0; validate conclusions against
 > the underlying evidence before relying on them.
 
-A fully local DFIR workstation. Ingest endpoint and log evidence — event logs, EVTX, forensic artifacts, DFIR collections (e.g. Velociraptor), and Microsoft Defender / Azure logs — plus raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
+A fully local DFIR workstation. Ingest endpoint and log evidence — event logs, EVTX, forensic artifacts, DFIR collections (e.g. Velociraptor), and Microsoft Defender / Azure logs — plus raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / OpenRouter / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
 
 Everything runs on your machine. API keys are stored in your OS credential vault, never on disk in plaintext.
 
@@ -34,7 +34,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 
 ## Features
 
-- **Bring your own AI.** Ollama (on-device) with live model discovery, or OpenAI, Anthropic, and Google Gemini with per-provider model catalogs and a built-in connection tester.
+- **Bring your own AI.** Ollama (on-device) with live model discovery, or OpenAI, OpenRouter, Anthropic, and Google Gemini with per-provider model catalogs and a built-in connection tester.
 - **Broad evidence ingestion.** Offline-collector ZIPs (e.g. Velociraptor), JSON/JSONL artifact results, CSV, EVTX/event logs, and Microsoft Defender / Azure (Sentinel) log exports are parsed and normalized into a unified event model with full-text search. Events and logs can also be fed in manually.
 - **Memory forensics.** MemProcFS process, module, VAD, thread, handle, network, service, and driver maps feed deterministic injection, hollowing, suspicious-service, network, and driver heuristics. Executable private-memory candidates are checked against VAD shape, module load order, live thread start addresses, network context, and machine-wide prevalence before escalation.
 - **APT hunting.** YARA sweep of memory using a bundled C2 / offensive-tooling ruleset (Cobalt Strike, Meterpreter, Sliver/Covenant/Havoc, Mimikatz, Rubeus, reflective loaders, shellcode markers) plus your own rules directory.
@@ -221,7 +221,7 @@ npm run dev                               # http://localhost:5173, proxies /api 
 Open **Settings**:
 
 - **Ollama (local):** point at your Ollama server URL (default `http://localhost:11434`); the model dropdown is populated live from your installed models.
-- **OpenAI / Anthropic / Gemini:** paste your API key (stored in the OS keyring), click **Test**, then pick a model.
+- **OpenAI / OpenRouter / Anthropic / Gemini:** paste your API key (stored in the OS keyring), click **Test**, then pick a model. OpenRouter uses its OpenAI-compatible API at `https://openrouter.ai/api/v1` by default.
 
 With Ollama, no case data ever leaves your machine. With a remote provider, only the evidence excerpts included in prompts are sent to that provider — Settings shows an explicit warning while a remote provider is selected.
 

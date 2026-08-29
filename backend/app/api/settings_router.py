@@ -22,6 +22,8 @@ from app.reverse.schemas import ReverseSettingsUpdate
 from app.reverse.tools import TOOL_DESCRIPTIONS
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+LLM_PROVIDERS = ("ollama", "openai", "openrouter", "gemini", "anthropic")
+API_KEY_PROVIDERS = ("openai", "openrouter", "gemini", "anthropic")
 
 
 @router.get("/llm", response_model=LLMConfigResponse)
@@ -36,6 +38,7 @@ async def get_llm_config() -> LLMConfigResponse:
         provider=cfg.llm.provider,
         model=cfg.llm.model,
         ollama_base_url=cfg.llm.ollama_base_url,
+        openrouter_base_url=cfg.llm.openrouter_base_url,
         temperature=cfg.llm.temperature,
         max_tokens=cfg.llm.max_tokens,
         analysis_max_tool_calls=cfg.llm.analysis_max_tool_calls,
@@ -55,6 +58,8 @@ async def update_llm_config(update: LLMConfigUpdate) -> LLMConfigResponse:
         cfg.llm.model = update.model
     if update.ollama_base_url is not None:
         cfg.llm.ollama_base_url = update.ollama_base_url
+    if update.openrouter_base_url is not None:
+        cfg.llm.openrouter_base_url = update.openrouter_base_url
     if update.temperature is not None:
         cfg.llm.temperature = update.temperature
     if update.max_tokens is not None:
@@ -80,6 +85,7 @@ async def update_llm_config(update: LLMConfigUpdate) -> LLMConfigResponse:
         provider=cfg.llm.provider,
         model=cfg.llm.model,
         ollama_base_url=cfg.llm.ollama_base_url,
+        openrouter_base_url=cfg.llm.openrouter_base_url,
         temperature=cfg.llm.temperature,
         max_tokens=cfg.llm.max_tokens,
         analysis_max_tool_calls=cfg.llm.analysis_max_tool_calls,
@@ -92,7 +98,7 @@ async def update_llm_config(update: LLMConfigUpdate) -> LLMConfigResponse:
 
 @router.get("/llm/models/{provider}", response_model=list[ModelInfo])
 async def get_models(provider: str) -> list[ModelInfo]:
-    if provider not in ("ollama", "openai", "gemini", "anthropic"):
+    if provider not in LLM_PROVIDERS:
         raise HTTPException(400, "Unknown provider")
     try:
         return await list_models_for_provider(provider)  # type: ignore[arg-type]
@@ -102,7 +108,7 @@ async def get_models(provider: str) -> list[ModelInfo]:
 
 @router.post("/llm/test/{provider}", response_model=ProviderTestResult)
 async def test_llm(provider: str) -> ProviderTestResult:
-    if provider not in ("ollama", "openai", "gemini", "anthropic"):
+    if provider not in LLM_PROVIDERS:
         raise HTTPException(400, "Unknown provider")
     ok, msg, models = await test_provider(provider)  # type: ignore[arg-type]
     return ProviderTestResult(success=ok, message=msg, models=models)
@@ -110,7 +116,7 @@ async def test_llm(provider: str) -> ProviderTestResult:
 
 @router.post("/llm/key/{provider}")
 async def set_api_key(provider: str, body: dict) -> dict:
-    if provider not in ("openai", "gemini", "anthropic"):
+    if provider not in API_KEY_PROVIDERS:
         raise HTTPException(400, "This provider does not use an API key")
     key = body.get("api_key", "")
     if not key:
@@ -121,7 +127,7 @@ async def set_api_key(provider: str, body: dict) -> dict:
 
 @router.delete("/llm/key/{provider}")
 async def remove_api_key(provider: str) -> dict:
-    if provider not in ("openai", "gemini", "anthropic"):
+    if provider not in API_KEY_PROVIDERS:
         raise HTTPException(400, "This provider does not use an API key")
     delete_api_key(provider)  # type: ignore[arg-type]
     return {"ok": True}

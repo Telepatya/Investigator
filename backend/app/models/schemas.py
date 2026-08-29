@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-ProviderType = Literal["ollama", "openai", "gemini", "anthropic"]
+ProviderType = Literal["ollama", "openai", "openrouter", "gemini", "anthropic"]
 Severity = Literal["info", "low", "medium", "high", "critical"]
 CaseStatus = Literal["created", "ingesting", "analyzing", "ready", "error"]
 
@@ -129,6 +129,7 @@ class LLMConfigUpdate(BaseModel):
     provider: ProviderType | None = None
     model: str | None = None
     ollama_base_url: str | None = None
+    openrouter_base_url: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
     analysis_max_tool_calls: int | None = Field(default=None, ge=0, le=20)
@@ -141,6 +142,7 @@ class LLMConfigResponse(BaseModel):
     provider: ProviderType
     model: str
     ollama_base_url: str
+    openrouter_base_url: str
     temperature: float
     max_tokens: int
     analysis_max_tool_calls: int

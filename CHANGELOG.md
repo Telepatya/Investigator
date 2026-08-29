@@ -7,6 +7,9 @@ migration, and verification details live in `docs/releases/`.
 
 ### Added
 
+- OpenRouter is available as a remote AI provider, with secure per-provider API
+  key storage, live model discovery, connection testing, and configurable API
+  endpoint support through its OpenAI-compatible interface.
 - A **Rules** page (top-level, between Reverse and Settings) lists every detection
   rule the engine runs — 324 built-in rules catalogued from the detection tables,
   plus any custom rules — and lets each one be enabled or disabled, with a

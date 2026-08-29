@@ -44,7 +44,7 @@ not installation prerequisites.
 | `memprocfs` | Raw-memory mounting and forensic extraction | Memory images cannot be processed; log and artifact workflows remain available. |
 | `yara-python` | YARA scanning of extracted memory bytes | YARA results are skipped and health/status explains the missing capability. |
 | Ollama | Fully local AI reports and chat | Deterministic investigation remains available. |
-| OpenAI, Anthropic, or Gemini account/API key | Remote AI reports and chat | That provider cannot be selected; no effect on deterministic analysis. |
+| OpenAI, OpenRouter, Anthropic, or Gemini account/API key | Remote AI reports and chat | That provider cannot be selected; no effect on deterministic analysis. |
 | Custom YARA rules | Organization-specific memory signatures | Only bundled rules are used. |
 
 The source launcher currently installs `backend/requirements-memory.lock` by

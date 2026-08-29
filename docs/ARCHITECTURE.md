@@ -541,7 +541,7 @@ dossier and runs its synchronous construction off the asyncio event loop.
 
 ### AI orchestration
 
-`app/llm` is provider-neutral. Ollama stays local; OpenAI, Anthropic, and Gemini
+`app/llm` is provider-neutral. Ollama stays local; OpenAI, OpenRouter, Anthropic, and Gemini
 send only prompt/tool excerpts to the configured provider. The Gemini provider
 uses the maintained `google-genai` client (not the legacy `google-generativeai`
 package). API keys live in the OS credential vault, and the settings UI warns that
