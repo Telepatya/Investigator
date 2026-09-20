@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 import sqlite3
 import time
@@ -29,6 +30,13 @@ def _hash(value: str) -> str:
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.touch(exist_ok=True)
+        os.chmod(path, 0o600)
+    except OSError:
+        # Windows ACLs and managed filesystem policies may not expose POSIX
+        # modes; the file is still created below the application data root.
+        pass
     db = sqlite3.connect(path, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout = 10000")
