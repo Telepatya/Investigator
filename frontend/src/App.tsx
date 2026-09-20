@@ -84,7 +84,7 @@ export default function App() {
                 <div className="truncate text-sm font-semibold text-ink-100">{auth?.user?.display_name || "Local session"}</div>
                 <div className="truncate text-xs text-ink-300">{auth?.enabled ? (auth.user?.email || "Organization SSO") : "Offline analysis"}</div>
               </div>
-              {auth?.enabled && <button className="text-xs text-ink-300 hover:text-accent-blue" onClick={() => void logout}>Log out</button>}
+              {auth?.enabled && <button className="text-xs text-ink-300 hover:text-accent-blue" onClick={() => void logout()}>Log out</button>}
             </div>
           </div>
 

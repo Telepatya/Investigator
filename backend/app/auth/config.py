@@ -8,12 +8,16 @@ application's regular settings export and backup paths.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 
 TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 FALSE_VALUES = frozenset({"0", "false", "no", "off", ""})
+DEFAULT_SCOPES = ("openid", "profile", "email")
+_SCOPE_TOKEN_RE = re.compile(r"^[\x21\x23-\x5b\x5d-\x7e]+$")
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 def _env(name: str, *aliases: str) -> str | None:
@@ -42,6 +46,18 @@ def _split_values(raw: str | None) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _parse_scopes(raw: str | None) -> tuple[tuple[str, ...], str | None]:
+    if raw is None:
+        return DEFAULT_SCOPES, None
+    tokens = raw.split(" ")
+    if not tokens or any(not token or not _SCOPE_TOKEN_RE.fullmatch(token) for token in tokens):
+        return (), "OIDC scopes must be safe space-delimited tokens"
+    if "openid" not in tokens:
+        tokens.insert(0, "openid")
+    # Keep the operator's order while avoiding duplicate scope parameters.
+    return tuple(dict.fromkeys(tokens)), None
+
+
 def normalize_origin(raw: str | None) -> str | None:
     """Validate and normalize an explicit public origin.
 
@@ -66,6 +82,8 @@ def normalize_origin(raw: str | None) -> str | None:
     except ValueError:
         return None
     host = parsed.hostname.lower()
+    if parsed.scheme == "http" and host not in _LOOPBACK_HOSTS:
+        return None
     rendered_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
     netloc = rendered_host if port is None else f"{rendered_host}:{port}"
     return urlunsplit((parsed.scheme.lower(), netloc, "", "", ""))
@@ -85,6 +103,7 @@ class AuthConfig:
     idle_seconds: int
     absolute_seconds: int
     transaction_seconds: int
+    scopes: tuple[str, ...] = DEFAULT_SCOPES
     error: str | None = None
 
     @property
@@ -122,6 +141,7 @@ def get_auth_config() -> AuthConfig:
     )
     admin_claim = _env("INVESTIGATOR_SSO_ADMIN_CLAIM", "INVESTIGATOR_AUTH_ADMIN_CLAIM")
     admin_value = _env("INVESTIGATOR_SSO_ADMIN_VALUE", "INVESTIGATOR_AUTH_ADMIN_VALUE")
+    scopes, scopes_error = _parse_scopes(_env("INVESTIGATOR_OIDC_SCOPES", "INVESTIGATOR_SSO_SCOPES"))
 
     issues: list[str] = []
     if enabled:
@@ -141,6 +161,8 @@ def get_auth_config() -> AuthConfig:
             issues.append("at least one token claim name is required")
         if not allowed_values:
             issues.append("at least one exact allowlist value is required")
+        if scopes_error:
+            issues.append(scopes_error)
         if (admin_claim is None) != (admin_value is None):
             issues.append("admin claim and admin value must be supplied together")
         if issuer:
@@ -151,6 +173,17 @@ def get_auth_config() -> AuthConfig:
                 issues.append("OIDC issuer must not include credentials, query, or fragment")
             elif parsed_issuer.scheme == "http" and parsed_issuer.hostname not in {"localhost", "127.0.0.1", "::1"}:
                 issues.append("OIDC issuer must use HTTPS except for loopback development")
+        if raw_origin:
+            try:
+                parsed_origin = urlsplit(raw_origin)
+            except ValueError:
+                parsed_origin = None
+            if (
+                parsed_origin is not None
+                and parsed_origin.scheme == "http"
+                and (parsed_origin.hostname or "").lower() not in _LOOPBACK_HOSTS
+            ):
+                issues.append("public origin must use HTTPS except for loopback development")
     try:
         idle_seconds = max(60, min(int(_env("INVESTIGATOR_SSO_IDLE_SECONDS") or "1800"), 86400))
         absolute_seconds = max(idle_seconds, min(int(_env("INVESTIGATOR_SSO_ABSOLUTE_SECONDS") or "28800"), 604800))
@@ -172,5 +205,6 @@ def get_auth_config() -> AuthConfig:
         idle_seconds=idle_seconds,
         absolute_seconds=absolute_seconds,
         transaction_seconds=transaction_seconds,
+        scopes=scopes,
         error="; ".join(issues) if issues else None,
     )

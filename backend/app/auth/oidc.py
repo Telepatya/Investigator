@@ -12,6 +12,7 @@ from urllib.parse import urlencode, urlsplit
 
 import httpx
 from authlib.jose import JsonWebToken
+from authlib.oidc.core import CodeIDToken
 
 from .config import AuthConfig
 
@@ -36,6 +37,7 @@ class OIDCMetadata:
     token_endpoint: str
     jwks_uri: str
     issuer: str
+    token_endpoint_auth_methods_supported: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -67,12 +69,20 @@ async def discover(config: AuthConfig) -> OIDCMetadata:
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("OIDC discovery failed: %s", type(exc).__name__)
         raise OIDCError("Identity provider discovery failed") from exc
+    if not isinstance(document, dict):
+        raise OIDCError("Identity provider metadata is invalid")
+    raw_auth_methods = document.get("token_endpoint_auth_methods_supported", ["client_secret_basic"])
+    if not isinstance(raw_auth_methods, list) or any(
+        not isinstance(method, str) or not method for method in raw_auth_methods
+    ):
+        raise OIDCError("Identity provider token authentication methods are invalid")
     try:
         metadata = OIDCMetadata(
             authorization_endpoint=str(document["authorization_endpoint"]),
             token_endpoint=str(document["token_endpoint"]),
             jwks_uri=str(document["jwks_uri"]),
             issuer=str(document["issuer"]),
+            token_endpoint_auth_methods_supported=tuple(raw_auth_methods),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise OIDCError("Identity provider metadata is incomplete") from exc
@@ -83,6 +93,13 @@ async def discover(config: AuthConfig) -> OIDCMetadata:
             parsed_endpoint = urlsplit(endpoint)
         except ValueError:
             raise OIDCError("Identity provider endpoint is invalid") from None
+        if (
+            parsed_endpoint.username
+            or parsed_endpoint.password
+            or parsed_endpoint.query
+            or parsed_endpoint.fragment
+        ):
+            raise OIDCError("Identity provider endpoint is invalid")
         if parsed_endpoint.scheme == "https" and parsed_endpoint.hostname:
             continue
         if parsed_endpoint.scheme == "http" and parsed_endpoint.hostname in {"localhost", "127.0.0.1", "::1"}:
@@ -99,7 +116,7 @@ async def authorization_url(config: AuthConfig, *, state: str, nonce: str, verif
         "client_id": config.client_id,
         "response_type": "code",
         "redirect_uri": config.callback_url(),
-        "scope": "openid profile email",
+        "scope": " ".join(config.scopes),
         "state": state,
         "nonce": nonce,
         "code_challenge": pkce_challenge(verifier),
@@ -119,14 +136,22 @@ async def exchange_code(config: AuthConfig, *, code: str, verifier: str) -> dict
         "client_id": config.client_id,
         "code_verifier": verifier,
     }
+    if "client_secret_basic" in metadata.token_endpoint_auth_methods_supported:
+        auth: tuple[str, str] | None = (config.client_id, config.client_secret)
+    elif "client_secret_post" in metadata.token_endpoint_auth_methods_supported:
+        auth = None
+        payload["client_secret"] = config.client_secret
+    else:
+        raise OIDCError("Identity provider does not advertise a supported client authentication method")
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-            response = await client.post(
-                metadata.token_endpoint,
-                data=payload,
-                auth=(config.client_id, config.client_secret),
-                headers={"Accept": "application/json"},
-            )
+            request_kwargs: dict[str, Any] = {
+                "data": payload,
+                "headers": {"Accept": "application/json"},
+            }
+            if auth is not None:
+                request_kwargs["auth"] = auth
+            response = await client.post(metadata.token_endpoint, **request_kwargs)
             response.raise_for_status()
             token_document = response.json()
     except (httpx.HTTPError, ValueError) as exc:
@@ -156,14 +181,15 @@ async def validate_id_token(config: AuthConfig, *, id_token: str, nonce: str) ->
         claims = token.decode(
             id_token,
             jwks,
+            claims_cls=CodeIDToken,
             claims_options={
                 "iss": {"essential": True, "value": config.issuer},
                 "sub": {"essential": True},
                 "aud": {"essential": True, "value": config.client_id},
                 "exp": {"essential": True},
                 "iat": {"essential": True},
-                "nonce": {"essential": True, "value": nonce},
             },
+            claims_params={"client_id": config.client_id, "nonce": nonce},
         )
         claims.validate(leeway=60)
     except Exception as exc:

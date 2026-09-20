@@ -114,7 +114,9 @@ DNS rebinding, so the backend enforces origin/host controls, centralized in
 When SSO is enabled, all `/api` product endpoints (including uploads,
 downloads, settings, rules, Reverse, and every WebSocket) require a valid
 server-side session. Only health and auth bootstrap/login/callback endpoints are
-anonymous. The opaque session cookie is HttpOnly, SameSite=Lax, Secure on HTTPS,
+anonymous; FastAPI's `/docs`, `/redoc`, and `/openapi.json` metadata endpoints
+also require a session. Static SPA assets remain public for the login shell. The
+opaque session cookie is HttpOnly, SameSite=Lax, Secure on HTTPS,
 and only its hash is stored; ID/access tokens and full claims are never stored
 or returned. Entra group-overage indicators fail closed without Graph calls.
 

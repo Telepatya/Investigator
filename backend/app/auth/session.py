@@ -16,6 +16,7 @@ from app import config as app_config
 
 
 COOKIE_NAME = "investigator_session"
+OIDC_BINDING_COOKIE_NAME = "investigator_oidc_binding"
 _db_lock = RLock()
 
 
@@ -56,6 +57,7 @@ def _connect() -> sqlite3.Connection:
         );
         CREATE TABLE IF NOT EXISTS oidc_transactions (
             state_hash TEXT PRIMARY KEY,
+            binding_hash TEXT,
             nonce TEXT NOT NULL,
             code_verifier TEXT NOT NULL,
             return_path TEXT NOT NULL,
@@ -66,6 +68,13 @@ def _connect() -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_oidc_transactions_expires ON oidc_transactions(expires_at);
         """
     )
+    # Old auth databases may have transactions created before browser binding
+    # existed. Keep the database readable, but those rows cannot be consumed.
+    transaction_columns = {
+        str(row[1]) for row in db.execute("PRAGMA table_info(oidc_transactions)")
+    }
+    if "binding_hash" not in transaction_columns:
+        db.execute("ALTER TABLE oidc_transactions ADD COLUMN binding_hash TEXT")
     return db
 
 
@@ -99,27 +108,29 @@ class UserSession:
         }
 
 
-def create_transaction(*, nonce: str, code_verifier: str, return_path: str, expires_at: float) -> str:
+def create_transaction(
+    *, nonce: str, code_verifier: str, binding_secret: str, return_path: str, expires_at: float,
+) -> str:
     state = secrets.token_urlsafe(32)
     now = time.time()
     with _db_lock, _database() as db:
         db.execute("DELETE FROM oidc_transactions WHERE expires_at <= ?", (now,))
         db.execute(
-            "INSERT INTO oidc_transactions(state_hash, nonce, code_verifier, return_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (_hash(state), nonce, code_verifier, return_path, now, expires_at),
+            "INSERT INTO oidc_transactions(state_hash, binding_hash, nonce, code_verifier, return_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_hash(state), _hash(binding_secret), nonce, code_verifier, return_path, now, expires_at),
         )
     return state
 
 
-def consume_transaction(state: str, now: float | None = None) -> dict[str, str] | None:
+def consume_transaction(state: str, binding_secret: str, now: float | None = None) -> dict[str, str] | None:
     current = time.time() if now is None else now
     with _db_lock, _database() as db:
         # Lock the database before reading so two worker processes cannot both
         # observe and consume the same one-time state value.
         db.execute("BEGIN IMMEDIATE")
         row = db.execute(
-            "SELECT nonce, code_verifier, return_path, expires_at FROM oidc_transactions WHERE state_hash = ?",
-            (_hash(state),),
+            "SELECT nonce, code_verifier, return_path, expires_at FROM oidc_transactions WHERE state_hash = ? AND binding_hash = ?",
+            (_hash(state), _hash(binding_secret)),
         ).fetchone()
         if row is None:
             return None

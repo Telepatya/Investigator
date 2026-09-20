@@ -7,11 +7,19 @@ import time
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from .config import get_auth_config
 from .oidc import OIDCError, authorization_url, exchange_code, pkce_verifier, validate_id_token
-from .session import COOKIE_NAME, consume_transaction, create_session, create_transaction, get_session, revoke_session
+from .session import (
+    COOKIE_NAME,
+    OIDC_BINDING_COOKIE_NAME,
+    consume_transaction,
+    create_session,
+    create_transaction,
+    get_session,
+    revoke_session,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -33,6 +41,16 @@ def _return_path(value: str | None) -> str:
 
 def _cookie_value(request: Request) -> str | None:
     return request.cookies.get(COOKIE_NAME)
+
+
+def _binding_cookie_value(request: Request) -> str | None:
+    return request.cookies.get(OIDC_BINDING_COOKIE_NAME)
+
+
+def _callback_failure(detail: str, status_code: int) -> JSONResponse:
+    response = JSONResponse(status_code=status_code, content={"detail": detail})
+    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path="/")
+    return response
 
 
 @router.get("/bootstrap")
@@ -63,18 +81,30 @@ async def auth_login(return_to: str | None = None) -> RedirectResponse:
     safe_return = _return_path(return_to)
     verifier = pkce_verifier()
     nonce = secrets.token_urlsafe(32)
+    binding_secret = secrets.token_urlsafe(32)
     state = create_transaction(
         nonce=nonce,
         code_verifier=verifier,
+        binding_secret=binding_secret,
         return_path=safe_return,
         expires_at=time.time() + config.transaction_seconds,
     )
     try:
         target = await authorization_url(config, state=state, nonce=nonce, verifier=verifier)
     except OIDCError as exc:
-        consume_transaction(state)
+        consume_transaction(state, binding_secret)
         raise HTTPException(502, "Identity provider is unavailable") from exc
-    return RedirectResponse(target, status_code=303)
+    response = RedirectResponse(target, status_code=303)
+    response.set_cookie(
+        OIDC_BINDING_COOKIE_NAME,
+        binding_secret,
+        max_age=config.transaction_seconds,
+        httponly=True,
+        secure=config.cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+    return response
 
 
 @router.get("/callback")
@@ -83,20 +113,25 @@ async def auth_callback(
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
-) -> RedirectResponse:
+) -> Response:
     config = get_auth_config()
     if not config.configured:
-        raise HTTPException(503, "Authentication is misconfigured")
-    if error or not code or not state or len(state) > 256:
-        raise HTTPException(400, "Authentication transaction failed")
-    transaction = consume_transaction(state)
+        return _callback_failure("Authentication is misconfigured", 503)
+    binding_secret = _binding_cookie_value(request)
+    if (error or not code) and state and len(state) <= 256 and binding_secret:
+        # A provider denial is terminal for the matching browser, but a
+        # mismatched browser must not consume the initiator's transaction.
+        consume_transaction(state, binding_secret)
+    if error or not code or not state or len(state) > 256 or not binding_secret:
+        return _callback_failure("Authentication transaction failed", 400)
+    transaction = consume_transaction(state, binding_secret)
     if transaction is None:
-        raise HTTPException(400, "Authentication transaction expired or already used")
+        return _callback_failure("Authentication transaction expired, already used, or bound to another browser", 400)
     try:
         token_document = await exchange_code(config, code=code, verifier=transaction["code_verifier"])
         identity = await validate_id_token(config, id_token=token_document["id_token"], nonce=transaction["nonce"])
-    except OIDCError as exc:
-        raise HTTPException(401, "Authentication failed") from exc
+    except OIDCError:
+        return _callback_failure("Authentication failed", 401)
     # A successful callback always rotates the browser credential. Revoke a
     # pre-existing session presented on the callback request so login cannot
     # leave an older bearer cookie active.
@@ -110,6 +145,7 @@ async def auth_callback(
         absolute_seconds=config.absolute_seconds,
     )
     response = RedirectResponse(transaction["return_path"], status_code=303)
+    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path="/")
     response.set_cookie(
         COOKIE_NAME,
         token,

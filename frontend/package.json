@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:auth": "node scripts/test-auth-gate.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.62.0",

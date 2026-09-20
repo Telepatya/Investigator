@@ -6,7 +6,8 @@ acceptance criteria.
 - Authentication is disabled by default and the standard launcher remains a
   loopback-only single-user workflow. Optional OIDC SSO supports one IdP and one
   shared organization pool, not per-case RBAC, SAML, SCIM, or Graph-backed group
-  expansion. Use HTTPS and follow [SSO.md](SSO.md) before any shared deployment.
+  expansion. The optional admin marker is informational only. Use HTTPS and
+  follow [SSO.md](SSO.md) before any shared deployment.
   Entra group-overage tokens are rejected closed and must be handled with app
   roles or application-assigned groups.
 - Only one backend process may operate on a case directory. The operation and

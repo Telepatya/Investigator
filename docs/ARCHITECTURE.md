@@ -134,7 +134,8 @@ uses Vite on `:5173` with `/api` proxied to the backend.
 When enabled with environment variables, ASGI middleware authenticates every API
 and WebSocket scope before route code runs. Health and auth bootstrap/login/
 callback endpoints remain anonymous so the SPA can render a login or
-configuration error; static assets remain public. OIDC discovery, authorization
+configuration error; FastAPI documentation metadata endpoints are protected,
+while static assets remain public. OIDC discovery, authorization
 code exchange, and ID-token signature/issuer/audience/time checks use Authlib and
 an explicit asymmetric algorithm allowlist. State, nonce, and PKCE verifier are
 one-time SQLite transactions. Successful identities are reduced to a subject,
@@ -142,8 +143,11 @@ display name/email, and admin bit; full claims and tokens are not persisted.
 
 Session cookies are opaque random values whose SHA-256 hashes are stored in
 `~/.investigator/auth.db`, with idle and absolute expiry and logout revocation.
-The exact configured public origin drives callback, CORS, Host, HTTP Origin, and
-WebSocket Origin policy; forwarded headers are never trusted. Group/role claims
+OIDC transactions also require a separate browser-bound, short-lived HttpOnly
+cookie whose hash is stored server-side, preventing one browser from replaying
+another browser's state. The exact configured public origin drives callback,
+CORS, Host, HTTP Origin, and WebSocket Origin policy; forwarded headers are
+never trusted. Group/role claims
 are compared case-sensitively against one deployment allowlist. Entra
 `hasgroups`/`_claim_names` overage indicators fail closed rather than invoking
 Graph. SSO is intentionally one IdP and one shared pool of cases/rules/Reverse

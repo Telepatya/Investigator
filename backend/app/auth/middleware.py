@@ -18,6 +18,7 @@ PUBLIC_HTTP_PATHS = frozenset({
     "/api/auth/login",
     "/api/auth/callback",
 })
+DOCUMENTATION_HTTP_PATHS = frozenset({"/docs", "/redoc", "/openapi.json"})
 
 
 def _cookie(scope: dict[str, Any]) -> str | None:
@@ -54,7 +55,7 @@ class AuthMiddleware:
         path = _path(scope)
         session = get_session(_cookie(scope), idle_seconds=config.idle_seconds) if config.configured else None
         if scope["type"] == "http":
-            if path in PUBLIC_HTTP_PATHS or not path.startswith("/api/"):
+            if path in PUBLIC_HTTP_PATHS or (not path.startswith("/api/") and path not in DOCUMENTATION_HTTP_PATHS):
                 await self.app(scope, receive, send)
                 return
             if not config.configured:

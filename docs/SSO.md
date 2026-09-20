@@ -12,18 +12,24 @@ INVESTIGATOR_PUBLIC_ORIGIN=https://investigator.example.com
 INVESTIGATOR_OIDC_ISSUER=https://issuer.example.com/oauth2/default
 INVESTIGATOR_OIDC_CLIENT_ID=<web-app-client-id>
 INVESTIGATOR_OIDC_CLIENT_SECRET=<web-app-client-secret>
+INVESTIGATOR_OIDC_SCOPES=openid profile email
 INVESTIGATOR_SSO_CLAIMS=groups,roles
 INVESTIGATOR_SSO_ALLOWED_VALUES=Investigator-Analysts,00000000-0000-0000-0000-000000000001
 INVESTIGATOR_SSO_ADMIN_CLAIM=roles
 INVESTIGATOR_SSO_ADMIN_VALUE=Investigator-Admins
 ```
 
-`INVESTIGATOR_PUBLIC_ORIGIN` is an exact `http(s)` origin (scheme, hostname,
-and optional port only). The callback URI is derived from it as
+`INVESTIGATOR_PUBLIC_ORIGIN` is an exact origin (scheme, hostname, and optional
+port only). HTTPS is required except for loopback development origins
+(`localhost`, `127.0.0.1`, or `::1`). The callback URI is derived from it as
 `<public-origin>/api/auth/callback`; it is never derived from `Host` or proxy
 headers. Use HTTPS in a shared deployment. The client secret is required when
 SSO is enabled; an incomplete configuration fails closed with no silent
 fallback to anonymous access.
+
+`INVESTIGATOR_OIDC_SCOPES` is a space-delimited list of safe OAuth scope
+tokens. `openid` is always added if omitted. Keep the list limited to scopes
+registered for this application; it is sent only in the authorization request.
 
 The implementation uses Authorization Code + PKCE S256, state and nonce
 transactions held server-side for one use, Authlib signature/issuer/audience/
@@ -47,6 +53,7 @@ SAML, SCIM, directory Graph calls, or API tokens.
    resulting client ID and secret as environment variables above.
 4. Add a **groups** claim to the ID token (or use an existing one), with a
    filter that only emits the groups needed by this app. Set
+   `INVESTIGATOR_OIDC_SCOPES=openid profile email groups` and set
    `INVESTIGATOR_SSO_CLAIMS=groups` and list the exact case-sensitive Okta group
    names in `INVESTIGATOR_SSO_ALLOWED_VALUES`. If administrators use a separate
    group, set the admin claim/value to `groups` and that exact group name.
@@ -62,8 +69,10 @@ SAML, SCIM, directory Graph calls, or API tokens.
    `https://login.microsoftonline.com/<tenant-id>/v2.0`.
 3. Under **Token configuration**, add a **Groups** claim. Prefer **Groups
    assigned to the application** and assign the required users/groups under
-   **Enterprise applications → Users and groups**. Configure
-   `INVESTIGATOR_SSO_CLAIMS=groups` and allowlist the exact Entra group object
+   **Enterprise applications → Users and groups**. Keep
+   `INVESTIGATOR_OIDC_SCOPES=openid profile email`; group claims are configured
+   in the app registration and are not requested through an unconditional
+   `groups` scope. Set `INVESTIGATOR_SSO_CLAIMS=groups` and allowlist the exact Entra group object
    IDs (case-sensitive string comparison).
 4. Alternatively define an **app role** such as `Investigator.Analyst` and
    assign it to users/groups. Configure `INVESTIGATOR_SSO_CLAIMS=roles` and
@@ -76,11 +85,20 @@ and does not request directory-wide permissions. Reduce assigned groups,
 prefer app roles, or use groups assigned to the application so the complete
 allowlisted claim fits in the ID token.
 
+The optional `INVESTIGATOR_SSO_ADMIN_CLAIM` and
+`INVESTIGATOR_SSO_ADMIN_VALUE` settings produce an informational `is_admin`
+marker in the bootstrap identity. They do not grant additional permissions:
+SSO deployments intentionally use one shared pool and have no per-case RBAC or
+admin settings endpoint.
+
 ## Operations and troubleshooting
 
 - Anonymous access to product APIs and all WebSockets is denied with JSON 401 or
   a pre-accept WebSocket denial. Health and the auth bootstrap/login/callback
   endpoints remain anonymous so the UI can show a login or configuration error.
+- FastAPI's `/docs`, `/redoc`, and `/openapi.json` metadata endpoints are
+  protected by the same session boundary when SSO is enabled; static SPA assets
+  remain public so the login shell can load.
 - Authenticated browser mutations require the exact configured HTTP `Origin`.
   Host, CORS, HTTP Origin, and WebSocket Origin checks all use the explicit
   public origin. Missing/bad origins are denied while SSO is enabled.

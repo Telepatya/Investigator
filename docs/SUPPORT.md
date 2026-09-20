@@ -12,9 +12,12 @@ release may not be delayed for that environment.
 | Ubuntu 24.04 LTS | x86-64 | Core supported | CI validated from source | Best effort; depends on MemProcFS platform support | Source checkout |
 | Other Windows, Linux, macOS | any | Unsupported/community | May work from source | Not release validated | None |
 
-Investigator is a local desktop workflow and is not supported as a shared,
-multi-user, Internet-exposed service. Windows on ARM, containers, WSL GUI use,
-and network filesystems for the case directory are not release targets.
+Investigator's default mode is a local desktop workflow and is not supported as
+an Internet-exposed service. An explicitly configured OIDC deployment may be
+used by one organization behind TLS and a correctly configured reverse proxy,
+with one shared pool of cases/rules/Reverse projects; it is not a general
+multi-tenant service and has no per-case RBAC. Windows on ARM, containers, WSL
+GUI use, and network filesystems for the case directory are not release targets.
 
 ## Toolchain
 
