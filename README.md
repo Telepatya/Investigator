@@ -20,6 +20,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - [Features](#features)
 - [Supported evidence](#supported-evidence)
 - [Quick start](#quick-start)
+- [Optional organization SSO](#optional-organization-sso)
 - [Configure the AI](#configure-the-ai)
 - [Working a case](#working-a-case)
 - [How analysis works](#how-analysis-works)
@@ -155,6 +156,12 @@ python run.py
 On Windows you can also just double-click **`run.bat`** (it calls `run.py`).
 
 This creates the Python virtual environment, installs locked dependencies, builds the frontend, and opens the app at `http://localhost:8400`.
+
+Authentication is disabled by default and the normal mode is loopback-only. An
+organization can opt into standards-based OIDC SSO with environment-only
+configuration; see [Optional organization SSO](docs/SSO.md) for exact Okta and
+Microsoft Entra setup, redirect URIs, claim allowlisting, and the Entra
+group-overage limitation.
 
 Options:
 

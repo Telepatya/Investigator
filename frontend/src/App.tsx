@@ -9,6 +9,7 @@ import { useTheme } from "./lib/theme";
 import { api } from "./lib/api";
 import { fmtTime } from "./lib/ui";
 import type { EventRow } from "./lib/types";
+import { useAuth } from "./components/AuthGate";
 
 const BRAND_CREDIT = "Made by Roei.f";
 const APP_VERSION = "0.1.0";
@@ -24,6 +25,7 @@ const NAV = [
 export default function App() {
   const loc = useLocation();
   const { theme, toggleTheme } = useTheme();
+  const { auth, logout } = useAuth();
   const inCase = loc.pathname.startsWith("/cases/");
   const caseId = inCase ? loc.pathname.split("/")[2] : "";
   const [searchOpen, setSearchOpen] = useState(false);
@@ -79,9 +81,10 @@ export default function App() {
                 <ShieldCheck size={18} />
               </div>
               <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-semibold text-ink-100">Local session</div>
-                <div className="truncate text-xs text-ink-300">Offline analysis</div>
+                <div className="truncate text-sm font-semibold text-ink-100">{auth?.user?.display_name || "Local session"}</div>
+                <div className="truncate text-xs text-ink-300">{auth?.enabled ? (auth.user?.email || "Organization SSO") : "Offline analysis"}</div>
               </div>
+              {auth?.enabled && <button className="text-xs text-ink-300 hover:text-accent-blue" onClick={() => void logout}>Log out</button>}
             </div>
           </div>
 

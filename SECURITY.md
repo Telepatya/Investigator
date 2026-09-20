@@ -88,34 +88,42 @@ rules rather than constructing paths directly from route or form values.
 
 ## Network Exposure And Local-Only Model
 
-Investigator is a single-user, loopback-only application. It binds to `127.0.0.1`
-and has no built-in authentication. Binding to loopback alone does **not** protect
-it from a hostile web page in the user's browser or from DNS rebinding, so the
-backend enforces origin/host controls, centralized in `backend/app/api/security.py`:
+Investigator is a single-user, loopback-only application by default. An optional
+one-organization OIDC mode is available for an explicitly configured public
+origin; see [the SSO deployment guide](docs/SSO.md). Binding to loopback alone
+does **not** protect it from a hostile web page in the user's browser or from
+DNS rebinding, so the backend enforces origin/host controls, centralized in
+`backend/app/api/security.py`:
 
 - **Host allowlist.** `TrustedHostMiddleware` compares each request's `Host`
-  header (port stripped) against `ALLOWED_HOSTS` (`localhost`, `127.0.0.1`) and
-  rejects anything else with `400`. This blocks DNS rebinding, where an attacker
-  domain resolves to `127.0.0.1`: the rebound request still carries the attacker's
-  hostname in `Host` and is refused.
+  header against `localhost`/`127.0.0.1` when SSO is disabled, or the hostname
+  explicitly present in `INVESTIGATOR_PUBLIC_ORIGIN` when SSO is enabled. It
+  never trusts forwarded headers.
 - **CORS allowlist.** Cross-origin HTTP reads are limited to the built app on
   `INVESTIGATOR_PORT` and the Vite dev server on `:5173`.
 - **HTTP Origin validation.** CORS does not stop a browser from sending a simple
   cross-origin write such as `multipart/form-data`. Every `POST`, `PUT`, `PATCH`,
-  and `DELETE` with a present `Origin` is therefore rejected unless it matches
-  the frontend allowlist. Non-browser clients may omit `Origin`.
-- **WebSocket origin validation.** CORS does not apply to WebSocket handshakes, so
-  every WebSocket route validates the browser `Origin` against the same allowlist
-  (and the target case's existence) *before* accepting. A missing `Origin` denotes
-  a non-browser client and is not a cross-site vector; any present-but-unlisted
-  origin (including a rebound attacker page or `null`) is refused.
+  and `DELETE` is rejected unless its Origin matches the frontend allowlist.
+  Non-browser clients may omit Origin only while SSO is disabled; SSO mode
+  requires the exact configured public Origin for mutations.
+- **WebSocket origin validation.** CORS does not apply to WebSocket handshakes;
+  every handshake is denied at the ASGI boundary unless its Origin and session
+  satisfy the configured policy before route code can accept it. Disabled mode
+  keeps the existing non-browser missing-Origin behavior.
 
-**Changing the bind address.** If you deliberately expose the backend on a
-non-loopback hostname, you must add that hostname to `ALLOWED_HOSTS` **and** to
-`allowed_origins()` in `backend/app/api/security.py` — the two lists must stay
-aligned, or the app will reject its own traffic. Exposing this app beyond loopback
-also means exposing an unauthenticated DFIR tool; add authentication and transport
-security (e.g. a reverse proxy) before doing so.
+When SSO is enabled, all `/api` product endpoints (including uploads,
+downloads, settings, rules, Reverse, and every WebSocket) require a valid
+server-side session. Only health and auth bootstrap/login/callback endpoints are
+anonymous. The opaque session cookie is HttpOnly, SameSite=Lax, Secure on HTTPS,
+and only its hash is stored; ID/access tokens and full claims are never stored
+or returned. Entra group-overage indicators fail closed without Graph calls.
+
+**Changing the bind address.** Disabled mode is intended for loopback only. If
+you deliberately expose the backend on a non-loopback hostname, configure SSO
+with the exact public origin and TLS first; SSO mode derives the Host/Origin
+allowlists from that origin and rejects incomplete configuration. A reverse
+proxy must preserve the public-origin contract rather than supplying a
+forwarded-host value that the app can trust.
 
 ## Resource Limits
 

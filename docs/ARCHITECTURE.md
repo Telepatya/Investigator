@@ -92,6 +92,7 @@ flowchart LR
     USER["Analyst actions"]
 
     subgraph BACKEND["FastAPI backend"]
+        AUTH["Optional OIDC boundary + SQLite sessions"]
         API["REST and WebSocket routers"]
         OPS["Per-case operation coordinator"]
         INGEST["Ingest pipeline"]
@@ -114,7 +115,8 @@ flowchart LR
     MEMORY --> API --> OPS --> MEM --> DB
     INGEST --> DETECT --> DB
     MEM --> DETECT
-    USER --> SHELL --> API
+    USER --> SHELL --> AUTH --> API
+    IDP["One configured organization IdP"] --> AUTH
     API --> MANUAL --> DB
     DB <--> GRAPH
     DB <--> LLM
@@ -126,6 +128,26 @@ flowchart LR
 The production frontend is built into `frontend/dist` and served by FastAPI, so
 the normal deployment is one local process on `127.0.0.1:8400`. Development mode
 uses Vite on `:5173` with `/api` proxied to the backend.
+
+### Optional organization SSO
+
+When enabled with environment variables, ASGI middleware authenticates every API
+and WebSocket scope before route code runs. Health and auth bootstrap/login/
+callback endpoints remain anonymous so the SPA can render a login or
+configuration error; static assets remain public. OIDC discovery, authorization
+code exchange, and ID-token signature/issuer/audience/time checks use Authlib and
+an explicit asymmetric algorithm allowlist. State, nonce, and PKCE verifier are
+one-time SQLite transactions. Successful identities are reduced to a subject,
+display name/email, and admin bit; full claims and tokens are not persisted.
+
+Session cookies are opaque random values whose SHA-256 hashes are stored in
+`~/.investigator/auth.db`, with idle and absolute expiry and logout revocation.
+The exact configured public origin drives callback, CORS, Host, HTTP Origin, and
+WebSocket Origin policy; forwarded headers are never trusted. Group/role claims
+are compared case-sensitively against one deployment allowlist. Entra
+`hasgroups`/`_claim_names` overage indicators fail closed rather than invoking
+Graph. SSO is intentionally one IdP and one shared pool of cases/rules/Reverse
+projects; it is not a multi-tenant authorization model.
 
 ### Reverse workspaces
 

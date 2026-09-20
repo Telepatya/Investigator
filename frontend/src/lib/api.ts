@@ -27,12 +27,28 @@ import type {
 
 const BASE = "/api";
 
+export interface AuthBootstrap {
+  enabled: boolean;
+  configured: boolean;
+  authenticated: boolean;
+  user: { subject: string; display_name: string | null; email: string | null; is_admin: boolean } | null;
+  login_url: string | null;
+}
+
+function notifyUnauthorized(path: string) {
+  if (!path.startsWith("/auth/")) {
+    window.dispatchEvent(new CustomEvent("investigator:auth-required"));
+  }
+}
+
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
   const contentHeaders = opts?.body instanceof FormData ? undefined : { "Content-Type": "application/json" };
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
-    headers: opts?.headers ?? contentHeaders,
+    credentials: "same-origin",
+    headers: { ...contentHeaders, ...(opts?.headers ?? {}) },
   });
+  if (res.status === 401) notifyUnauthorized(path);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Request failed: ${res.status}`);
@@ -41,6 +57,9 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  authBootstrap: () => req<AuthBootstrap>("/auth/bootstrap"),
+  logout: () => req<{ ok: boolean }>("/auth/logout", { method: "POST" }),
+
   // Cases
   listCases: () => req<Case[]>("/cases"),
   getCase: (id: string, signal?: AbortSignal) => req<Case>(`/cases/${id}`, { signal }),
@@ -392,7 +411,8 @@ export async function downloadMemoryProcessMinidump(
   sessionId: string,
   pid: number,
 ) {
-  const res = await fetch(memoryProcessDownloadUrl(caseId, sessionId, pid, "minidump"));
+  const res = await fetch(memoryProcessDownloadUrl(caseId, sessionId, pid, "minidump"), { credentials: "same-origin" });
+  if (res.status === 401) notifyUnauthorized("/cases/download");
   await saveDownloadResponse(res, `process-${pid}.minidump.dmp`);
 }
 
@@ -421,6 +441,7 @@ export async function downloadMemoryVfsArchive(caseId: string, sessionId: string
     downloadUrl(`/cases/${caseId}/memory/${encodeURIComponent(sessionId)}/vfs/archive`),
     {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ paths }),
     },

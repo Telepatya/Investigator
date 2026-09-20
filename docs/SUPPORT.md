@@ -25,6 +25,15 @@ and network filesystems for the case directory are not release targets.
 | npm | Version bundled with supported Node 22 | Building from source | Installs exactly from `frontend/package-lock.json` with `npm ci`. |
 | Modern browser | Current Edge, Chrome, or Firefox | Always | The backend binds to loopback and opens the UI locally. |
 
+## Optional organization SSO
+
+OIDC SSO is supported as an environment-configured deployment option with one
+IdP per backend. Okta and Microsoft Entra web-app registrations are documented
+in [SSO.md](SSO.md). The SSO path is validated against the supported browser and
+Python runtimes above, but an IdP tenant, reverse proxy, TLS termination, and
+claim policy remain deployment-specific. SAML, SCIM, API tokens, multi-tenant
+isolation, and Entra Graph group expansion are not supported.
+
 ## Required Python dependencies
 
 The application runtime dependencies in `backend/requirements.in` and their

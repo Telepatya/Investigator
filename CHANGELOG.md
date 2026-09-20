@@ -7,6 +7,11 @@ migration, and verification details live in `docs/releases/`.
 
 ### Added
 
+- Optional organization OIDC SSO with Authorization Code + PKCE, state/nonce
+  replay protection, Authlib-backed token validation, exact Okta/Entra
+  group-or-role allowlisting, opaque server-side sessions, ASGI-boundary API and
+  WebSocket protection, and a documented [deployment guide](docs/SSO.md).
+
 - OpenRouter is available as a remote AI provider, with secure per-provider API
   key storage, live model discovery, connection testing, and configurable API
   endpoint support through its OpenAI-compatible interface.

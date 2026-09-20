@@ -16,7 +16,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api import analysis_router, cases_router, settings_router
-from app.api.security import ALLOWED_HOSTS, allowed_origins, authorize_http
+from app.api.security import allowed_hosts, allowed_origins, authorize_http
+from app.auth.middleware import AuthMiddleware
+from app.auth.router import router as auth_router
 from app.config import ensure_dirs
 from app.store.cases import (
     CaseNotFoundError,
@@ -113,7 +115,7 @@ app = FastAPI(
 # DNS-rebinding, where a hostile page resolves its own domain to 127.0.0.1 and
 # reaches this backend from the victim's browser: the rebound request still
 # carries the attacker's hostname in Host and is refused here.
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 
 # Local-only tool: restrict cross-origin reads to our own frontend origins
 # (built app served by this backend, plus the Vite dev server).
@@ -124,6 +126,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Authentication is enforced for both HTTP and WebSocket scopes before any
+# product route runs. Static SPA assets remain public for the login shell.
+app.add_middleware(AuthMiddleware)
 
 
 @app.middleware("http")
@@ -147,6 +153,7 @@ app.include_router(cases_router.router)
 app.include_router(analysis_router.router)
 app.include_router(reverse_router)
 app.include_router(rules_router)
+app.include_router(auth_router)
 
 
 @app.get("/api/health")

@@ -17,6 +17,7 @@ import ReportPage from "./pages/ReportPage";
 import { ThemeProvider } from "./lib/theme";
 import ReversePage, { ReverseCasePage } from "./pages/ReversePage";
 import ReverseProjectPage from "./pages/ReverseProjectPage";
+import { AuthGate, AuthProvider } from "./components/AuthGate";
 
 // Split the two heaviest routes into on-demand chunks: TimelinePage pulls in
 // vis-timeline and EntityMapPage pulls in reactflow, so neither weighs down the
@@ -74,7 +75,11 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
+        <AuthProvider>
+          <AuthGate>
+            <RouterProvider router={router} />
+          </AuthGate>
+        </AuthProvider>
       </QueryClientProvider>
     </ThemeProvider>
   </React.StrictMode>,
