@@ -381,8 +381,9 @@ export function memoryProcessDownloadUrl(
   );
 }
 
-async function saveDownloadResponse(res: Response, fallbackFilename: string) {
+async function saveDownloadResponse(res: Response, fallbackFilename: string, requestPath?: string) {
   if (!res.ok) {
+    if (res.status === 401 && requestPath) notifyUnauthorized(requestPath);
     const text = await res.text();
     try {
       const parsed = JSON.parse(text) as { detail?: string };
@@ -412,8 +413,7 @@ export async function downloadMemoryProcessMinidump(
   pid: number,
 ) {
   const res = await fetch(memoryProcessDownloadUrl(caseId, sessionId, pid, "minidump"), { credentials: "same-origin" });
-  if (res.status === 401) notifyUnauthorized("/cases/download");
-  await saveDownloadResponse(res, `process-${pid}.minidump.dmp`);
+  await saveDownloadResponse(res, `process-${pid}.minidump.dmp`, "/cases/download");
 }
 
 export function memoryModuleDownloadUrl(
@@ -446,7 +446,7 @@ export async function downloadMemoryVfsArchive(caseId: string, sessionId: string
       body: JSON.stringify({ paths }),
     },
   );
-  await saveDownloadResponse(res, "memprocfs-selection.zip");
+  await saveDownloadResponse(res, "memprocfs-selection.zip", "/cases/memory/vfs/archive");
 }
 
 export function uploadFile(
@@ -466,12 +466,16 @@ export function uploadFile(
       params.set("mem_eventlogs", String(Boolean(memoryOptions.eventlogs)));
     }
     xhr.open("POST", `${BASE}/cases/${caseId}/upload?${params.toString()}`);
+    xhr.withCredentials = true;
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress((e.loaded / e.total) * 100);
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
-      else reject(new Error(xhr.responseText || "Upload failed"));
+      else {
+        if (xhr.status === 401) notifyUnauthorized(`/cases/${caseId}/upload`);
+        reject(new Error(xhr.responseText || "Upload failed"));
+      }
     };
     xhr.onerror = () => reject(new Error("Upload failed"));
     xhr.send(form);

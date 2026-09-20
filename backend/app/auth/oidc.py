@@ -190,12 +190,11 @@ def _claim_values(value: Any) -> tuple[str, ...] | None:
 
 def identity_from_claims(config: AuthConfig, claims: dict[str, Any]) -> Identity:
     """Apply exact group/role allowlisting without retaining full claims."""
-    if claims.get("hasgroups") is not None:
+    if "hasgroups" in claims:
         # Microsoft Entra emits hasgroups when group membership is over the
         # token limit.  Calling Graph is intentionally out of scope.
         raise OIDCError("Identity provider group membership is incomplete")
-    overage = claims.get("_claim_names")
-    if overage is not None:
+    if "_claim_names" in claims:
         # A token containing the overage indirection is not self-contained;
         # do not attempt to guess whether a configured claim is complete.
         raise OIDCError("Identity provider group membership is incomplete")
