@@ -359,10 +359,8 @@ def archive_vfs_selection(case_id: str, session_id: str, paths: list[str]) -> Pa
     # _cache_path returns a canonical child of the case artifact directory;
     # output.name is a single basename and mkstemp adds an unpredictable suffix.
     descriptor, partial_name = tempfile.mkstemp(
-        # codeql[py/path-injection]
-        dir=output.parent,
-        # codeql[py/path-injection]
-        prefix=f".{output.name}.partial-",
+        dir=output.parent,  # codeql[py/path-injection]
+        prefix=f".{output.name}.partial-",  # codeql[py/path-injection]
         suffix=".zip",
     )
     os.close(descriptor)
@@ -402,13 +400,11 @@ def archive_vfs_selection(case_id: str, session_id: str, paths: list[str]) -> Pa
                         })
             zf.writestr("manifest.json", json.dumps(manifest, indent=2))
         # partial is the exact path returned by mkstemp; output passed _cache_path.
-        # codeql[py/path-injection]
-        os.replace(partial, output)
+        os.replace(partial, output)  # codeql[py/path-injection]
     except Exception as exc:
         try:
             # partial is the exact path returned by mkstemp above.
-            # codeql[py/path-injection]
-            partial.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)  # codeql[py/path-injection]
         except OSError:
             logger.warning(
                 "Could not remove partial VFS archive %s",
@@ -728,10 +724,8 @@ def _copy_process_range(
     # output is canonical and contained; output.name is a single basename and
     # mkstemp creates the unpredictable partial file atomically in that directory.
     descriptor, partial_name = tempfile.mkstemp(
-        # codeql[py/path-injection]
-        dir=output.parent,
-        # codeql[py/path-injection]
-        prefix=f".{output.name}.partial-",
+        dir=output.parent,  # codeql[py/path-injection]
+        prefix=f".{output.name}.partial-",  # codeql[py/path-injection]
     )
     partial = Path(partial_name)
     hasher = hashlib.sha256()
@@ -753,8 +747,7 @@ def _copy_process_range(
         if copied != size:
             raise ValueError(f"Incomplete memory read: expected {size} bytes, received {copied}")
         # partial is the exact path returned by mkstemp; output passed containment.
-        # codeql[py/path-injection]
-        os.replace(partial, output)
+        os.replace(partial, output)  # codeql[py/path-injection]
         return {
             **metadata,
             "local_path": str(output),
@@ -766,8 +759,7 @@ def _copy_process_range(
     except Exception as exc:
         try:
             # partial is the exact path returned by mkstemp above.
-            # codeql[py/path-injection]
-            partial.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)  # codeql[py/path-injection]
         except OSError:
             logger.warning(
                 "Could not remove partial memory-range extraction %s",
@@ -790,10 +782,8 @@ def _copy_vfs_file(
     # output is canonical and contained; output.name is a single basename and
     # mkstemp creates the unpredictable partial file atomically in that directory.
     descriptor, partial_name = tempfile.mkstemp(
-        # codeql[py/path-injection]
-        dir=output.parent,
-        # codeql[py/path-injection]
-        prefix=f".{output.name}.partial-",
+        dir=output.parent,  # codeql[py/path-injection]
+        prefix=f".{output.name}.partial-",  # codeql[py/path-injection]
     )
     partial = Path(partial_name)
     hasher = hashlib.sha256()
@@ -818,13 +808,11 @@ def _copy_vfs_file(
         if size_hint is not None and copied != size_hint:
             raise ValueError(f"Incomplete VFS read: expected {size_hint} bytes, received {copied}")
         # partial is the exact path returned by mkstemp; output passed containment.
-        # codeql[py/path-injection]
-        os.replace(partial, output)
+        os.replace(partial, output)  # codeql[py/path-injection]
     except Exception as exc:
         try:
             # partial is the exact path returned by mkstemp above.
-            # codeql[py/path-injection]
-            partial.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)  # codeql[py/path-injection]
         except OSError:
             logger.warning(
                 "Could not remove partial VFS extraction %s",
