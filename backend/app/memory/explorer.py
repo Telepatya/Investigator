@@ -356,8 +356,12 @@ def archive_vfs_selection(case_id: str, session_id: str, paths: list[str]) -> Pa
     output = _cache_path(case_id, dump.dump_stem, "vfs", archive_name)
     manifest: list[dict[str, Any]] = []
     count = 0
+    # _cache_path returns a canonical child of the case artifact directory;
+    # output.name is a single basename and mkstemp adds an unpredictable suffix.
     descriptor, partial_name = tempfile.mkstemp(
+        # codeql[py/path-injection]
         dir=output.parent,
+        # codeql[py/path-injection]
         prefix=f".{output.name}.partial-",
         suffix=".zip",
     )
@@ -397,9 +401,13 @@ def archive_vfs_selection(case_id: str, session_id: str, paths: list[str]) -> Pa
                             "error": str(exc),
                         })
             zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        # partial is the exact path returned by mkstemp; output passed _cache_path.
+        # codeql[py/path-injection]
         os.replace(partial, output)
     except Exception as exc:
         try:
+            # partial is the exact path returned by mkstemp above.
+            # codeql[py/path-injection]
             partial.unlink(missing_ok=True)
         except OSError:
             logger.warning(
@@ -717,8 +725,13 @@ def _copy_process_range(
 ) -> dict[str, Any]:
     output = _contained_artifact_path(allowed_root, output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    # output is canonical and contained; output.name is a single basename and
+    # mkstemp creates the unpredictable partial file atomically in that directory.
     descriptor, partial_name = tempfile.mkstemp(
-        dir=output.parent, prefix=f".{output.name}.partial-"
+        # codeql[py/path-injection]
+        dir=output.parent,
+        # codeql[py/path-injection]
+        prefix=f".{output.name}.partial-",
     )
     partial = Path(partial_name)
     hasher = hashlib.sha256()
@@ -739,6 +752,8 @@ def _copy_process_range(
                     break
         if copied != size:
             raise ValueError(f"Incomplete memory read: expected {size} bytes, received {copied}")
+        # partial is the exact path returned by mkstemp; output passed containment.
+        # codeql[py/path-injection]
         os.replace(partial, output)
         return {
             **metadata,
@@ -750,6 +765,8 @@ def _copy_process_range(
         }
     except Exception as exc:
         try:
+            # partial is the exact path returned by mkstemp above.
+            # codeql[py/path-injection]
             partial.unlink(missing_ok=True)
         except OSError:
             logger.warning(
@@ -770,8 +787,13 @@ def _copy_vfs_file(
 ) -> dict[str, Any]:
     output = _contained_artifact_path(allowed_root, output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    # output is canonical and contained; output.name is a single basename and
+    # mkstemp creates the unpredictable partial file atomically in that directory.
     descriptor, partial_name = tempfile.mkstemp(
-        dir=output.parent, prefix=f".{output.name}.partial-"
+        # codeql[py/path-injection]
+        dir=output.parent,
+        # codeql[py/path-injection]
+        prefix=f".{output.name}.partial-",
     )
     partial = Path(partial_name)
     hasher = hashlib.sha256()
@@ -795,9 +817,13 @@ def _copy_vfs_file(
                     break
         if size_hint is not None and copied != size_hint:
             raise ValueError(f"Incomplete VFS read: expected {size_hint} bytes, received {copied}")
+        # partial is the exact path returned by mkstemp; output passed containment.
+        # codeql[py/path-injection]
         os.replace(partial, output)
     except Exception as exc:
         try:
+            # partial is the exact path returned by mkstemp above.
+            # codeql[py/path-injection]
             partial.unlink(missing_ok=True)
         except OSError:
             logger.warning(
