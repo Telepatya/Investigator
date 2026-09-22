@@ -109,7 +109,7 @@ class UserSession:
 
 
 def create_transaction(
-    *, nonce: str, code_verifier: str, binding_secret: str, return_path: str, expires_at: float,
+    *, nonce: str, code_verifier: str, browser_binding: str, return_path: str, expires_at: float,
 ) -> str:
     state = secrets.token_urlsafe(32)
     now = time.time()
@@ -117,12 +117,12 @@ def create_transaction(
         db.execute("DELETE FROM oidc_transactions WHERE expires_at <= ?", (now,))
         db.execute(
             "INSERT INTO oidc_transactions(state_hash, binding_hash, nonce, code_verifier, return_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (_hash(state), _hash(binding_secret), nonce, code_verifier, return_path, now, expires_at),
+            (_hash(state), _hash(browser_binding), nonce, code_verifier, return_path, now, expires_at),
         )
     return state
 
 
-def consume_transaction(state: str, binding_secret: str, now: float | None = None) -> dict[str, str] | None:
+def consume_transaction(state: str, browser_binding: str, now: float | None = None) -> dict[str, str] | None:
     current = time.time() if now is None else now
     with _db_lock, _database() as db:
         # Lock the database before reading so two worker processes cannot both
@@ -130,7 +130,7 @@ def consume_transaction(state: str, binding_secret: str, now: float | None = Non
         db.execute("BEGIN IMMEDIATE")
         row = db.execute(
             "SELECT nonce, code_verifier, return_path, expires_at FROM oidc_transactions WHERE state_hash = ? AND binding_hash = ?",
-            (_hash(state), _hash(binding_secret)),
+            (_hash(state), _hash(browser_binding)),
         ).fetchone()
         if row is None:
             return None

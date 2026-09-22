@@ -10,7 +10,12 @@ from unittest.mock import patch
 import app.config as config
 from app.reverse.database import ReverseArtifact, ReverseProject, dispose_reverse_db, get_reverse_session
 from app.reverse.handoff import ProcessHandoffError, handoff_process_to_reverse
-from app.reverse.store import contained_project_path, import_artifact, list_projects
+from app.reverse.store import (
+    contained_project_path,
+    create_project,
+    import_artifact,
+    list_projects,
+)
 from app.store import cases
 from app.store.database import Event, Finding, MemoryResult, Process, dispose_all_db_engines
 
@@ -64,7 +69,7 @@ class ReverseProcessHandoffTests(unittest.TestCase):
             session.commit()
         finally:
             session.close()
-        self.dump = self.root / "calc.exe_2244.minidump.dmp"
+        self.dump = config.case_uploads_path(self.case_id) / "calc.exe_2244.minidump.dmp"
         self.dump.write_bytes(b"MDMP-process-bytes")
         self.modules = [{"name": "calc.exe", "base_hex": "0x400000", "size": 4096}]
         self.handles = [{"type": "Process", "target_pid": 3000, "target_process": "child.exe",
@@ -135,6 +140,63 @@ class ReverseProcessHandoffTests(unittest.TestCase):
             "app.reverse.handoff.import_artifact", side_effect=fail_second
         ):
             with self.assertRaisesRegex(ProcessHandoffError, "disk full"):
+                handoff_process_to_reverse(self.case_id, "mem-a", 2244)
+        self.assertEqual(list_projects(self.case_id), [])
+
+    def test_import_rejects_sources_outside_authorized_root(self) -> None:
+        project = create_project("contained import", linked_case_id=self.case_id)
+        allowed = self.root / "allowed"
+        allowed.mkdir()
+        outside = self.root / "outside.bin"
+        outside.write_bytes(b"outside")
+
+        with self.assertRaisesRegex(ValueError, "authorized directory"):
+            import_artifact(
+                project.id,
+                outside,
+                source_root=allowed,
+                name="outside.bin",
+                artifact_type="upload",
+                content_type="application/octet-stream",
+            )
+        with get_reverse_session() as db:
+            self.assertEqual(
+                db.query(ReverseArtifact).filter_by(project_id=project.id).count(), 0
+            )
+
+    def test_import_rejects_symlink_escape(self) -> None:
+        project = create_project("symlink import", linked_case_id=self.case_id)
+        allowed = self.root / "allowed"
+        allowed.mkdir()
+        outside = self.root / "outside.bin"
+        outside.write_bytes(b"outside")
+        link = allowed / "link.bin"
+        try:
+            link.symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"Symlink creation is unavailable: {exc}")
+
+        with self.assertRaisesRegex(ValueError, "authorized directory"):
+            import_artifact(
+                project.id,
+                link,
+                source_root=allowed,
+                name="link.bin",
+                artifact_type="upload",
+                content_type="application/octet-stream",
+            )
+
+    def test_handoff_rejects_extractor_output_outside_case_root(self) -> None:
+        outside = self.root / "outside.minidump"
+        outside.write_bytes(b"outside")
+        patches = self._patch_sources()
+        with (
+            patch("app.reverse.handoff.extract_process_image", return_value=outside),
+            patches[1],
+            patches[2],
+            patches[3],
+        ):
+            with self.assertRaisesRegex(ProcessHandoffError, "authorized directory"):
                 handoff_process_to_reverse(self.case_id, "mem-a", 2244)
         self.assertEqual(list_projects(self.case_id), [])
 

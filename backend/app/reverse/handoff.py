@@ -11,6 +11,7 @@ from typing import Any, Iterable
 
 from sqlalchemy import select
 
+from app.config import case_dir_path
 from app.memory.explorer import (
     MemoryExplorerError,
     export_process_handles,
@@ -26,6 +27,7 @@ from .store import (
     add_audit,
     append_provenance,
     create_project,
+    contained_source_file,
     delete_project,
     import_artifact,
     project_dir,
@@ -367,7 +369,8 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     )
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path, *, source_root: Path) -> str:
+    path = contained_source_file(path, source_root)
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         while chunk := stream.read(4 * 1024 * 1024):
@@ -395,7 +398,8 @@ def handoff_process_to_reverse(case_id: str, session_id: str, pid: int) -> dict[
         )
         proc = context["process"]
         dump = resolve_memory_dump(case_id, session_id)
-        minidump_hash = _sha256(minidump)
+        case_root = case_dir_path(case_id)
+        minidump_hash = _sha256(minidump, source_root=case_root)
         source_metadata = {
             "case_id": case_id,
             "session_id": session_id,
@@ -430,6 +434,7 @@ def handoff_process_to_reverse(case_id: str, session_id: str, pid: int) -> dict[
                 import_artifact(
                     project.id,
                     minidump,
+                    source_root=case_root,
                     name=minidump.name,
                     artifact_type="upload",
                     content_type="application/octet-stream",
@@ -438,6 +443,7 @@ def handoff_process_to_reverse(case_id: str, session_id: str, pid: int) -> dict[
                 import_artifact(
                     project.id,
                     context_path,
+                    source_root=root,
                     name=context_path.name,
                     artifact_type="context",
                     content_type="application/json",
@@ -446,6 +452,7 @@ def handoff_process_to_reverse(case_id: str, session_id: str, pid: int) -> dict[
                 import_artifact(
                     project.id,
                     actions_path,
+                    source_root=root,
                     name=actions_path.name,
                     artifact_type="context",
                     content_type="application/x-ndjson",
@@ -454,6 +461,7 @@ def handoff_process_to_reverse(case_id: str, session_id: str, pid: int) -> dict[
                 import_artifact(
                     project.id,
                     handles_path,
+                    source_root=root,
                     name=handles_path.name,
                     artifact_type="context",
                     content_type="application/x-ndjson",

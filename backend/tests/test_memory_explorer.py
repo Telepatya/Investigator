@@ -164,6 +164,7 @@ class MemoryExplorerTests(unittest.TestCase):
         (self.uploads / "dump.raw").write_bytes(b"raw")
         self.patches = [
             patch.object(explorer, "case_uploads_path", return_value=self.uploads),
+            patch.object(explorer, "get_cases_dir", return_value=self.root),
             patch.object(cases, "get_cases_dir", return_value=self.root),
             patch.object(cases, "case_db_path", side_effect=lambda case_id: self.root / case_id / "case.db"),
             patch.object(forensics, "get_cases_dir", return_value=self.root),
@@ -491,30 +492,61 @@ class MemoryExtractionCompletenessTests(unittest.TestCase):
         self.assertIsNone(explorer._hash_process_range(process, 0x1000, 8))
         self.assertIsNotNone(explorer._hash_process_range(process, 0x1000, 2))
 
-    def test_short_process_range_is_not_published_as_complete(self):
+    def test_short_process_range_preserves_previous_complete_output(self):
         process = types.SimpleNamespace(memory=_FakeMemory({0x1000: b"MZ"}))
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "image.extracted"
+            root = Path(directory)
+            output = root / "image.extracted"
+            output.write_bytes(b"previous")
             with self.assertRaisesRegex(explorer.MemoryExplorerError, "Incomplete memory read"):
-                explorer._copy_process_range(process, 0x1000, 8, output, {})
-            self.assertFalse(output.exists())
+                explorer._copy_process_range(
+                    process, 0x1000, 8, output, {}, allowed_root=root
+                )
+            self.assertEqual(output.read_bytes(), b"previous")
+            self.assertEqual(list(root.glob(".*.partial-*")), [])
 
-    def test_known_size_short_vfs_file_is_removed(self):
+    def test_known_size_short_vfs_file_preserves_previous_complete_output(self):
         vmm = types.SimpleNamespace(vfs=_FakeVfs())
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "version.extracted"
+            root = Path(directory)
+            output = root / "version.extracted"
+            output.write_bytes(b"previous")
             with self.assertRaisesRegex(explorer.MemoryExplorerError, "Incomplete VFS read"):
-                explorer._copy_vfs_file(vmm, "/sys/version.txt", output, {"size": 10})
-            self.assertFalse(output.exists())
+                explorer._copy_vfs_file(
+                    vmm,
+                    "/sys/version.txt",
+                    output,
+                    {"size": 10},
+                    allowed_root=root,
+                )
+            self.assertEqual(output.read_bytes(), b"previous")
+            self.assertEqual(list(root.glob(".*.partial-*")), [])
 
     def test_unknown_size_vfs_file_still_completes_at_eof(self):
         vmm = types.SimpleNamespace(vfs=_FakeVfs())
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "version.extracted"
-            result = explorer._copy_vfs_file(vmm, "/sys/version.txt", output, None)
+            root = Path(directory)
+            output = root / "version.extracted"
+            result = explorer._copy_vfs_file(
+                vmm, "/sys/version.txt", output, None, allowed_root=root
+            )
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["size"], 5)
             self.assertEqual(output.read_bytes(), b"build")
+
+    def test_copy_helpers_reject_targets_outside_authorized_root(self):
+        process = types.SimpleNamespace(memory=_FakeMemory({0x1000: b"MZ"}))
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            allowed = base / "allowed"
+            allowed.mkdir()
+            outside = base / "outside.bin"
+            outside.write_bytes(b"sentinel")
+            with self.assertRaisesRegex(explorer.MemoryExplorerError, "Unsafe extraction path"):
+                explorer._copy_process_range(
+                    process, 0x1000, 2, outside, {}, allowed_root=allowed
+                )
+            self.assertEqual(outside.read_bytes(), b"sentinel")
 
     def test_short_archive_member_reports_failure(self):
         vmm = types.SimpleNamespace(vfs=_FakeVfs())

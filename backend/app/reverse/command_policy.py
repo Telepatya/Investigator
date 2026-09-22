@@ -118,7 +118,7 @@ def _mutation_targets(executable: str, args: list[str], cwd: str) -> list[str]:
             continue
         if executable == "chmod" and index == 0 and re.fullmatch(r"[0-7]{3,4}", arg):
             continue
-        if executable == "chmod" and index == 0 and re.fullmatch(r"[ugoa]+[+-=][rwxXst]+", arg):
+        if executable == "chmod" and index == 0 and re.fullmatch(r"[ugoa]+[+=-][rwxXst]+", arg):
             continue
         if executable in {"binwalk", "7z", "7za", "p7zip", "unzip", "unrar", "upx"}:
             # Input artifacts are legitimate non-option operands. Explicit output

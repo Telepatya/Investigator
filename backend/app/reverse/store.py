@@ -75,6 +75,17 @@ def contained_project_path(project_id: str, relative_path: str, *, must_exist: b
     return candidate
 
 
+def contained_source_file(source: Path, source_root: Path) -> Path:
+    """Return a canonical source only when it stays below an authorized root."""
+    root_real = os.path.realpath(source_root)
+    source_real = os.path.realpath(source)
+    root_check = os.path.normcase(root_real)
+    source_check = os.path.normcase(source_real)
+    if source_check == root_check or not source_check.startswith(root_check + os.sep):
+        raise ValueError("Artifact source escapes its authorized directory")
+    return Path(source_real)
+
+
 def create_project(name: str, description: str = "", linked_case_id: str | None = None) -> ReverseProject:
     if linked_case_id and not case_store.case_exists(linked_case_id):
         raise ValueError("Linked case does not exist")
@@ -149,6 +160,7 @@ def import_artifact(
     project_id: str,
     source: Path,
     *,
+    source_root: Path,
     name: str,
     artifact_type: str,
     content_type: str,
@@ -157,7 +169,7 @@ def import_artifact(
     """Atomically import a trusted local file and record bounded source provenance."""
     project_id = validate_project_id(project_id)
     safe_name = safe_filename(name)
-    source = source.resolve(strict=True)
+    source = contained_source_file(source, source_root)
     if not source.is_file():
         raise ValueError("Artifact source is not a regular file")
     if artifact_type not in {"upload", "context"}:

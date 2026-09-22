@@ -2,51 +2,56 @@
 
 ## Scope and delivery
 
-Audit baseline: `5a4149865aca87d82acd15f6f51c7f4a66bf7120`, including 16 committed SSO changes ahead of remote `main` (`b6340fa2015a1ae6744532f1dbe0199d86772726`). Work branch: `codex/security-quality-audit`.
+Audit baseline: `5a4149865aca87d82acd15f6f51c7f4a66bf7120`, including 16 committed SSO changes ahead of the former remote `main` (`b6340fa2015a1ae6744532f1dbe0199d86772726`). Pull request #88 was merged as `6e70b1ec2abd586e6a040d2c36043aeecdce15d4`. The post-merge CodeQL follow-up uses branch `codex/codeql-follow-up`.
 
 The audit covered the tracked Python backend, React frontend, optional Reverse sandbox, dependency inputs/locks, launcher, release tooling and CI configuration. Review combined manual source inspection, targeted synthetic regression tests, full project gates and registry/advisory checks. It did not involve real case evidence, production endpoints, real provider credentials or executing malware samples.
 
 Implementation used Astra because the requested Luna model was unavailable. Sol performed planning and separate implementation review. Automated agent review does not replace required maintainer approval.
 
-Final local validation is complete. The exact independently reviewed revision and hosted CI state are recorded in the draft PR.
+The original local validation is complete. The exact independently reviewed revision and hosted CI state are recorded in pull request #88. After the repository became public, GitHub CodeQL became available and produced the follow-up findings listed below.
 
 ## Findings
 
-Each finding has an issue in the private repository. Issues remain open until the relevant changes are merged; an implementation in the draft PR is not a released fix.
+Each finding has a repository issue. Issues remain open until the relevant changes are merged.
 
 | Issue | Finding | Status |
 | --- | --- | --- |
-| [#60](https://github.com/Telepatya/Investigator/issues/60) | Bound Reverse tool-output collection | Implemented; pending merge |
-| [#61](https://github.com/Telepatya/Investigator/issues/61) | Reject incomplete memory/VFS exports | Implemented; pending merge |
-| [#62](https://github.com/Telepatya/Investigator/issues/62) | Release MemProcFS lock on initialization failure | Implemented; pending merge |
-| [#63](https://github.com/Telepatya/Investigator/issues/63) | Constrain provider destinations and credential forwarding | Implemented; pending merge |
-| [#64](https://github.com/Telepatya/Investigator/issues/64) | Enforce runtime regex deadlines | Implemented; pending merge |
-| [#65](https://github.com/Telepatya/Investigator/issues/65) | Enforce rule quota on edits and enabling | Implemented; pending merge |
-| [#66](https://github.com/Telepatya/Investigator/issues/66) | Remove unused dependencies/imports and stale references | Implemented; pending merge |
-| [#67](https://github.com/Telepatya/Investigator/issues/67) | Preserve Windows environment in missing-Sigma test | Implemented; pending merge |
-| [#68](https://github.com/Telepatya/Investigator/issues/68) | Update AnyIO | Implemented; pending merge |
-| [#69](https://github.com/Telepatya/Investigator/issues/69) | Update pip | Implemented; pending merge |
+| [#60](https://github.com/Telepatya/Investigator/issues/60) | Bound Reverse tool-output collection | Merged in #88 |
+| [#61](https://github.com/Telepatya/Investigator/issues/61) | Reject incomplete memory/VFS exports | Merged in #88 |
+| [#62](https://github.com/Telepatya/Investigator/issues/62) | Release MemProcFS lock on initialization failure | Merged in #88 |
+| [#63](https://github.com/Telepatya/Investigator/issues/63) | Constrain provider destinations and credential forwarding | Merged in #88 |
+| [#64](https://github.com/Telepatya/Investigator/issues/64) | Enforce runtime regex deadlines | Merged in #88 |
+| [#65](https://github.com/Telepatya/Investigator/issues/65) | Enforce rule quota on edits and enabling | Merged in #88 |
+| [#66](https://github.com/Telepatya/Investigator/issues/66) | Remove unused dependencies/imports and stale references | Merged in #88 |
+| [#67](https://github.com/Telepatya/Investigator/issues/67) | Preserve Windows environment in missing-Sigma test | Merged in #88 |
+| [#68](https://github.com/Telepatya/Investigator/issues/68) | Update AnyIO | Merged in #88 |
+| [#69](https://github.com/Telepatya/Investigator/issues/69) | Update pip | Merged in #88 |
 | [#70](https://github.com/Telepatya/Investigator/issues/70) | Unpatched diskcache advisory | Unresolved upstream advisory |
-| [#71](https://github.com/Telepatya/Investigator/issues/71) | Add browser anti-framing/content headers | Implemented; pending merge |
-| [#72](https://github.com/Telepatya/Investigator/issues/72) | Bound API request bodies, queries and WebSocket input | Implemented; pending merge |
-| [#73](https://github.com/Telepatya/Investigator/issues/73) | Separate ZIP upload attribution | Implemented; pending merge |
-| [#74](https://github.com/Telepatya/Investigator/issues/74) | Seal sandbox evidence under independent ownership | Implemented; pending merge |
-| [#75](https://github.com/Telepatya/Investigator/issues/75) | Restore mobile navigation | Implemented; pending merge |
-| [#76](https://github.com/Telepatya/Investigator/issues/76) | Repair dialog labels, keyboard dismissal and focus | Implemented; pending merge |
-| [#77](https://github.com/Telepatya/Investigator/issues/77) | Remove external font requests | Implemented; pending merge |
-| [#78](https://github.com/Telepatya/Investigator/issues/78) | Repair packaged dependency entry point | Implemented; pending merge |
-| [#79](https://github.com/Telepatya/Investigator/issues/79) | Invalidate frontend build cache for all inputs | Implemented; pending merge |
-| [#80](https://github.com/Telepatya/Investigator/issues/80) | Isolate multiple memory dumps | Implemented; pending merge |
-| [#81](https://github.com/Telepatya/Investigator/issues/81) | Make detection rebuild atomic | Implemented; pending merge |
-| [#82](https://github.com/Telepatya/Investigator/issues/82) | Update baseline-browser-mapping | Implemented; pending merge |
-| [#83](https://github.com/Telepatya/Investigator/issues/83) | Update Browserslist | Implemented; pending merge |
-| [#84](https://github.com/Telepatya/Investigator/issues/84) | Bound multipart uploads before temporary-file allocation | Implemented; pending merge |
-| [#85](https://github.com/Telepatya/Investigator/issues/85) | Require HTTPS for hosted remote provider endpoints | Implemented; pending merge |
-| [#86](https://github.com/Telepatya/Investigator/issues/86) | Make same-name evidence replacement atomic across files and attributed rows | Implemented; pending merge |
-| [#87](https://github.com/Telepatya/Investigator/issues/87) | Bound and coalesce ingestion progress listener queues | Implemented; pending merge |
-| [#89](https://github.com/Telepatya/Investigator/issues/89) | Make dependency-lock CI invocation portable on Linux runners | Implemented; pending merge |
-| [#90](https://github.com/Telepatya/Investigator/issues/90) | Restore supported dependency review for pull requests | External repository configuration pending |
-| [#91](https://github.com/Telepatya/Investigator/issues/91) | Restore CodeQL analysis and update workflows to Node 24 actions | Code update implemented; repository setting pending |
+| [#71](https://github.com/Telepatya/Investigator/issues/71) | Add browser anti-framing/content headers | Merged in #88 |
+| [#72](https://github.com/Telepatya/Investigator/issues/72) | Bound API request bodies, queries and WebSocket input | Merged in #88 |
+| [#73](https://github.com/Telepatya/Investigator/issues/73) | Separate ZIP upload attribution | Merged in #88 |
+| [#74](https://github.com/Telepatya/Investigator/issues/74) | Seal sandbox evidence under independent ownership | Merged in #88 |
+| [#75](https://github.com/Telepatya/Investigator/issues/75) | Restore mobile navigation | Merged in #88 |
+| [#76](https://github.com/Telepatya/Investigator/issues/76) | Repair dialog labels, keyboard dismissal and focus | Merged in #88 |
+| [#77](https://github.com/Telepatya/Investigator/issues/77) | Remove external font requests | Merged in #88 |
+| [#78](https://github.com/Telepatya/Investigator/issues/78) | Repair packaged dependency entry point | Merged in #88 |
+| [#79](https://github.com/Telepatya/Investigator/issues/79) | Invalidate frontend build cache for all inputs | Merged in #88 |
+| [#80](https://github.com/Telepatya/Investigator/issues/80) | Isolate multiple memory dumps | Merged in #88 |
+| [#81](https://github.com/Telepatya/Investigator/issues/81) | Make detection rebuild atomic | Merged in #88 |
+| [#82](https://github.com/Telepatya/Investigator/issues/82) | Update baseline-browser-mapping | Merged in #88 |
+| [#83](https://github.com/Telepatya/Investigator/issues/83) | Update Browserslist | Merged in #88 |
+| [#84](https://github.com/Telepatya/Investigator/issues/84) | Bound multipart uploads before temporary-file allocation | Merged in #88 |
+| [#85](https://github.com/Telepatya/Investigator/issues/85) | Require HTTPS for hosted remote provider endpoints | Merged in #88 |
+| [#86](https://github.com/Telepatya/Investigator/issues/86) | Make same-name evidence replacement atomic across files and attributed rows | Merged in #88 |
+| [#87](https://github.com/Telepatya/Investigator/issues/87) | Bound and coalesce ingestion progress listener queues | Merged in #88 |
+| [#89](https://github.com/Telepatya/Investigator/issues/89) | Make dependency-lock CI invocation portable on Linux runners | Merged in #88 |
+| [#90](https://github.com/Telepatya/Investigator/issues/90) | Restore supported dependency review for pull requests | Repository is now public; follow-up PR validation pending |
+| [#91](https://github.com/Telepatya/Investigator/issues/91) | Restore CodeQL analysis and update workflows to Node 24 actions | Dynamic scan succeeded; checked-in advanced workflow validation pending |
+| [#92](https://github.com/Telepatya/Investigator/issues/92) | Make Reverse artifact source containment explicit | Implemented in follow-up; pending PR |
+| [#93](https://github.com/Telepatya/Investigator/issues/93) | Make MemProcFS extraction writes atomic and CodeQL-verifiable | Implemented in follow-up; pending PR |
+| [#94](https://github.com/Telepatya/Investigator/issues/94) | Clarify and narrow the OIDC browser-binding cookie | Implemented in follow-up; pending PR |
+| [#95](https://github.com/Telepatya/Investigator/issues/95) | Correct the Reverse chmod symbolic-mode regular expression | Implemented in follow-up; pending PR |
+| [#96](https://github.com/Telepatya/Investigator/issues/96) | Use an informative category assertion | Implemented in follow-up; pending PR |
 
 ## Authorization and trust boundaries
 
@@ -79,11 +84,15 @@ the pull request because review evidence applies to a specific revision.
 
 Browser smoke checks used the actual built frontend with an isolated read-only synthetic API fixture, not the application backend: navigation at 390×844 and 1440×900; Case and Reverse create dialogs; Rules editor/import dialogs; labels, keyboard focus, Escape and opener restoration. The 390-pixel layout had no horizontal overflow in the inspected dialog. No external HTTP font/script/link references remained in the initial document. The temporary fixture service and browser tab were stopped after verification.
 
-The published draft PR repeated lock freshness, installation, `pip check`,
+Pull request #88 repeated lock freshness, installation, `pip check`,
 compilation, Ruff, all 473 backend tests, frontend build/audits, and repository
 policy checks successfully. Its remaining failed checks are the unpatched
-`diskcache` advisory (#70), unavailable dependency review (#90), and CodeQL
-result publication while code scanning is disabled (#91).
+`diskcache` advisory (#70), dependency review while the repository was private
+(#90), and CodeQL result publication while code scanning was disabled (#91).
+After the repository became public, GitHub's dynamic CodeQL setup completed for
+Actions, JavaScript/TypeScript and Python. It reported 14 open alerts grouped
+into issues #92-#96; the next advanced-workflow run is the acceptance gate for
+those repairs.
 
 A source credential-pattern scan found no matching private-key blocks or common credential prefixes in the tracked source. This was a limited pattern scan, not an exhaustive secret/history audit.
 
@@ -91,8 +100,7 @@ A source credential-pattern scan found no matching private-key blocks or common 
 
 - The unpatched diskcache dependency prevents a clean dependency-security result.
 - No live Docker integration or base-image/apt vulnerability scanner ran; Docker's engine was unavailable. Unit tests do not prove kernel/container containment.
-- GitHub code-scanning alerts returned HTTP 403 to the audit credential. The published PR's CodeQL jobs completed both language analyses but could not publish results because code scanning is disabled.
-- GitHub's dependency-review action is unsupported for this private repository until the required dependency graph and Advanced Security capability is enabled or an equivalent scanner replaces it; issue [#90](https://github.com/Telepatya/Investigator/issues/90) tracks that repository-level work.
-- CodeQL analysis cannot publish results until code scanning is enabled for the repository. The workflows now use supported Node 24 action majors and grant Actions metadata read access; issue [#91](https://github.com/Telepatya/Investigator/issues/91) tracks the remaining repository-level enablement.
+- The repository is now public, so code scanning and dependency review are eligible without a private-repository Code Security license. The follow-up PR must demonstrate both checked-in workflows successfully on the new visibility state.
+- The first available CodeQL scan reported 14 alerts. Manual dataflow review found no remotely reachable traversal in the flagged paths, but the follow-up still makes source-root trust explicit, validates paths at write sinks, and fixes the adjacent non-atomic cache replacement defect.
 - No live identity-provider, remote LLM, real memory-dump or production deployment validation was performed.
-- Manual coverage, tests and scanners cannot establish that the entire codebase is vulnerability-free. The PR must remain draft while blocking findings or required validation are unresolved.
+- Manual coverage, tests and scanners cannot establish that the entire codebase is vulnerability-free. The CodeQL follow-up must remain unmerged until its advanced scan and required tests complete.

@@ -7,13 +7,14 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.config import case_uploads_path
+from app.config import case_uploads_path, get_cases_dir
 from app.memory.forensics import memprocfs_artifact_dir
 from app.memory.identity import is_memory_upload, memory_upload_key
 from app.memory.memprocfs_runner import (
@@ -325,7 +326,13 @@ def extract_vfs_file(case_id: str, session_id: str, vfs_path: str) -> Path:
         if entry is not None and _entry_is_dir(entry):
             raise MemoryExplorerError("VFS path is a directory; use archive download for folders")
         output = _cache_path(case_id, dump.dump_stem, "vfs", f"{_safe_filename(_basename(source))}.extracted")
-        info = _copy_vfs_file(vmm, source, output, entry)
+        info = _copy_vfs_file(
+            vmm,
+            source,
+            output,
+            entry,
+            allowed_root=memprocfs_artifact_dir(case_id, dump.dump_stem),
+        )
     _record_manifest(case_id, dump.dump_stem, info)
     return output
 
@@ -426,7 +433,13 @@ def extract_process_image(
                 f"{_safe_filename(_proc_name(proc, pid))}_{pid}.minidump.dmp",
             )
             info = {
-                **_copy_vfs_file(vmm, source, output, entry),
+                **_copy_vfs_file(
+                    vmm,
+                    source,
+                    output,
+                    entry,
+                    allowed_root=memprocfs_artifact_dir(case_id, dump.dump_stem),
+                ),
                 "kind": "process_minidump",
                 "pid": pid,
                 "process": _proc_name(proc, pid),
@@ -436,12 +449,19 @@ def extract_process_image(
             if not module:
                 raise MemoryExplorerError("Could not identify the process image in memory", 404)
             output = _module_output_path(case_id, dump.dump_stem, proc, pid, module, process_image=True)
-            info = _copy_process_range(proc, module["base"], module["size"], output, {
-                "kind": "process_image",
-                "pid": pid,
-                "process": _proc_name(proc, pid),
-                "module": module,
-            })
+            info = _copy_process_range(
+                proc,
+                module["base"],
+                module["size"],
+                output,
+                {
+                    "kind": "process_image",
+                    "pid": pid,
+                    "process": _proc_name(proc, pid),
+                    "module": module,
+                },
+                allowed_root=memprocfs_artifact_dir(case_id, dump.dump_stem),
+            )
     _record_manifest(case_id, dump.dump_stem, info)
     return output
 
@@ -454,12 +474,19 @@ def extract_process_module(case_id: str, session_id: str, pid: int, base: str | 
         if not module:
             raise MemoryExplorerError("Module not found in process memory", 404)
         output = _module_output_path(case_id, dump.dump_stem, proc, pid, module, process_image=False)
-        info = _copy_process_range(proc, module["base"], module["size"], output, {
-            "kind": "module",
-            "pid": pid,
-            "process": _proc_name(proc, pid),
-            "module": module,
-        })
+        info = _copy_process_range(
+            proc,
+            module["base"],
+            module["size"],
+            output,
+            {
+                "kind": "module",
+                "pid": pid,
+                "process": _proc_name(proc, pid),
+                "module": module,
+            },
+            allowed_root=memprocfs_artifact_dir(case_id, dump.dump_stem),
+        )
     _record_manifest(case_id, dump.dump_stem, info)
     return output
 
@@ -636,12 +663,25 @@ def _find_module(proc, base: str | None, name: str | None) -> dict[str, Any] | N
     return None
 
 
-def _copy_process_range(proc, base: int, size: int, output: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+def _copy_process_range(
+    proc,
+    base: int,
+    size: int,
+    output: Path,
+    metadata: dict[str, Any],
+    *,
+    allowed_root: Path,
+) -> dict[str, Any]:
+    output = _contained_artifact_path(allowed_root, output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, partial_name = tempfile.mkstemp(
+        dir=output.parent, prefix=f".{output.name}.partial-"
+    )
+    partial = Path(partial_name)
     hasher = hashlib.sha256()
     copied = 0
     try:
-        with open(output, "wb") as dst:
+        with os.fdopen(descriptor, "wb") as dst:
             while copied < size:
                 length = min(VFS_CHUNK_SIZE, size - copied)
                 data = proc.memory.read(base + copied, length)
@@ -656,6 +696,7 @@ def _copy_process_range(proc, base: int, size: int, output: Path, metadata: dict
                     break
         if copied != size:
             raise ValueError(f"Incomplete memory read: expected {size} bytes, received {copied}")
+        os.replace(partial, output)
         return {
             **metadata,
             "local_path": str(output),
@@ -666,23 +707,35 @@ def _copy_process_range(proc, base: int, size: int, output: Path, metadata: dict
         }
     except Exception as exc:
         try:
-            output.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
         except OSError:
             logger.warning(
                 "Could not remove partial memory-range extraction %s",
-                _sanitize_for_log(output),
+                _sanitize_for_log(partial),
                 exc_info=True,
             )
         raise MemoryExplorerError(f"Could not extract memory range: {exc}", 500) from exc
 
 
-def _copy_vfs_file(vmm, source: str, output: Path, entry: Any | None) -> dict[str, Any]:
+def _copy_vfs_file(
+    vmm,
+    source: str,
+    output: Path,
+    entry: Any | None,
+    *,
+    allowed_root: Path,
+) -> dict[str, Any]:
+    output = _contained_artifact_path(allowed_root, output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, partial_name = tempfile.mkstemp(
+        dir=output.parent, prefix=f".{output.name}.partial-"
+    )
+    partial = Path(partial_name)
     hasher = hashlib.sha256()
     copied = 0
     size_hint = _entry_size(entry)
     try:
-        with open(output, "wb") as dst:
+        with os.fdopen(descriptor, "wb") as dst:
             while size_hint is None or copied < size_hint:
                 length = VFS_CHUNK_SIZE if size_hint is None else min(VFS_CHUNK_SIZE, size_hint - copied)
                 if length <= 0:
@@ -699,13 +752,14 @@ def _copy_vfs_file(vmm, source: str, output: Path, entry: Any | None) -> dict[st
                     break
         if size_hint is not None and copied != size_hint:
             raise ValueError(f"Incomplete VFS read: expected {size_hint} bytes, received {copied}")
+        os.replace(partial, output)
     except Exception as exc:
         try:
-            output.unlink(missing_ok=True)
+            partial.unlink(missing_ok=True)
         except OSError:
             logger.warning(
                 "Could not remove partial VFS extraction %s",
-                _sanitize_for_log(output),
+                _sanitize_for_log(partial),
                 exc_info=True,
             )
         raise MemoryExplorerError(f"Could not extract VFS file {source}: {exc}", 500) from exc
@@ -821,16 +875,36 @@ def _record_manifest(case_id: str, dump_stem: str, entry: dict[str, Any]) -> Non
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+def _contained_artifact_path(allowed_root: Path, candidate: Path) -> Path:
+    root_real = os.path.realpath(allowed_root)
+    candidate_real = os.path.realpath(candidate)
+    root_check = os.path.normcase(root_real)
+    candidate_check = os.path.normcase(candidate_real)
+    if candidate_check == root_check or not candidate_check.startswith(root_check + os.sep):
+        raise MemoryExplorerError("Unsafe extraction path", 500)
+    return Path(candidate_real)
+
+
 def _cache_path(case_id: str, dump_stem: str, group: str, filename: str) -> Path:
-    artifact_root = memprocfs_artifact_dir(case_id, dump_stem).resolve()
-    artifact_root_real = os.path.realpath(artifact_root)
-    root = (artifact_root / "extracted" / _safe_filename(group)).resolve()
-    if not os.path.realpath(root).startswith(artifact_root_real + os.sep):
+    cases_root_real = os.path.realpath(get_cases_dir())
+    artifact_root_real = os.path.realpath(memprocfs_artifact_dir(case_id, dump_stem))
+    if not os.path.normcase(artifact_root_real).startswith(
+        os.path.normcase(cases_root_real) + os.sep
+    ):
+        raise MemoryExplorerError("Unsafe extraction root", 500)
+    artifact_root = Path(artifact_root_real)
+    root = _contained_artifact_path(
+        artifact_root, artifact_root / "extracted" / _safe_filename(group)
+    )
+    if not os.path.normcase(os.path.realpath(root)).startswith(
+        os.path.normcase(artifact_root_real) + os.sep
+    ):
         raise MemoryExplorerError("Unsafe extraction directory", 500)
     root.mkdir(parents=True, exist_ok=True)
-    root_real = os.path.realpath(root)
-    output = (root / _safe_filename(filename)).resolve()
-    if not os.path.realpath(output).startswith(root_real + os.sep):
+    output = _contained_artifact_path(root, root / _safe_filename(filename))
+    if not os.path.normcase(os.path.realpath(output)).startswith(
+        os.path.normcase(os.path.realpath(root)) + os.sep
+    ):
         raise MemoryExplorerError("Unsafe extraction filename", 500)
     return output
 

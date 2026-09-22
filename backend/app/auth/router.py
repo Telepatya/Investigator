@@ -22,6 +22,7 @@ from .session import (
 )
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+OIDC_BINDING_COOKIE_PATH = "/api/auth/callback"
 
 
 def _return_path(value: str | None) -> str:
@@ -49,7 +50,7 @@ def _binding_cookie_value(request: Request) -> str | None:
 
 def _callback_failure(detail: str, status_code: int) -> JSONResponse:
     response = JSONResponse(status_code=status_code, content={"detail": detail})
-    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path="/")
+    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path=OIDC_BINDING_COOKIE_PATH)
     return response
 
 
@@ -81,28 +82,30 @@ async def auth_login(return_to: str | None = None) -> RedirectResponse:
     safe_return = _return_path(return_to)
     verifier = pkce_verifier()
     nonce = secrets.token_urlsafe(32)
-    binding_secret = secrets.token_urlsafe(32)
+    # This opaque, one-time browser correlation handle is stored only as a
+    # hash server-side. It is not an identity-provider or application secret.
+    browser_binding = secrets.token_urlsafe(32)
     state = create_transaction(
         nonce=nonce,
         code_verifier=verifier,
-        binding_secret=binding_secret,
+        browser_binding=browser_binding,
         return_path=safe_return,
         expires_at=time.time() + config.transaction_seconds,
     )
     try:
         target = await authorization_url(config, state=state, nonce=nonce, verifier=verifier)
     except OIDCError as exc:
-        consume_transaction(state, binding_secret)
+        consume_transaction(state, browser_binding)
         raise HTTPException(502, "Identity provider is unavailable") from exc
     response = RedirectResponse(target, status_code=303)
     response.set_cookie(
         OIDC_BINDING_COOKIE_NAME,
-        binding_secret,
+        browser_binding,
         max_age=config.transaction_seconds,
         httponly=True,
         secure=config.cookie_secure,
         samesite="lax",
-        path="/",
+        path=OIDC_BINDING_COOKIE_PATH,
     )
     return response
 
@@ -117,14 +120,14 @@ async def auth_callback(
     config = get_auth_config()
     if not config.configured:
         return _callback_failure("Authentication is misconfigured", 503)
-    binding_secret = _binding_cookie_value(request)
-    if (error or not code) and state and len(state) <= 256 and binding_secret:
+    browser_binding = _binding_cookie_value(request)
+    if (error or not code) and state and len(state) <= 256 and browser_binding:
         # A provider denial is terminal for the matching browser, but a
         # mismatched browser must not consume the initiator's transaction.
-        consume_transaction(state, binding_secret)
-    if error or not code or not state or len(state) > 256 or not binding_secret:
+        consume_transaction(state, browser_binding)
+    if error or not code or not state or len(state) > 256 or not browser_binding:
         return _callback_failure("Authentication transaction failed", 400)
-    transaction = consume_transaction(state, binding_secret)
+    transaction = consume_transaction(state, browser_binding)
     if transaction is None:
         return _callback_failure("Authentication transaction expired, already used, or bound to another browser", 400)
     try:
@@ -145,7 +148,7 @@ async def auth_callback(
         absolute_seconds=config.absolute_seconds,
     )
     response = RedirectResponse(transaction["return_path"], status_code=303)
-    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path="/")
+    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path=OIDC_BINDING_COOKIE_PATH)
     response.set_cookie(
         COOKIE_NAME,
         token,
