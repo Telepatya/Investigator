@@ -18,9 +18,9 @@ class SyntheticDemoFixtureTests(unittest.TestCase):
 
         self.assertEqual(len(events), 9)
         self.assertEqual({event["host"] for event in events}, {"EXAMPLE-WKS"})
-        self.assertTrue(
-            {"filesystem", "process", "persistence", "network", "account"}
-            <= {event["category"] for event in events}
+        self.assertSetEqual(
+            {event["category"] for event in events},
+            {"filesystem", "process", "persistence", "network", "account"},
         )
         self.assertTrue(all(event["timestamp"] is not None for event in events))
         self.assertTrue(all("example.invalid" not in str(event.get("host", "")) for event in events))

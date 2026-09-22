@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -20,7 +23,16 @@ from app.auth.oidc import (
     identity_from_claims,
     validate_id_token,
 )
-from app.auth.session import clear_auth_state, consume_transaction, create_session, create_transaction, get_session, revoke_session
+from app.auth.session import (
+    LEGACY_OIDC_BINDING_COOKIE_NAME,
+    OIDC_BINDING_COOKIE_NAME,
+    clear_auth_state,
+    consume_transaction,
+    create_session,
+    create_transaction,
+    get_session,
+    revoke_session,
+)
 import app.config as app_config
 
 
@@ -350,12 +362,32 @@ class SessionTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_transaction_is_one_time_and_expires(self) -> None:
-        state = create_transaction(nonce="nonce", code_verifier="verifier", binding_secret="binding", return_path="/cases", expires_at=100)
+        state = create_transaction(nonce="nonce", code_verifier="verifier", browser_binding="binding", return_path="/cases", expires_at=100)
         self.assertIsNone(consume_transaction(state, "binding", now=101))
-        state = create_transaction(nonce="nonce", code_verifier="verifier", binding_secret="binding", return_path="/cases", expires_at=200)
+        state = create_transaction(nonce="nonce", code_verifier="verifier", browser_binding="binding", return_path="/cases", expires_at=200)
         self.assertIsNone(consume_transaction(state, "wrong-browser", now=150))
         self.assertEqual(consume_transaction(state, "binding", now=150), {"nonce": "nonce", "code_verifier": "verifier", "return_path": "/cases"})
         self.assertIsNone(consume_transaction(state, "binding", now=150))
+
+    def test_transaction_persists_only_hashes_of_browser_values(self) -> None:
+        browser_binding = "unique-browser-binding"
+        state = create_transaction(
+            nonce="nonce",
+            code_verifier="verifier",
+            browser_binding=browser_binding,
+            return_path="/cases",
+            expires_at=time.time() + 60,
+        )
+        with closing(sqlite3.connect(app_config.DEFAULT_CONFIG_DIR / "auth.db")) as db:
+            stored_state, stored_binding = db.execute(
+                "SELECT state_hash, binding_hash FROM oidc_transactions"
+            ).fetchone()
+        self.assertEqual(stored_state, hashlib.sha256(state.encode()).hexdigest())
+        self.assertEqual(
+            stored_binding, hashlib.sha256(browser_binding.encode()).hexdigest()
+        )
+        self.assertNotEqual(stored_state, state)
+        self.assertNotEqual(stored_binding, browser_binding)
 
     def test_session_tamper_expiry_rotation_and_logout(self) -> None:
         token, _session = create_session(subject="sub", display_name="A", email=None, is_admin=False, idle_seconds=10, absolute_seconds=100, now=100)
@@ -429,6 +461,15 @@ class AuthBoundaryTests(unittest.TestCase):
             self.assertEqual(unsafe.status_code, 400)
             started = self.client.get("/api/auth/login?return_to=/cases", follow_redirects=False)
         self.assertEqual(started.status_code, 303)
+        binding_cookie = next(
+            value
+            for value in started.headers.get_list("set-cookie")
+            if value.startswith(f"{OIDC_BINDING_COOKIE_NAME}=")
+            and "Max-Age=0" not in value
+        )
+        self.assertIn("HttpOnly", binding_cookie)
+        self.assertIn("SameSite=lax", binding_cookie)
+        self.assertIn("Path=/api/auth/callback", binding_cookie)
         location = started.headers["location"]
         from urllib.parse import parse_qs, urlsplit
         state = parse_qs(urlsplit(location).query).get("state", [""])[0]
@@ -442,6 +483,75 @@ class AuthBoundaryTests(unittest.TestCase):
         self.assertEqual(callback.headers["location"], "/cases")
         replay = self.client.get(f"/api/auth/callback?code=code&state={state}", follow_redirects=False)
         self.assertEqual(replay.status_code, 400)
+
+    def test_rotated_binding_cookie_ignores_duplicate_legacy_root_cookie(self) -> None:
+        from app.auth import router as auth_router
+        from app.auth.oidc import Identity
+        from urllib.parse import parse_qs, urlsplit
+
+        async def fake_authorization_url(_config, **kwargs):
+            return "https://idp.example.test/authorize?state=" + kwargs["state"]
+
+        self.client.cookies.set(
+            LEGACY_OIDC_BINDING_COOKIE_NAME,
+            "stale-root-binding",
+            path="/",
+        )
+        with patch.object(
+            auth_router,
+            "authorization_url",
+            new=AsyncMock(side_effect=fake_authorization_url),
+        ):
+            started = self.client.get("/api/auth/login", follow_redirects=False)
+
+        set_cookie_headers = started.headers.get_list("set-cookie")
+        self.assertTrue(
+            any(
+                header.startswith(f"{LEGACY_OIDC_BINDING_COOKIE_NAME}=")
+                and "Max-Age=0" in header
+                and "Path=/" in header
+                for header in set_cookie_headers
+            )
+        )
+        binding_header = next(
+            header
+            for header in set_cookie_headers
+            if header.startswith(f"{OIDC_BINDING_COOKIE_NAME}=")
+            and "Max-Age=0" not in header
+        )
+        browser_binding = binding_header.split(";", 1)[0].split("=", 1)[1]
+        state = parse_qs(urlsplit(started.headers["location"]).query)["state"][0]
+
+        # Browsers order cookies by path length. Reproduce the problematic
+        # duplicate legacy name explicitly; the rotated cookie remains unique.
+        cookie_header = "; ".join(
+            (
+                f"{LEGACY_OIDC_BINDING_COOKIE_NAME}=stale-callback-binding",
+                f"{LEGACY_OIDC_BINDING_COOKIE_NAME}=stale-root-binding",
+                f"{OIDC_BINDING_COOKIE_NAME}={browser_binding}",
+            )
+        )
+        with (
+            patch.object(
+                auth_router,
+                "exchange_code",
+                new=AsyncMock(return_value={"id_token": "opaque-test-token"}),
+            ),
+            patch.object(
+                auth_router,
+                "validate_id_token",
+                new=AsyncMock(
+                    return_value=Identity("sub", "Analyst", None, False)
+                ),
+            ),
+        ):
+            callback = self.client.get(
+                f"/api/auth/callback?code=code&state={state}",
+                headers={"cookie": cookie_header},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(callback.status_code, 303)
 
     def test_login_transaction_is_bound_to_initiating_browser(self) -> None:
         from app.auth import router as auth_router

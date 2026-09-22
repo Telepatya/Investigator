@@ -109,6 +109,8 @@ class _FakeVfs:
     def __init__(self):
         self.files = {
             "/sys/version.txt": b"build",
+            "/one/report.txt": b"first",
+            "/two/report.txt": b"second",
             "/pid/123/minidump/minidump.dmp": b"MDMPFULLPROCESS",
         }
 
@@ -131,6 +133,15 @@ class _FakeVfs:
             }
         if path == "/sys":
             return {"version.txt": {"name": "version.txt", "f_isdir": False, "size": 5}}
+        if path in {"/one", "/two"}:
+            source = f"{path}/report.txt"
+            return {
+                "report.txt": {
+                    "name": "report.txt",
+                    "f_isdir": False,
+                    "size": len(self.files[source]),
+                }
+            }
         return {}
 
     def read(self, path: str, length: int, offset: int = 0):
@@ -164,6 +175,7 @@ class MemoryExplorerTests(unittest.TestCase):
         (self.uploads / "dump.raw").write_bytes(b"raw")
         self.patches = [
             patch.object(explorer, "case_uploads_path", return_value=self.uploads),
+            patch.object(explorer, "get_cases_dir", return_value=self.root),
             patch.object(cases, "get_cases_dir", return_value=self.root),
             patch.object(cases, "case_db_path", side_effect=lambda case_id: self.root / case_id / "case.db"),
             patch.object(forensics, "get_cases_dir", return_value=self.root),
@@ -455,6 +467,20 @@ class MemoryExplorerTests(unittest.TestCase):
             explorer.extract_vfs_file("deadbeef", "mem-dump", "/sys/missing.txt")
         self.assertEqual(cm.exception.status_code, 404)
 
+    def test_vfs_downloads_with_same_basename_have_source_specific_cache_paths(self) -> None:
+        first = explorer.extract_vfs_file(
+            "deadbeef", "mem-dump", "/one/report.txt"
+        )
+        second = explorer.extract_vfs_file(
+            "deadbeef", "mem-dump", "/two/report.txt"
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), b"first")
+        self.assertEqual(second.read_bytes(), b"second")
+        self.assertIn(explorer._source_key("/one/report.txt"), first.name)
+        self.assertIn(explorer._source_key("/two/report.txt"), second.name)
+
     def test_extensionless_physicalmemory_upload_resolves_as_dump(self) -> None:
         (self.uploads / "PhysicalMemory").write_bytes(b"raw")
 
@@ -484,6 +510,48 @@ class MemoryExplorerTests(unittest.TestCase):
         self.assertEqual(manifest[0]["source"], "/sys/version.txt")
         self.assertEqual(manifest[0]["status"], "ok")
 
+    def test_same_second_archive_requests_publish_distinct_complete_files(self) -> None:
+        with (
+            patch.object(explorer.time, "time", return_value=1_700_000_000),
+            patch.object(
+                explorer.secrets,
+                "token_hex",
+                side_effect=["a" * 32, "b" * 32],
+            ),
+        ):
+            first = explorer.archive_vfs_selection(
+                "deadbeef", "mem-dump", ["/sys"]
+            )
+            second = explorer.archive_vfs_selection(
+                "deadbeef", "mem-dump", ["/sys"]
+            )
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.is_file())
+        self.assertTrue(second.is_file())
+        for archive in (first, second):
+            with zipfile.ZipFile(archive) as zf:
+                self.assertEqual(zf.read("sys/version.txt"), b"build")
+        self.assertEqual(list(first.parent.glob(".*.partial-*.zip")), [])
+
+    def test_archive_failure_does_not_publish_partial_zip(self) -> None:
+        with patch.object(
+            zipfile.ZipFile,
+            "writestr",
+            side_effect=OSError("simulated archive failure"),
+        ):
+            with self.assertRaisesRegex(
+                explorer.MemoryExplorerError, "Could not create VFS archive"
+            ):
+                explorer.archive_vfs_selection("deadbeef", "mem-dump", ["/sys"])
+
+        output_dir = (
+            self.root / "deadbeef" / "derived" / "memprocfs" / "dump"
+            / "extracted" / "vfs"
+        )
+        self.assertEqual(list(output_dir.glob("*.zip")), [])
+        self.assertEqual(list(output_dir.glob(".*.partial-*.zip")), [])
+
 
 class MemoryExtractionCompletenessTests(unittest.TestCase):
     def test_incomplete_module_range_has_no_complete_image_hash(self):
@@ -491,30 +559,61 @@ class MemoryExtractionCompletenessTests(unittest.TestCase):
         self.assertIsNone(explorer._hash_process_range(process, 0x1000, 8))
         self.assertIsNotNone(explorer._hash_process_range(process, 0x1000, 2))
 
-    def test_short_process_range_is_not_published_as_complete(self):
+    def test_short_process_range_preserves_previous_complete_output(self):
         process = types.SimpleNamespace(memory=_FakeMemory({0x1000: b"MZ"}))
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "image.extracted"
+            root = Path(directory)
+            output = root / "image.extracted"
+            output.write_bytes(b"previous")
             with self.assertRaisesRegex(explorer.MemoryExplorerError, "Incomplete memory read"):
-                explorer._copy_process_range(process, 0x1000, 8, output, {})
-            self.assertFalse(output.exists())
+                explorer._copy_process_range(
+                    process, 0x1000, 8, output, {}, allowed_root=root
+                )
+            self.assertEqual(output.read_bytes(), b"previous")
+            self.assertEqual(list(root.glob(".*.partial-*")), [])
 
-    def test_known_size_short_vfs_file_is_removed(self):
+    def test_known_size_short_vfs_file_preserves_previous_complete_output(self):
         vmm = types.SimpleNamespace(vfs=_FakeVfs())
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "version.extracted"
+            root = Path(directory)
+            output = root / "version.extracted"
+            output.write_bytes(b"previous")
             with self.assertRaisesRegex(explorer.MemoryExplorerError, "Incomplete VFS read"):
-                explorer._copy_vfs_file(vmm, "/sys/version.txt", output, {"size": 10})
-            self.assertFalse(output.exists())
+                explorer._copy_vfs_file(
+                    vmm,
+                    "/sys/version.txt",
+                    output,
+                    {"size": 10},
+                    allowed_root=root,
+                )
+            self.assertEqual(output.read_bytes(), b"previous")
+            self.assertEqual(list(root.glob(".*.partial-*")), [])
 
     def test_unknown_size_vfs_file_still_completes_at_eof(self):
         vmm = types.SimpleNamespace(vfs=_FakeVfs())
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "version.extracted"
-            result = explorer._copy_vfs_file(vmm, "/sys/version.txt", output, None)
+            root = Path(directory)
+            output = root / "version.extracted"
+            result = explorer._copy_vfs_file(
+                vmm, "/sys/version.txt", output, None, allowed_root=root
+            )
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["size"], 5)
             self.assertEqual(output.read_bytes(), b"build")
+
+    def test_copy_helpers_reject_targets_outside_authorized_root(self):
+        process = types.SimpleNamespace(memory=_FakeMemory({0x1000: b"MZ"}))
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            allowed = base / "allowed"
+            allowed.mkdir()
+            outside = base / "outside.bin"
+            outside.write_bytes(b"sentinel")
+            with self.assertRaisesRegex(explorer.MemoryExplorerError, "Unsafe extraction path"):
+                explorer._copy_process_range(
+                    process, 0x1000, 2, outside, {}, allowed_root=allowed
+                )
+            self.assertEqual(outside.read_bytes(), b"sentinel")
 
     def test_short_archive_member_reports_failure(self):
         vmm = types.SimpleNamespace(vfs=_FakeVfs())
