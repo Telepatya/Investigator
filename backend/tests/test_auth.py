@@ -1,0 +1,481 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from authlib.jose import JsonWebKey, JsonWebToken
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+from app.auth.config import AuthConfig, get_auth_config
+from app.auth.oidc import (
+    OIDCError,
+    OIDCMetadata,
+    authorization_url,
+    exchange_code,
+    identity_from_claims,
+    validate_id_token,
+)
+from app.auth.session import clear_auth_state, consume_transaction, create_session, create_transaction, get_session, revoke_session
+import app.config as app_config
+
+
+def _auth_config(**overrides) -> AuthConfig:
+    values = {
+        "enabled": True,
+        "issuer": "https://idp.example.test/oauth2/default",
+        "client_id": "client",
+        "client_secret": "secret",
+        "public_origin": "https://investigator.example.test",
+        "claim_names": ("groups", "roles"),
+        "allowed_values": ("Analysts", "00000000-0000-0000-0000-000000000001"),
+        "admin_claim": "roles",
+        "admin_value": "Investigator.Admin",
+        "idle_seconds": 60,
+        "absolute_seconds": 3600,
+        "transaction_seconds": 600,
+    }
+    values.update(overrides)
+    return AuthConfig(**values)
+
+
+class AuthConfigTests(unittest.TestCase):
+    def test_disabled_defaults_without_idp_configuration(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = get_auth_config()
+        self.assertFalse(cfg.enabled)
+        self.assertFalse(cfg.configured)
+
+    def test_enabled_incomplete_configuration_fails_closed(self) -> None:
+        with patch.dict(os.environ, {"INVESTIGATOR_AUTH_ENABLED": "true"}, clear=True):
+            cfg = get_auth_config()
+        self.assertTrue(cfg.enabled)
+        self.assertFalse(cfg.configured)
+        self.assertIn("OIDC issuer is required", cfg.error or "")
+
+    def test_remote_plaintext_public_origin_fails_closed(self) -> None:
+        with patch.dict(os.environ, {
+            "INVESTIGATOR_AUTH_ENABLED": "true",
+            "INVESTIGATOR_PUBLIC_ORIGIN": "http://investigator.example.test",
+            "INVESTIGATOR_OIDC_ISSUER": "https://idp.example.test",
+            "INVESTIGATOR_OIDC_CLIENT_ID": "client",
+            "INVESTIGATOR_OIDC_CLIENT_SECRET": "secret",
+            "INVESTIGATOR_SSO_ALLOWED_VALUES": "Analysts",
+        }, clear=True):
+            cfg = get_auth_config()
+        self.assertFalse(cfg.configured)
+        self.assertIn("HTTPS", (cfg.error or "").upper())
+
+    def test_loopback_plaintext_origin_and_scope_configuration(self) -> None:
+        with patch.dict(os.environ, {
+            "INVESTIGATOR_AUTH_ENABLED": "true",
+            "INVESTIGATOR_PUBLIC_ORIGIN": "http://localhost:8400",
+            "INVESTIGATOR_OIDC_ISSUER": "http://localhost:9000",
+            "INVESTIGATOR_OIDC_CLIENT_ID": "client",
+            "INVESTIGATOR_OIDC_CLIENT_SECRET": "secret",
+            "INVESTIGATOR_OIDC_SCOPES": "profile email groups",
+            "INVESTIGATOR_SSO_ALLOWED_VALUES": "Analysts",
+        }, clear=True):
+            cfg = get_auth_config()
+        self.assertTrue(cfg.configured)
+        self.assertEqual(cfg.scopes, ("openid", "profile", "email", "groups"))
+
+    def test_unsafe_scope_configuration_fails_closed(self) -> None:
+        with patch.dict(os.environ, {
+            "INVESTIGATOR_AUTH_ENABLED": "true",
+            "INVESTIGATOR_PUBLIC_ORIGIN": "https://investigator.example.test",
+            "INVESTIGATOR_OIDC_ISSUER": "https://idp.example.test",
+            "INVESTIGATOR_OIDC_CLIENT_ID": "client",
+            "INVESTIGATOR_OIDC_CLIENT_SECRET": "secret",
+            "INVESTIGATOR_OIDC_SCOPES": "openid profile\nemail",
+            "INVESTIGATOR_SSO_ALLOWED_VALUES": "Analysts",
+        }, clear=True):
+            cfg = get_auth_config()
+        self.assertFalse(cfg.configured)
+        self.assertIn("scope", (cfg.error or "").lower())
+
+    def test_auth_disabled_does_not_discover_an_idp(self) -> None:
+        from fastapi.testclient import TestClient
+        from app.auth import oidc
+        from app.main import app
+        with patch.dict(os.environ, {}, clear=True), patch.object(oidc, "discover", new=AsyncMock()) as discover:
+            response = TestClient(app, base_url="http://localhost").get("/api/auth/bootstrap")
+        self.assertEqual(response.status_code, 200)
+        discover.assert_not_awaited()
+
+
+class IdentityClaimTests(unittest.TestCase):
+    def test_okta_group_allowlist_and_admin_are_exact(self) -> None:
+        identity = identity_from_claims(
+            _auth_config(claim_names=("groups",), allowed_values=("IR-Analysts",), admin_claim="groups", admin_value="IR-Admins"),
+            {"sub": "okta-sub", "groups": ["IR-Analysts", "IR-Admins"], "email": "analyst@example.test"},
+        )
+        self.assertEqual(identity.subject, "okta-sub")
+        self.assertTrue(identity.is_admin)
+
+    def test_entra_role_and_group_overage_fail_closed(self) -> None:
+        identity = identity_from_claims(_auth_config(claim_names=("roles",), allowed_values=("Investigator.Analyst",)), {"sub": "entra-sub", "roles": ["Investigator.Analyst"]})
+        self.assertEqual(identity.subject, "entra-sub")
+        for claims in (
+            {"sub": "x", "roles": ["Investigator.Analyst"], "hasgroups": True},
+            {"sub": "x", "roles": ["Investigator.Analyst"], "_claim_names": {"groups": "src"}},
+        ):
+            with self.assertRaises(OIDCError):
+                identity_from_claims(_auth_config(claim_names=("roles",), allowed_values=("Investigator.Analyst",)), claims)
+
+    def test_missing_malformed_and_wrong_allowlist_fail_closed(self) -> None:
+        cfg = _auth_config(claim_names=("groups",), allowed_values=("Allowed",))
+        for claims in ({"sub": "x"}, {"sub": "x", "groups": "Allowed"}, {"sub": "x", "groups": ["Other"]}):
+            with self.assertRaises(OIDCError):
+                identity_from_claims(cfg, claims)
+
+
+class OIDCValidationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        from app.auth import oidc
+
+        self.oidc = oidc
+        self.config = _auth_config(scopes=("openid", "profile", "email", "groups"))
+        self.metadata = OIDCMetadata(
+            authorization_endpoint="https://idp.example.test/authorize",
+            token_endpoint="https://idp.example.test/token",
+            jwks_uri="https://idp.example.test/jwks",
+            issuer=self.config.issuer or "",
+            token_endpoint_auth_methods_supported=("client_secret_basic",),
+        )
+        self.private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.private_pem = self.private_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        public_pem = self.private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        self.public_jwk = JsonWebKey.import_key(public_pem).as_dict()
+        self.public_jwk["kid"] = "test-key"
+
+    def _token(self, **overrides) -> str:
+        now = int(time.time())
+        claims = {
+            "iss": self.config.issuer,
+            "sub": "subject",
+            "aud": self.config.client_id,
+            "exp": now + 300,
+            "iat": now,
+            "nonce": "nonce",
+            "groups": ["Analysts"],
+        }
+        claims.update(overrides)
+        token = JsonWebToken(["RS256"]).encode(
+            {"alg": "RS256", "kid": "test-key", "typ": "JWT"},
+            claims,
+            self.private_pem,
+        )
+        return token.decode("ascii") if isinstance(token, bytes) else token
+
+    async def _validate(self, token: str, jwks: dict | None = None):
+        metadata = self.metadata
+        jwks_document = jwks or {"keys": [self.public_jwk]}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return jwks_document
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def get(self, _url):
+                return FakeResponse()
+
+        with (
+            patch.object(self.oidc, "discover", new=AsyncMock(return_value=metadata)),
+            patch.object(self.oidc.httpx, "AsyncClient", FakeClient),
+        ):
+            return await validate_id_token(self.config, id_token=token, nonce="nonce")
+
+    async def test_authorization_url_preserves_configured_safe_scopes(self) -> None:
+        with patch.object(self.oidc, "discover", new=AsyncMock(return_value=self.metadata)):
+            url = await authorization_url(self.config, state="state", nonce="nonce", verifier="verifier")
+        from urllib.parse import parse_qs, urlsplit
+
+        self.assertEqual(parse_qs(urlsplit(url).query)["scope"], ["openid profile email groups"])
+
+    async def test_signed_id_token_success_and_strict_azp(self) -> None:
+        identity = await self._validate(self._token())
+        self.assertEqual(identity.subject, "subject")
+
+        multi_audience = await self._validate(self._token(aud=["client", "other"], azp="client"))
+        self.assertEqual(multi_audience.subject, "subject")
+        for claims in (
+            {"aud": ["client", "other"]},
+            {"aud": ["client", "other"], "azp": "other"},
+            {"azp": "other"},
+        ):
+            with self.subTest(claims=claims):
+                with self.assertRaises(OIDCError):
+                    await self._validate(self._token(**claims))
+
+    async def test_signed_id_token_rejects_bad_claims_key_and_algorithm(self) -> None:
+        now = int(time.time())
+        bad_claims = (
+            {"iss": "https://wrong.example.test"},
+            {"aud": "other"},
+            {"exp": now - 120},
+            {"iat": now + 120},
+            {"nonce": "wrong"},
+        )
+        for claims in bad_claims:
+            with self.subTest(claims=claims):
+                with self.assertRaises(OIDCError):
+                    await self._validate(self._token(**claims))
+
+        now = int(time.time())
+        unknown_kid = JsonWebToken(["RS256"]).encode(
+            {"alg": "RS256", "kid": "unknown-key"},
+            {"iss": self.config.issuer, "sub": "subject", "aud": "client", "exp": now + 300, "iat": now, "nonce": "nonce", "groups": ["Analysts"]},
+            self.private_pem,
+        )
+        with self.assertRaises(OIDCError):
+            await self._validate(unknown_kid.decode("ascii") if isinstance(unknown_kid, bytes) else unknown_kid)
+
+        other_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        other_pem = other_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        bad_signature = JsonWebToken(["RS256"]).encode(
+            {"alg": "RS256", "kid": "test-key"},
+            {"iss": self.config.issuer, "sub": "subject", "aud": "client", "exp": now + 300, "iat": now, "nonce": "nonce", "groups": ["Analysts"]},
+            other_pem,
+        )
+        with self.assertRaises(OIDCError):
+            await self._validate(bad_signature.decode("ascii") if isinstance(bad_signature, bytes) else bad_signature)
+
+        hs_token = JsonWebToken(["HS256"]).encode(
+            {"alg": "HS256", "kid": "test-key"},
+            {"iss": self.config.issuer, "sub": "subject", "aud": "client", "exp": now + 300, "iat": now, "nonce": "nonce", "groups": ["Analysts"]},
+            b"symmetric-test-secret",
+        )
+        with self.assertRaises(OIDCError):
+            await self._validate(hs_token.decode("ascii") if isinstance(hs_token, bytes) else hs_token)
+
+    async def test_exchange_honors_advertised_client_auth_method(self) -> None:
+        for methods, expected_basic in ((
+            ("client_secret_basic",), True),
+            (("client_secret_post",), False),
+        ):
+            with self.subTest(methods=methods):
+                metadata = OIDCMetadata(
+                    self.metadata.authorization_endpoint,
+                    self.metadata.token_endpoint,
+                    self.metadata.jwks_uri,
+                    self.metadata.issuer,
+                    methods,
+                )
+                requests: list[dict] = []
+
+                class FakeResponse:
+                    def raise_for_status(self):
+                        return None
+
+                    def json(self):
+                        return {"id_token": "signed-token"}
+
+                class FakeClient:
+                    def __init__(self, *args, **kwargs):
+                        pass
+
+                    async def __aenter__(self):
+                        return self
+
+                    async def __aexit__(self, *args):
+                        return None
+
+                    async def post(self, _url, **kwargs):
+                        requests.append(kwargs)
+                        return FakeResponse()
+
+                with (
+                    patch.object(self.oidc, "discover", new=AsyncMock(return_value=metadata)),
+                    patch.object(self.oidc.httpx, "AsyncClient", FakeClient),
+                ):
+                    await exchange_code(self.config, code="code", verifier="verifier")
+                self.assertEqual(len(requests), 1)
+                if expected_basic:
+                    self.assertEqual(requests[0]["auth"], ("client", "secret"))
+                    self.assertNotIn("client_secret", requests[0]["data"])
+                else:
+                    self.assertNotIn("auth", requests[0])
+                    self.assertEqual(requests[0]["data"]["client_secret"], "secret")
+                self.assertNotIn("secret", requests[0].get("url", ""))
+
+        unsupported = OIDCMetadata(
+            self.metadata.authorization_endpoint,
+            self.metadata.token_endpoint,
+            self.metadata.jwks_uri,
+            self.metadata.issuer,
+            ("private_key_jwt",),
+        )
+        with patch.object(self.oidc, "discover", new=AsyncMock(return_value=unsupported)):
+            with self.assertRaises(OIDCError):
+                await exchange_code(self.config, code="code", verifier="verifier")
+
+
+class SessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.old = app_config.DEFAULT_CONFIG_DIR
+        app_config.DEFAULT_CONFIG_DIR = Path(self.temp.name)
+        clear_auth_state()
+
+    def tearDown(self) -> None:
+        app_config.DEFAULT_CONFIG_DIR = self.old
+        self.temp.cleanup()
+
+    def test_transaction_is_one_time_and_expires(self) -> None:
+        state = create_transaction(nonce="nonce", code_verifier="verifier", binding_secret="binding", return_path="/cases", expires_at=100)
+        self.assertIsNone(consume_transaction(state, "binding", now=101))
+        state = create_transaction(nonce="nonce", code_verifier="verifier", binding_secret="binding", return_path="/cases", expires_at=200)
+        self.assertIsNone(consume_transaction(state, "wrong-browser", now=150))
+        self.assertEqual(consume_transaction(state, "binding", now=150), {"nonce": "nonce", "code_verifier": "verifier", "return_path": "/cases"})
+        self.assertIsNone(consume_transaction(state, "binding", now=150))
+
+    def test_session_tamper_expiry_rotation_and_logout(self) -> None:
+        token, _session = create_session(subject="sub", display_name="A", email=None, is_admin=False, idle_seconds=10, absolute_seconds=100, now=100)
+        self.assertEqual(get_session(token, idle_seconds=10, now=105).subject, "sub")
+        self.assertIsNone(get_session(token + "tampered", idle_seconds=10, now=105))
+        self.assertIsNone(get_session(token, idle_seconds=10, now=200))
+        token2, _ = create_session(subject="sub", display_name="A", email=None, is_admin=False, idle_seconds=10, absolute_seconds=100, now=100)
+        self.assertNotEqual(token, token2)
+        revoke_session(token2)
+        self.assertIsNone(get_session(token2, idle_seconds=10, now=101))
+
+
+class AuthBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.old = app_config.DEFAULT_CONFIG_DIR
+        app_config.DEFAULT_CONFIG_DIR = Path(self.temp.name)
+        self.env = patch.dict(os.environ, {
+            "INVESTIGATOR_AUTH_ENABLED": "true",
+            "INVESTIGATOR_PUBLIC_ORIGIN": "http://localhost:8400",
+            "INVESTIGATOR_OIDC_ISSUER": "http://localhost:9000",
+            "INVESTIGATOR_OIDC_CLIENT_ID": "client",
+            "INVESTIGATOR_OIDC_CLIENT_SECRET": "secret",
+            "INVESTIGATOR_SSO_CLAIMS": "groups",
+            "INVESTIGATOR_SSO_ALLOWED_VALUES": "Analysts",
+        }, clear=True)
+        self.env.start()
+        from fastapi.testclient import TestClient
+        from app.main import app
+        self.client = TestClient(app, base_url="http://localhost:8400")
+
+    def tearDown(self) -> None:
+        self.client.close()
+        self.env.stop()
+        app_config.DEFAULT_CONFIG_DIR = self.old
+        self.temp.cleanup()
+
+    def test_anonymous_api_and_websocket_are_denied_but_health_bootstrap_are_public(self) -> None:
+        from starlette.websockets import WebSocketDisconnect
+
+        self.assertEqual(self.client.get("/api/health").status_code, 200)
+        self.assertEqual(self.client.get("/api/auth/bootstrap").status_code, 200)
+        self.assertEqual(self.client.get("/openapi.json").status_code, 401)
+        denied = self.client.get("/api/cases")
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.json(), {"detail": "Authentication required"})
+        with self.assertRaises(WebSocketDisconnect):
+            with self.client.websocket_connect(
+                "/api/cases/deadbeef/ingestion-ws",
+                headers={"origin": "http://localhost:8400"},
+            ):
+                pass
+
+    def test_authenticated_session_and_origin_policy(self) -> None:
+        token, _ = create_session(subject="sub", display_name="Analyst", email=None, is_admin=False, idle_seconds=60, absolute_seconds=3600)
+        self.client.cookies.set("investigator_session", token)
+        self.assertEqual(self.client.get("/api/auth/session").json()["authenticated"], True)
+        self.assertEqual(self.client.post("/api/auth/logout").status_code, 403)
+        self.assertEqual(self.client.post("/api/auth/logout", headers={"origin": "http://localhost:8400"}).status_code, 200)
+
+    def test_login_return_path_state_and_callback_replay_protection(self) -> None:
+        from app.auth.oidc import Identity
+        from app.auth import router as auth_router
+        from urllib.parse import urlencode
+
+        async def fake_authorization_url(_config, **kwargs):
+            return "https://idp.example.test/authorize?" + urlencode({"state": kwargs["state"]})
+
+        with patch.object(auth_router, "authorization_url", new=AsyncMock(side_effect=fake_authorization_url)):
+            unsafe = self.client.get("/api/auth/login?return_to=https://evil.example/", follow_redirects=False)
+            self.assertEqual(unsafe.status_code, 400)
+            started = self.client.get("/api/auth/login?return_to=/cases", follow_redirects=False)
+        self.assertEqual(started.status_code, 303)
+        location = started.headers["location"]
+        from urllib.parse import parse_qs, urlsplit
+        state = parse_qs(urlsplit(location).query).get("state", [""])[0]
+        self.assertTrue(state)
+        with (
+            patch.object(auth_router, "exchange_code", new=AsyncMock(return_value={"id_token": "opaque-test-token"})),
+            patch.object(auth_router, "validate_id_token", new=AsyncMock(return_value=Identity("sub", "Analyst", None, False))),
+        ):
+            callback = self.client.get(f"/api/auth/callback?code=code&state={state}", follow_redirects=False)
+        self.assertEqual(callback.status_code, 303)
+        self.assertEqual(callback.headers["location"], "/cases")
+        replay = self.client.get(f"/api/auth/callback?code=code&state={state}", follow_redirects=False)
+        self.assertEqual(replay.status_code, 400)
+
+    def test_login_transaction_is_bound_to_initiating_browser(self) -> None:
+        from app.auth import router as auth_router
+        from app.auth.oidc import Identity
+        from urllib.parse import parse_qs, urlsplit
+        from fastapi.testclient import TestClient
+
+        async def fake_authorization_url(_config, **kwargs):
+            return "https://idp.example.test/authorize?state=" + kwargs["state"]
+
+        other_client = TestClient(__import__("app.main", fromlist=["app"]).app, base_url="http://localhost:8400")
+        try:
+            with patch.object(auth_router, "authorization_url", new=AsyncMock(side_effect=fake_authorization_url)):
+                started_a = self.client.get("/api/auth/login?return_to=/cases", follow_redirects=False)
+                started_b = other_client.get("/api/auth/login?return_to=/cases", follow_redirects=False)
+            state_a = parse_qs(urlsplit(started_a.headers["location"]).query)["state"][0]
+            self.assertNotEqual(state_a, parse_qs(urlsplit(started_b.headers["location"]).query)["state"][0])
+            with (
+                patch.object(auth_router, "exchange_code", new=AsyncMock(return_value={"id_token": "opaque-test-token"})),
+                patch.object(auth_router, "validate_id_token", new=AsyncMock(return_value=Identity("sub", "Analyst", None, False))),
+            ):
+                wrong_browser = other_client.get(
+                    f"/api/auth/callback?code=code&state={state_a}",
+                    follow_redirects=False,
+                )
+                self.assertEqual(wrong_browser.status_code, 400)
+                right_browser = self.client.get(
+                    f"/api/auth/callback?code=code&state={state_a}",
+                    follow_redirects=False,
+                )
+            self.assertEqual(right_browser.status_code, 303)
+        finally:
+            other_client.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

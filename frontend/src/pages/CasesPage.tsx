@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { api } from "../lib/api";
 import type { Case } from "../lib/types";
-import { ConfirmDialog, EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
+import { ConfirmDialog, EmptyState, Modal, PageShell, PageTitle, Spinner } from "../components/common";
 import { fmtRelative } from "../lib/ui";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -108,19 +108,19 @@ export default function CasesPage() {
       )}
 
       {showCreate && (
-        <div className="modal-backdrop fixed inset-0 z-50 grid place-items-center p-4">
-          <div className="modal-panel w-full max-w-md rounded-2xl p-6">
+        <Modal title="New investigation" onClose={() => setShowCreate(false)} busy={createMut.isPending} className="max-w-md">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-ink-50">New investigation</h2>
-              <button className="text-ink-400 transition hover:text-ink-100 active:scale-95" onClick={() => setShowCreate(false)}>
+              <button aria-label="Close new investigation" className="text-ink-400 transition hover:text-ink-100 active:scale-95" onClick={() => setShowCreate(false)}>
                 <X size={18} />
               </button>
             </div>
             <div className="space-y-4">
               <div>
-                <label className="label">Case name</label>
+                <label className="label" htmlFor="new-case-name">Case name</label>
                 <input
                   className="input"
+                  id="new-case-name"
                   placeholder="e.g. WORKSTATION-07 compromise"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
@@ -128,9 +128,10 @@ export default function CasesPage() {
                 />
               </div>
               <div>
-                <label className="label">Description</label>
+                <label className="label" htmlFor="new-case-description">Description</label>
                 <textarea
                   className="input min-h-[80px]"
+                  id="new-case-description"
                   placeholder="Context, ticket number, suspected activity…"
                   value={desc}
                   onChange={(e) => setDesc(e.target.value)}
@@ -149,8 +150,7 @@ export default function CasesPage() {
                 </button>
               </div>
             </div>
-          </div>
-        </div>
+        </Modal>
       )}
     </PageShell>
   );

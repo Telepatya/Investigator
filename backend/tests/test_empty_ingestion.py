@@ -34,6 +34,23 @@ from app.ingest import pipeline
 
 
 class EmptyIngestionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_progress_listener_is_bounded_and_keeps_latest_status(self) -> None:
+        manager = pipeline.IngestionManager()
+        queue = manager.subscribe("case-1")
+        self.assertEqual(queue.maxsize, pipeline.LISTENER_QUEUE_SIZE)
+
+        for sequence in range(pipeline.LISTENER_QUEUE_SIZE + 7):
+            manager._broadcast("case-1", {
+                "phase": "parsing", "sequence": sequence, "done": False,
+            })
+        terminal = {"phase": "done", "sequence": 999, "done": True}
+        manager._broadcast("case-1", terminal)
+
+        self.assertEqual(queue.qsize(), pipeline.LISTENER_QUEUE_SIZE)
+        queued = [queue.get_nowait() for _ in range(queue.qsize())]
+        self.assertEqual(queued[-1], terminal)
+        self.assertEqual(manager.get_status("case-1"), terminal)
+
     async def test_zero_event_upload_skips_detections_and_completes(self) -> None:
         manager = pipeline.IngestionManager()
         progress_updates: list[dict] = []
@@ -87,7 +104,7 @@ class EmptyIngestionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 pipeline.coordinator,
                 "snapshot",
-                side_effect=[{"queued": 1}, {"queued": 1}, {"queued": 0}, {"queued": 0}],
+                side_effect=[{"queued": 1}, {"queued": 0}],
             ),
             patch.object(engine, "run_detections_sync") as run_detections,
         ):
@@ -99,7 +116,7 @@ class EmptyIngestionTests(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.sleep(0)
 
-        run_detections.assert_called_once_with("case-1")
+        run_detections.assert_called_once_with("case-1", rebuild=False)
         update_meta.assert_any_call(
             "case-1", include_stats=False, status="ready"
         )

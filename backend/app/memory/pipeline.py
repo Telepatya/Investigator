@@ -24,6 +24,7 @@ from app.memory.forensics import (
     reset_memprocfs_artifact_dir,
 )
 from app.memory.memprocfs_runner import MemProcFSRunner, is_memprocfs_available
+from app.memory.identity import memory_upload_key
 from app.memory.yara_scanner import get_scanner
 from app.store import cases as case_store
 from app.store.database import MemoryResult, Process
@@ -945,9 +946,11 @@ def analyze_memory_dump_sync(
         return stats
 
     runner = MemProcFSRunner(dump_path)
-    session_id = f"mem-{dump_path.stem}"
+    session.info["upload_name"] = dump_path.name
+    dump_key = memory_upload_key(dump_path.name)
+    session_id = f"mem-{dump_key}"
     unsupported_capabilities: list[str] = []
-    artifact_dir = reset_memprocfs_artifact_dir(case_id, dump_path.stem)
+    artifact_dir = reset_memprocfs_artifact_dir(case_id, dump_key)
     extraction_manifest: dict[str, Any] | None = None
     memory_options = memory_options or {}
     include_forensic_timeline = bool(memory_options.get("forensic_timeline"))
@@ -985,7 +988,7 @@ def analyze_memory_dump_sync(
         if include_forensic_timeline or include_eventlogs:
             progress("memory", 56.0, "Parsing MemProcFS forensic artifacts", False, None)
             artifact_stats = ingest_memprocfs_artifacts_sync(
-                session, dump_path.stem, artifact_dir, extraction_manifest, progress
+                session, dump_key, artifact_dir, extraction_manifest, progress
             )
             stats["events"] += artifact_stats.get("events", 0)
             stats["memory_results"] += artifact_stats.get("memory_results", 0)
@@ -1027,6 +1030,7 @@ def analyze_memory_dump_sync(
                 cmdline=cmdlines.get(pid),
                 start_time=start,
                 session_id=session_id,
+                upload_name=session.info.get("upload_name"),
                 flags=[],
                 severity="info",
                 extra={"source": "memprocfs.pslist"},
@@ -1148,6 +1152,7 @@ def analyze_memory_dump_sync(
                 cmdline=cmdlines.get(pid),
                 start_time=create_time,
                 session_id=session_id,
+                upload_name=session.info.get("upload_name"),
                 flags=[flag],
                 severity=severity,
                 extra={"source": "memprocfs.psscan", **data},
@@ -1804,7 +1809,7 @@ def analyze_memory_dump_sync(
         from app.detect.engine import run_detections_sync
         run_detections_sync(case_id)
 
-        stats["memory_results"] = session.query(MemoryResult).count()
+        stats["memory_results"] = session.query(MemoryResult).filter(MemoryResult.upload_name == dump_path.name).count()
         return stats
     except Exception:
         session.rollback()
@@ -1896,6 +1901,7 @@ def _yara_scan_processes(session, dump_path, session_id, stats, progress, result
 def _add_memory_result(session, plugin, pid, process_name, summary, data, severity) -> MemoryResult:
     result = MemoryResult(
         plugin=plugin, pid=pid, process_name=process_name,
+        upload_name=session.info.get("upload_name"),
         summary=summary, data=data, severity=severity,
     )
     session.add(result)

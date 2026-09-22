@@ -1,0 +1,12 @@
+# Reverse sandbox malware-analysis pack. Keep exact direct versions here and
+# regenerate requirements.lock with hashes for Linux/Python 3.10.
+lief==0.17.6
+capstone==5.0.9
+flare-capa==9.4.0
+flare-floss==3.1.1
+dnfile==0.18.0
+dncil==1.0.2
+pyelftools==0.33
+xdis==6.1.1
+# Security floor for the packaging helper pulled in by the analysis tools.
+pip>=26.2

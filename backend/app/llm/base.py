@@ -50,6 +50,9 @@ def get_provider(config: AppConfig | None = None) -> LLMProvider:
     if provider == "openai":
         from app.llm.openai_provider import OpenAIProvider
         return OpenAIProvider(cfg)
+    if provider == "openrouter":
+        from app.llm.openrouter_provider import OpenRouterProvider
+        return OpenRouterProvider(cfg)
     if provider == "gemini":
         from app.llm.gemini_provider import GeminiProvider
         return GeminiProvider(cfg)

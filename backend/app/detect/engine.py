@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Text, cast, or_, select
+from sqlalchemy import Text, cast, delete as sqldelete, or_, select, update as sqlupdate
 
 from app.detect.rules import (
     DGA_MIN_ENTROPY,
@@ -23,22 +23,13 @@ from app.detect.rules import (
     DOMAIN_FINDING_CAP,
     DYNAMIC_DNS_SUFFIXES,
     EXPECTED_PARENTS,
-    LINUX_PERSISTENCE_PATHS,
-    LINUX_SUSPICIOUS_CMDLINE_PATTERNS,
-    LOLBINS,
     LOW_SIGNAL_LOLBINS,
-    PERSISTENCE_REGISTRY_PATHS,
     SCHEDULED_TASK_SCRIPT_HOSTS,
-    SUSPICIOUS_CMDLINE_PATTERNS,
     SUSPICIOUS_EXECUTION_DIRS,
-    SUSPICIOUS_PARENT_CHILD_MAP,
     SUSPICIOUS_TLDS,
-    SYSTEM_PROCESS_PATHS,
     TASK_UPDATER_MASQUERADES,
-    WEB_ATTACK_PATTERNS,
-    WEB_USER_AGENT_PATTERNS,
 )
-from app.detect.manual import apply_manual_findings
+from app.detect.manual import apply_manual_findings, restore_manual_event_severities
 from app.detect.overrides import (
     apply_overrides,
     get_benign_keys,
@@ -46,6 +37,8 @@ from app.detect.overrides import (
     is_suppressed,
     rule_id_for,
 )
+from app.rules.fieldmap import MatchCtx
+from app.rules.profile import DEFAULT_PROFILE, RuleProfile, load_profile
 from app.store import cases as case_store
 from app.store.database import Event, Finding, MemoryResult, Process
 
@@ -316,7 +309,19 @@ def _add_finding(
     techniques: list[str],
     evidence: dict[str, Any],
     source: str,
+    *,
+    profile: RuleProfile = DEFAULT_PROFILE,
 ) -> None:
+    # Global rule state is applied here because this is the only place that sees
+    # every finding, including the ones produced by imperative engine code rather
+    # than by a rule table. Filtering the tables (see RuleProfile) is what makes a
+    # disabled rule cheaper; this is what makes it correct everywhere. Both sets are
+    # empty by default, so an untouched installation pays only two attribute reads.
+    if profile.disabled_legacy_ids or profile.severity_overrides:
+        legacy_id = rule_id_for(title, source)
+        if legacy_id in profile.disabled_legacy_ids:
+            return
+        severity = profile.severity_overrides.get(legacy_id, severity)
     key = (title, str(evidence.get("entity") or evidence.get("pid") or evidence.get("summary", ""))[:200])
     if key in existing:
         return
@@ -626,6 +631,8 @@ def _check_memprocfs_timeline_event(
     evidence: dict[str, Any],
     task_records: list[dict[str, Any]],
     persistence_artifacts: list[tuple[str, str, str, str]],
+    *,
+    profile: RuleProfile = DEFAULT_PROFILE,
 ) -> None:
     mem_csv = str(raw.get("memprocfs_csv") or "").lower()
     if mem_csv == "tasks.csv":
@@ -645,7 +652,7 @@ def _check_memprocfs_timeline_event(
         }
         if action or task_name:
             task_records.append(task_record)
-        top = _check_cmdline(session, existing, action, evidence, f"event:{event.source}")
+        top = _check_cmdline(session, existing, action, evidence, f"event:{event.source}", profile=profile)
         if top:
             _escalate_event(
                 session, event, top,
@@ -660,7 +667,7 @@ def _check_memprocfs_timeline_event(
     text = _timeline_text(event, raw)
     lower = text.lower()
     if typ == "PROC":
-        top = _check_cmdline(session, existing, text, evidence, f"event:{event.source}")
+        top = _check_cmdline(session, existing, text, evidence, f"event:{event.source}", profile=profile)
         if top:
             _escalate_event(
                 session, event, top,
@@ -668,7 +675,7 @@ def _check_memprocfs_timeline_event(
             )
 
     if typ == "REG":
-        for fragment, technique, desc in PERSISTENCE_REGISTRY_PATHS:
+        for fragment, technique, desc in profile.registry_persistence:
             if fragment in lower:
                 if not _memprocfs_registry_persistence_is_specific(fragment, lower):
                     break
@@ -746,11 +753,20 @@ def _check_memprocfs_timeline_event(
             )
 
 
-def _check_cmdline_impl(session, existing, text, evidence, source, patterns, prefilter) -> str | None:
+def _check_cmdline_impl(
+    session, existing, text, evidence, source, patterns, prefilter,
+    *, profile: RuleProfile = DEFAULT_PROFILE,
+) -> str | None:
     """Match `text` against a command-line pattern list, emitting a finding per
     match and returning the highest severity seen. `prefilter` is a cheap literal
-    gate that must fire before the full list is scanned."""
+    gate that must fire before the full list is scanned.
+
+    `patterns` comes from the active RuleProfile, which is the full module table
+    unless the analyst disabled something. Because filtering only ever *removes*
+    entries, the prefilter remains a valid superset gate and needs no adjustment."""
     if not text:
+        return None
+    if not patterns:
         return None
     if not prefilter.search(text):
         return None
@@ -768,29 +784,36 @@ def _check_cmdline_impl(session, existing, text, evidence, source, patterns, pre
                 techniques=[technique],
                 evidence=evidence,
                 source=source,
+                profile=profile,
             )
             if top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[top]:
                 top = severity
     return top
 
 
-def _check_cmdline(session, existing, text: str, evidence: dict[str, Any], source: str) -> str | None:
+def _check_cmdline(
+    session, existing, text: str, evidence: dict[str, Any], source: str,
+    *, profile: RuleProfile = DEFAULT_PROFILE,
+) -> str | None:
     """Returns highest severity matched, adds findings (Windows pattern set)."""
     return _check_cmdline_impl(
         session, existing, text, evidence, source,
-        SUSPICIOUS_CMDLINE_PATTERNS, _CMDLINE_PREFILTER_RE,
+        profile.win_cmdline, _CMDLINE_PREFILTER_RE, profile=profile,
     )
 
 
-def _check_linux_cmdline(session, existing, text: str, evidence: dict[str, Any], source: str) -> str | None:
+def _check_linux_cmdline(
+    session, existing, text: str, evidence: dict[str, Any], source: str,
+    *, profile: RuleProfile = DEFAULT_PROFILE,
+) -> str | None:
     """Returns highest severity matched, adds findings (Linux/Unix pattern set)."""
     return _check_cmdline_impl(
         session, existing, text, evidence, source,
-        LINUX_SUSPICIOUS_CMDLINE_PATTERNS, _LINUX_CMDLINE_PREFILTER_RE,
+        profile.linux_cmdline, _LINUX_CMDLINE_PREFILTER_RE, profile=profile,
     )
 
 
-def _scan_cmdline_severity(text: str) -> str | None:
+def _scan_cmdline_severity(text: str, *, profile: RuleProfile = DEFAULT_PROFILE) -> str | None:
     """Highest severity any cmdline pattern matches, WITHOUT emitting findings.
 
     Used when a matched pattern serves as one *signal* inside a larger graded
@@ -802,9 +825,49 @@ def _scan_cmdline_severity(text: str) -> str | None:
         return None
     lower = text.lower()
     top: str | None = None
-    for regex, _tech, _desc, severity in SUSPICIOUS_CMDLINE_PATTERNS:
+    for regex, _tech, _desc, severity in profile.win_cmdline:
         if regex.search(lower) and (top is None or SEVERITY_RANK[severity] > SEVERITY_RANK[top]):
             top = severity
+    return top
+
+
+def _check_custom_rules(
+    session,
+    existing: set[tuple[str, str]],
+    ctx: MatchCtx,
+    evidence: dict[str, Any],
+    source: str,
+    profile: RuleProfile,
+) -> str | None:
+    """Evaluate the analyst's Sigma rules against one process or event.
+
+    Callers guard on ``profile.custom.empty`` so an installation with no custom
+    rules never reaches this function. Within it, ``candidates`` applies the derived
+    literal prefilter, so a subject that cannot match any rule costs one alternation
+    search rather than a walk over the whole rule set.
+    """
+    candidates = profile.custom.candidates(ctx.blob())
+    if not candidates:
+        return None
+    top: str | None = None
+    for rule in candidates:
+        if not rule.logsource_gate(ctx) or not rule.predicate(ctx):
+            continue
+        _add_finding(
+            session, existing,
+            title=rule.title,
+            description=(
+                f"{rule.description or 'Custom Sigma rule matched.'} "
+                f"(rule {rule.slug})"
+            ).strip(),
+            severity=rule.severity,
+            techniques=list(rule.techniques),
+            evidence={**evidence, "sigma_rule": rule.slug},
+            source=f"sigma:{rule.slug}",
+            profile=profile,
+        )
+        if top is None or SEVERITY_RANK[rule.severity] > SEVERITY_RANK[top]:
+            top = rule.severity
     return top
 
 
@@ -1316,7 +1379,10 @@ _LINUX_CMDLINE_PREFILTER_RE = re.compile(
 _LINUX_PRIV_GROUPS = {"sudo", "wheel", "root", "admin", "adm", "docker"}
 
 
-def _check_linux_persistence(session, existing, event, raw, evidence) -> None:
+def _check_linux_persistence(
+    session, existing, event, raw, evidence,
+    *, profile: RuleProfile = DEFAULT_PROFILE,
+) -> None:
     """Flag Linux persistence-file writes observed via auditd PATH records or a
     crontab modification event."""
     candidates: list[str] = []
@@ -1332,7 +1398,7 @@ def _check_linux_persistence(session, existing, event, raw, evidence) -> None:
                     write_ish = True
     if not write_ish or not candidates:
         return
-    for fragment, technique, description, severity in LINUX_PERSISTENCE_PATHS:
+    for fragment, technique, description, severity in profile.linux_persistence:
         if any(fragment in name for name in candidates):
             _add_finding(
                 session, existing,
@@ -1346,7 +1412,10 @@ def _check_linux_persistence(session, existing, event, raw, evidence) -> None:
             _escalate_event(session, event, severity, f"Detection: {description}")
 
 
-def _check_linux_event(session, existing, event, raw, evidence, auth_fail, auth_success) -> None:
+def _check_linux_event(
+    session, existing, event, raw, evidence, auth_fail, auth_success,
+    *, profile: RuleProfile = DEFAULT_PROFILE,
+) -> None:
     """Per-event Linux/Entra heuristics: feed the auth brute-force trackers, flag
     root logins, account/group changes, risky Entra sign-ins, and persistence
     writes. Called only for events carrying Linux/Entra markers."""
@@ -1448,7 +1517,7 @@ def _check_linux_event(session, existing, event, raw, evidence, auth_fail, auth_
         )
         _escalate_event(session, event, "medium", "Detection: crontab modified")
 
-    _check_linux_persistence(session, existing, event, raw, evidence)
+    _check_linux_persistence(session, existing, event, raw, evidence, profile=profile)
 
 
 def _mem_result_technique(plugin: str, summary: str) -> list[str]:
@@ -2890,10 +2959,22 @@ def _corroborate_findings(session, processes, disabled: set[str], benign: set[st
     return changed
 
 
-def run_detections_sync(case_id: str) -> int:
-    """Run all detection heuristics for a case. Returns number of findings added."""
+def run_detections_sync(case_id: str, *, rebuild: bool = False) -> int:
+    """Commit a complete detection run atomically, retaining prior results on error."""
     session = case_store.get_session(case_id)
     try:
+        if rebuild:
+            restore_manual_event_severities(session)
+            session.execute(sqldelete(Finding))
+            session.execute(
+                sqlupdate(Event)
+                .where(
+                    Event.severity_reason.like("Detection:%")
+                    | Event.severity_reason.like("Context:%")
+                    | Event.severity_reason.like("Flagged-entity match:%")
+                )
+                .values(severity="info", severity_reason=None)
+            )
         total_started = time.perf_counter()
         phase_started = total_started
 
@@ -2917,6 +2998,11 @@ def run_detections_sync(case_id: str) -> int:
         # User overrides (persisted in case_meta, survive this rebuild).
         disabled_rules = get_disabled_rules(session)
         benign_keys = get_benign_keys(session)
+
+        # Global rule state, snapshotted once so a rule edit mid-run cannot leave
+        # this case's findings internally inconsistent. With no customization this
+        # is the shared default profile and the engine behaves exactly as before.
+        profile = load_profile()
 
         processes = list(session.scalars(select(Process)))
         proc_by_pid: dict[tuple[str, int], Process] = {}
@@ -2945,8 +3031,8 @@ def run_detections_sync(case_id: str) -> int:
             }
 
             # LOLBin usage with non-trivial command line
-            if name in LOLBINS and cmdline and len(cmdline.split()) > 1:
-                technique, desc = LOLBINS[name]
+            if name in profile.lolbins and cmdline and len(cmdline.split()) > 1:
+                technique, desc = profile.lolbins[name]
                 _add_finding(
                     session, existing,
                     title=f"LOLBin activity: {proc.name}",
@@ -2958,8 +3044,19 @@ def run_detections_sync(case_id: str) -> int:
                 )
                 flags.append("lolbin")
 
+            # Analyst-authored Sigma rules, evaluated against the same process.
+            if not profile.custom.empty:
+                sigma_top = _check_custom_rules(
+                    session, existing,
+                    MatchCtx(kind="process", raw=dict(proc.extra or {}),
+                             process=proc, parent=proc_by_pid.get((proc.session_id, proc.ppid or -1))),
+                    evidence, "process-heuristics", profile,
+                )
+                if sigma_top and SEVERITY_RANK[sigma_top] > SEVERITY_RANK.get(proc.severity, 0):
+                    proc.severity = sigma_top
+
             # Suspicious command line patterns
-            top = _check_cmdline(session, existing, cmdline, evidence, "process-heuristics")
+            top = _check_cmdline(session, existing, cmdline, evidence, "process-heuristics", profile=profile)
             if top:
                 flags.append("suspicious-cmdline")
                 cmdline_rank[(proc.session_id, proc.pid)] = SEVERITY_RANK[top]
@@ -2977,8 +3074,8 @@ def run_detections_sync(case_id: str) -> int:
 
             # Masquerading: system process from wrong path. Path is normalized (device
             # paths, \??\, \SystemRoot) and placeholder/bare-name paths never fire.
-            if name in SYSTEM_PROCESS_PATHS and path and "\\" in path:
-                expected = SYSTEM_PROCESS_PATHS[name]
+            if name in profile.system_process_paths and path and "\\" in path:
+                expected = profile.system_process_paths[name]
                 if expected not in path:
                     _add_finding(
                         session, existing,
@@ -3000,7 +3097,7 @@ def run_detections_sync(case_id: str) -> int:
             # Execution from suspicious directories. Weak single signal on its own
             # (installers, updaters and portable apps run from these too), so it is
             # graded "low" and relies on corroboration to rise.
-            if path and any(d in path for d in SUSPICIOUS_EXECUTION_DIRS):
+            if path and any(d in path for d in profile.exec_dirs):
                 _add_finding(
                     session, existing,
                     title=f"Execution from suspicious directory: {proc.name}",
@@ -3075,7 +3172,7 @@ def run_detections_sync(case_id: str) -> int:
                 }
                 # Known-bad pairs (skip when the parent PID was demonstrably reused)
                 if not pid_reused:
-                    bad_pair = SUSPICIOUS_PARENT_CHILD_MAP.get((pname, name))
+                    bad_pair = profile.parent_child.get((pname, name))
                     if bad_pair is not None:
                         technique, desc = bad_pair
                         _add_finding(
@@ -3160,14 +3257,14 @@ def run_detections_sync(case_id: str) -> int:
             if SEVERITY_RANK[severity] > SEVERITY_RANK.get(proc.severity, 0):
                 proc.severity = severity
 
-        session.commit()
+        session.flush()
         mark_phase("process heuristics", processes=len(processes), findings=len(existing) - before)
 
         # --- MemoryResult bridge ---
         # Memory analysis can produce high-confidence indicators even when no
         # event-log fields exist to match, so promote those rows into Findings.
         _promote_memory_results(session, existing)
-        session.commit()
+        session.flush()
         mark_phase("memory promotion", findings=len(existing) - before)
 
         # --- Event heuristics ---
@@ -3272,14 +3369,26 @@ def run_detections_sync(case_id: str) -> int:
                     "dangerous process access, or high-risk handle)",
                 )
 
+            # Analyst-authored Sigma rules, evaluated against the same event.
+            if not profile.custom.empty:
+                sigma_top = _check_custom_rules(
+                    session, existing,
+                    MatchCtx(kind="event", raw=raw, event=event),
+                    evidence, f"event:{event.source}", profile,
+                )
+                if sigma_top:
+                    _escalate_event(
+                        session, event, sigma_top, "Detection: custom Sigma rule matched"
+                    )
+
             # Linux events run only the Linux pattern set (and vice-versa) so free-text
             # syslog prose can't trip Windows rules and Windows cmdlines can't trip
             # Linux rules.
             is_linux = bool(raw.get("linux_log"))
             if is_linux:
-                top = _check_linux_cmdline(session, existing, summary_text, evidence, f"event:{event.source}")
+                top = _check_linux_cmdline(session, existing, summary_text, evidence, f"event:{event.source}", profile=profile)
             else:
-                top = _check_cmdline(session, existing, summary_text, evidence, f"event:{event.source}")
+                top = _check_cmdline(session, existing, summary_text, evidence, f"event:{event.source}", profile=profile)
             if top:
                 _escalate_event(
                     session, event, top,
@@ -3289,11 +3398,12 @@ def run_detections_sync(case_id: str) -> int:
             if is_linux or raw.get("AuthProto") or raw.get("LinuxAccountAction"):
                 _check_linux_event(
                     session, existing, event, raw, evidence,
-                    linux_auth_fail, linux_auth_success,
+                    linux_auth_fail, linux_auth_success, profile=profile,
                 )
 
             _check_memprocfs_timeline_event(
-                session, existing, event, raw, evidence, task_records, persistence_artifacts
+                session, existing, event, raw, evidence, task_records, persistence_artifacts,
+                profile=profile,
             )
 
             # wevtutil cl in an embedded command line: track for the log-clear window pass
@@ -3311,7 +3421,7 @@ def run_detections_sync(case_id: str) -> int:
             key_path = str(raw.get("KeyPath") or raw.get("Key") or raw.get("Name") or "").lower()
             if event.category == "persistence" or "registry" in event.source.lower():
                 matched_runkey = False
-                for fragment, technique, desc in PERSISTENCE_REGISTRY_PATHS:
+                for fragment, technique, desc in profile.registry_persistence:
                     if fragment in key_path or fragment in summary_text.lower():
                         _add_finding(
                             session, existing,
@@ -3389,7 +3499,7 @@ def run_detections_sync(case_id: str) -> int:
                 npath = _normalize_path(_first_exe_token(image))
                 reasons: list[str] = []
                 techniques = ["T1543.003"]
-                if npath and "\\" in npath and any(d in npath for d in SUSPICIOUS_EXECUTION_DIRS):
+                if npath and "\\" in npath and any(d in npath for d in profile.exec_dirs):
                     reasons.append(
                         f"service binary in a user-writable/staging path ({image[:200]})"
                     )
@@ -3545,7 +3655,7 @@ def run_detections_sync(case_id: str) -> int:
 
             # Web access-log attack detection
             if event.category == "weblog":
-                _check_weblog(session, existing, event, raw, web_ip_tracker)
+                _check_weblog(session, existing, event, raw, web_ip_tracker, profile=profile)
 
             # Beaconing-shaped network events: same remote endpoint many times
             if event.category == "network" and event.timestamp:
@@ -4019,11 +4129,17 @@ def run_detections_sync(case_id: str) -> int:
             case_id, time.perf_counter() - total_started, after - before, after,
         )
         return after - before
+    except BaseException:
+        session.rollback()
+        raise
     finally:
         session.close()
 
 
-def _check_weblog(session, existing, event, raw, web_ip_tracker) -> None:
+def _check_weblog(
+    session, existing, event, raw, web_ip_tracker,
+    *, profile: RuleProfile = DEFAULT_PROFILE,
+) -> None:
     """Detect web attacks in a single access-log event and accumulate per-IP stats."""
     ip = str(raw.get("client_ip") or event.entity or "unknown")
     request = str(raw.get("request") or "")
@@ -4067,7 +4183,7 @@ def _check_weblog(session, existing, event, raw, web_ip_tracker) -> None:
     # These are overwhelmingly plain-substring checks, for which `in` is already
     # C-fast; a literal prefilter gate here measured *slower* than the loop itself
     # (unlike the all-regex cmdline path, which a prefilter genuinely accelerates).
-    for pattern, technique, desc, severity in WEB_ATTACK_PATTERNS:
+    for pattern, technique, desc, severity in profile.web_attacks:
         hit = pattern.search(req_lower) if isinstance(pattern, re.Pattern) else pattern in req_lower
         if hit:
             # /manager/html on its own is very noisy; only flag when authenticated
@@ -4076,7 +4192,7 @@ def _check_weblog(session, existing, event, raw, web_ip_tracker) -> None:
             record(technique, desc, severity)
 
     # Scanner/attack-tool signatures identify themselves in the User-Agent header.
-    for pattern, technique, desc, severity in WEB_USER_AGENT_PATTERNS:
+    for pattern, technique, desc, severity in profile.web_user_agents:
         if ua_lower and pattern in ua_lower:
             record(technique, desc, severity)
 

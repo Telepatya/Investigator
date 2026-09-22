@@ -8,7 +8,7 @@
 > Interfaces and stored data may change before 1.0; validate conclusions against
 > the underlying evidence before relying on them.
 
-A fully local DFIR workstation. Ingest endpoint and log evidence — event logs, EVTX, forensic artifacts, DFIR collections (e.g. Velociraptor), and Microsoft Defender / Azure logs — plus raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
+A fully local DFIR workstation. Ingest endpoint and log evidence — event logs, EVTX, forensic artifacts, DFIR collections (e.g. Velociraptor), and Microsoft Defender / Azure logs — plus raw memory dumps, run MemProcFS + YARA + a deterministic detection engine, and let a configurable LLM (local Ollama, or remote OpenAI / OpenRouter / Anthropic / Gemini) reconstruct the machine's story — a full timeline, interactive process and entity maps, MITRE ATT&CK coverage, and a written incident summary.
 
 Everything runs on your machine. API keys are stored in your OS credential vault, never on disk in plaintext.
 
@@ -20,6 +20,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - [Features](#features)
 - [Supported evidence](#supported-evidence)
 - [Quick start](#quick-start)
+- [Optional organization SSO](#optional-organization-sso)
 - [Configure the AI](#configure-the-ai)
 - [Working a case](#working-a-case)
 - [How analysis works](#how-analysis-works)
@@ -34,7 +35,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 
 ## Features
 
-- **Bring your own AI.** Ollama (on-device) with live model discovery, or OpenAI, Anthropic, and Google Gemini with per-provider model catalogs and a built-in connection tester.
+- **Bring your own AI.** Ollama (on-device) with live model discovery, or OpenAI, OpenRouter, Anthropic, and Google Gemini with per-provider model catalogs and a built-in connection tester.
 - **Broad evidence ingestion.** Offline-collector ZIPs (e.g. Velociraptor), JSON/JSONL artifact results, CSV, EVTX/event logs, and Microsoft Defender / Azure (Sentinel) log exports are parsed and normalized into a unified event model with full-text search. Events and logs can also be fed in manually.
 - **Memory forensics.** MemProcFS process, module, VAD, thread, handle, network, service, and driver maps feed deterministic injection, hollowing, suspicious-service, network, and driver heuristics. Executable private-memory candidates are checked against VAD shape, module load order, live thread start addresses, network context, and machine-wide prevalence before escalation.
 - **APT hunting.** YARA sweep of memory using a bundled C2 / offensive-tooling ruleset (Cobalt Strike, Meterpreter, Sliver/Covenant/Havoc, Mimikatz, Rubeus, reflective loaders, shellcode markers) plus your own rules directory.
@@ -43,6 +44,7 @@ Everything runs on your machine. API keys are stored in your OS credential vault
 - **Analyst workstation UI.** Responsive glass-panel workspace with system-aware light/dark themes, a persistent case shell, expandable current-case event search, reusable detail drawers, subtle loading/interaction animation, and case-scoped busy states.
 - **Investigation views.** A server-filtered chronological timeline, deterministic layered entity map, overview dashboard, memory explorer, findings and event tables, evidence management, report export, and streaming AI chat. Timeline and entity-map bundles load only when those routes are opened.
 - **Analyst findings.** Events and entities can be promoted to durable manual findings. Event flags carry their chosen severity into the referenced event and exact-entity-related timeline activity, while benign/delete actions restore the prior parser or detector severity.
+- **Reverse workspaces.** Upload suspicious binaries to standalone or case-linked workspaces for network-isolated, non-root static analysis. Reverse reuses the configured LLM, preserves a signed provenance chain, and supports reports, IOC extraction, replay, and follow-up chat without intentionally executing samples.
 
 | Entity map | Timeline |
 | --- | --- |
@@ -155,6 +157,12 @@ On Windows you can also just double-click **`run.bat`** (it calls `run.py`).
 
 This creates the Python virtual environment, installs locked dependencies, builds the frontend, and opens the app at `http://localhost:8400`.
 
+Authentication is disabled by default and the normal mode is loopback-only. An
+organization can opt into standards-based OIDC SSO with environment-only
+configuration; see [Optional organization SSO](docs/SSO.md) for exact Okta and
+Microsoft Entra setup, redirect URIs, claim allowlisting, and the Entra
+group-overage limitation.
+
 Options:
 
 ```bash
@@ -162,7 +170,41 @@ python run.py --dev                  # backend + Vite dev server with hot reload
 python run.py --port 9000            # use a different port
 python run.py --skip-build           # skip rebuilding the frontend
 python run.py --allow-unlocked-deps  # temporary local fallback if Python lock files aren't generated yet
+python run.py --build-reverse-sandbox # explicitly build the optional Docker static-analysis image
 ```
+
+The **Reverse** tab works as a local workspace manager without Docker. Running
+static binary analysis additionally requires Docker Desktop (Linux containers)
+and the explicitly built `investigator-reverse:latest` image. Normal startup
+never downloads or builds that image. Reverse projects and artifacts are stored
+under `~/.investigator/reverse/`; private provenance and provider keys remain in
+the operating-system credential vault. Reverse uses an adaptive
+malware-analysis prompt and one-operation loop (`run_cmd`, `read_file`,
+`write_file`, and `list_dir`) instead of a fixed checklist or rigid report
+template. Findings cite expandable `[trace:<message-id>]` evidence, and a
+goal-driven reviewer may request more analysis or revise unsupported report
+language before publishing. Reports expose complete, partial, or blocked
+analysis outcomes separately from review warnings and signature integrity; every
+published report is signed even when review is unavailable or leaves warnings.
+Follow-up chat uses the same tool-capable
+12-turn loop, so it can inspect the sealed artifacts instead of answering
+solely from report text.
+Review and signature status are visible on the Report tab and can be retried
+independently. Unfinished reports can resume the same investigation from either
+the workspace or report view; the previously published signed bytes are retained
+as a downloadable snapshot while the continuation runs.
+Reverse also persists semantic attempt history and normalized failure fingerprints.
+Two matching failures, or three operations that add no new evidence, activate a
+diagnostic pivot that asks the analyst model to validate bounds, headers, sizes,
+hashes, or runtime compatibility before retrying the stalled method. Substantive
+`ANALYSIS CHECKPOINT` responses are saved without prematurely entering report
+review. The sandbox includes a bounded `pyinstaller-inspect` analyzer that validates
+CArchive layout, safely extracts selected entries, and uses `xdis` for cross-version
+Python bytecode disassembly without importing or executing the sample.
+When built-in analyzers are insufficient, approved Reverse projects also let the
+model create Python parsers/decoders and run them against the sealed sample
+inside the same networkless, non-root sandbox. This does not enable a shell,
+subprocesses, native loading, or intentional sample execution.
 
 <details>
 <summary><strong>Manual start</strong> (without the launcher)</summary>
@@ -186,7 +228,7 @@ npm run dev                               # http://localhost:5173, proxies /api 
 Open **Settings**:
 
 - **Ollama (local):** point at your Ollama server URL (default `http://localhost:11434`); the model dropdown is populated live from your installed models.
-- **OpenAI / Anthropic / Gemini:** paste your API key (stored in the OS keyring), click **Test**, then pick a model.
+- **OpenAI / OpenRouter / Anthropic / Gemini:** paste your API key (stored in the OS keyring), click **Test**, then pick a model. OpenRouter uses its OpenAI-compatible API at `https://openrouter.ai/api/v1` by default.
 
 With Ollama, no case data ever leaves your machine. With a remote provider, only the evidence excerpts included in prompts are sent to that provider — Settings shows an explicit warning while a remote provider is selected.
 
@@ -253,7 +295,7 @@ toolchain, required-dependency, and optional-dependency matrix.
 The short version:
 
 - **Backend** (`backend/app`): FastAPI + SQLAlchemy, one SQLite database per case with FTS5 search. A per-case async operation coordinator serializes ingestion, analysis, detection rebuilds, and deletion; a per-database writer gate serializes SQLite write transactions while WAL keeps reads available. CPU/blocking graph and dossier work is moved off the event loop.
-- **Frontend** (`frontend/src`): React + TypeScript + Vite + Tailwind, with tokenized light/dark themes, React Flow, vis-timeline, Recharts, and TanStack Query. Query keys and transient UI state are case-scoped, long operations remain visible through WebSockets, and heavy visualization routes are code-split.
+- **Frontend** (`frontend/src`): React + TypeScript + Vite + Tailwind, with tokenized light/dark themes, React Flow, vis-timeline, and TanStack Query. Query keys and transient UI state are case-scoped, long operations remain visible through WebSockets, and heavy visualization routes are code-split.
 
 ## Development
 

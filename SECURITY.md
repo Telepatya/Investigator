@@ -88,34 +88,44 @@ rules rather than constructing paths directly from route or form values.
 
 ## Network Exposure And Local-Only Model
 
-Investigator is a single-user, loopback-only application. It binds to `127.0.0.1`
-and has no built-in authentication. Binding to loopback alone does **not** protect
-it from a hostile web page in the user's browser or from DNS rebinding, so the
-backend enforces origin/host controls, centralized in `backend/app/api/security.py`:
+Investigator is a single-user, loopback-only application by default. An optional
+one-organization OIDC mode is available for an explicitly configured public
+origin; see [the SSO deployment guide](docs/SSO.md). Binding to loopback alone
+does **not** protect it from a hostile web page in the user's browser or from
+DNS rebinding, so the backend enforces origin/host controls, centralized in
+`backend/app/api/security.py`:
 
 - **Host allowlist.** `TrustedHostMiddleware` compares each request's `Host`
-  header (port stripped) against `ALLOWED_HOSTS` (`localhost`, `127.0.0.1`) and
-  rejects anything else with `400`. This blocks DNS rebinding, where an attacker
-  domain resolves to `127.0.0.1`: the rebound request still carries the attacker's
-  hostname in `Host` and is refused.
+  header against `localhost`/`127.0.0.1` when SSO is disabled, or the hostname
+  explicitly present in `INVESTIGATOR_PUBLIC_ORIGIN` when SSO is enabled. It
+  never trusts forwarded headers.
 - **CORS allowlist.** Cross-origin HTTP reads are limited to the built app on
   `INVESTIGATOR_PORT` and the Vite dev server on `:5173`.
 - **HTTP Origin validation.** CORS does not stop a browser from sending a simple
   cross-origin write such as `multipart/form-data`. Every `POST`, `PUT`, `PATCH`,
-  and `DELETE` with a present `Origin` is therefore rejected unless it matches
-  the frontend allowlist. Non-browser clients may omit `Origin`.
-- **WebSocket origin validation.** CORS does not apply to WebSocket handshakes, so
-  every WebSocket route validates the browser `Origin` against the same allowlist
-  (and the target case's existence) *before* accepting. A missing `Origin` denotes
-  a non-browser client and is not a cross-site vector; any present-but-unlisted
-  origin (including a rebound attacker page or `null`) is refused.
+  and `DELETE` is rejected unless its Origin matches the frontend allowlist.
+  Non-browser clients may omit Origin only while SSO is disabled; SSO mode
+  requires the exact configured public Origin for mutations.
+- **WebSocket origin validation.** CORS does not apply to WebSocket handshakes;
+  every handshake is denied at the ASGI boundary unless its Origin and session
+  satisfy the configured policy before route code can accept it. Disabled mode
+  keeps the existing non-browser missing-Origin behavior.
 
-**Changing the bind address.** If you deliberately expose the backend on a
-non-loopback hostname, you must add that hostname to `ALLOWED_HOSTS` **and** to
-`allowed_origins()` in `backend/app/api/security.py` — the two lists must stay
-aligned, or the app will reject its own traffic. Exposing this app beyond loopback
-also means exposing an unauthenticated DFIR tool; add authentication and transport
-security (e.g. a reverse proxy) before doing so.
+When SSO is enabled, all `/api` product endpoints (including uploads,
+downloads, settings, rules, Reverse, and every WebSocket) require a valid
+server-side session. Only health and auth bootstrap/login/callback endpoints are
+anonymous; FastAPI's `/docs`, `/redoc`, and `/openapi.json` metadata endpoints
+also require a session. Static SPA assets remain public for the login shell. The
+opaque session cookie is HttpOnly, SameSite=Lax, Secure on HTTPS,
+and only its hash is stored; ID/access tokens and full claims are never stored
+or returned. Entra group-overage indicators fail closed without Graph calls.
+
+**Changing the bind address.** Disabled mode is intended for loopback only. If
+you deliberately expose the backend on a non-loopback hostname, configure SSO
+with the exact public origin and TLS first; SSO mode derives the Host/Origin
+allowlists from that origin and rejects incomplete configuration. A reverse
+proxy must preserve the public-origin contract rather than supplying a
+forwarded-host value that the app can trust.
 
 ## Resource Limits
 
@@ -151,6 +161,78 @@ advisory:
 - **Remote providers are explicit.** With Ollama, no case data leaves the machine.
   With a remote provider, only prompt/tool excerpts are sent, and the settings UI
   warns that evidence will leave the machine.
+
+## Reverse Static-Analysis Boundary
+
+Reverse artifacts are potentially executable malware and receive a stricter
+boundary than ordinary case evidence:
+
+- Reverse uses the existing loopback/Host/Origin controls and stores uploads by
+  generated UUID, after streamed size enforcement, basename validation, hashing,
+  staging, and atomic commit. Project paths use canonical containment checks.
+- Reverse uses a four-operation tool protocol: `run_cmd`, `read_file`,
+  `write_file`, and `list_dir`. `run_cmd` accepts one argv array, never shell text.
+  Both host and container validate against the same immutable executable/path
+  policy, and the broker substitutes an exact absolute binary before `shell=False`.
+  Indirect execution features in `find`, `awk`, and `sed` are denied. Shells,
+  networks, privilege changes, and uploaded-sample launching remain outside the
+  protocol.
+- The optional Linux container runs non-root with no network, host mounts, or
+  Docker socket; all capabilities are dropped, `no-new-privileges` and a read-only
+  root filesystem are applied, and writable tmpfs, CPU, memory, PID, timeout, and
+  output bounds are enforced. It is ephemeral and reconstructed from stored
+  artifacts after its idle TTL.
+- Artifact reconstruction uses a fixed, non-model-callable staging broker rather
+  than a host mount. It accepts bounded chunks at an exact UUID and offset, then
+  checks the expected size and SHA-256 and seals the sample before a static tool
+  can read it. Staging commands and analysis commands both use `shell=False`.
+- The agent follows an adaptive investigation loop. Its prompt asks
+  for identification, unpacking/deobfuscation, static analysis, behavioral
+  indicators, evidence correlation, and comprehensive malicious-sample reporting,
+  but the host imposes no fixed file-format checklist or report schema. Exact
+  duplicate operations are blocked. Semantic retry state and normalized failure
+  fingerprints activate a diagnostic pivot after two matching failures or three
+  operations without novel evidence; only the stalled method is paused, and an
+  independent bounds/header/size/hash/runtime check clears the pivot.
+- Follow-up Reverse chat uses the same guarded four-operation tool loop for up to
+  12 turns. Its tool requests and result hashes are added to audit/provenance
+  history; it does not gain a broader command or Python policy than analysis.
+- The fixed `pyinstaller-inspect` analyzer only parses bytes. It validates cookie,
+  package, TOC, entry, compression, and output-path invariants; selected bytecode is
+  decoded with `xdis` rather than imported or executed by the container runtime.
+- Reports receive a separate structured IOC-enumeration pass and an independent,
+  goal-driven evidence review. Material claims and IOCs cite stable tool-message
+  references, whose project-scoped API exposes the retained bounded output and
+  hash without broadening sandbox access. The reviewer can request targeted
+  analysis or a report-only revision, but cannot introduce evidence. Review is
+  capped at two passes and records passed, passed-with-warnings, or failed status
+  independently of the complete, partial, or blocked analysis outcome.
+- Remote LLM providers may receive bounded strings, headers, hashes, report text,
+  and tool output from Reverse artifacts. The same evidence-leaves-the-machine
+  warning and global provider choice shown in Settings applies.
+- Analysis runs record the provider/model snapshot, image digest, tool versions,
+  artifact hashes, and a tamper-evident provenance chain. The per-install signing
+  private key is generated into the OS credential vault and is never packaged.
+  New installations use a compact Ed25519 key that fits Windows Credential
+  Manager; existing RSA keys remain readable. Exact report bytes are committed
+  and signed regardless of outcome or review warnings, so a vault outage leaves
+  a published report with an explicit, retryable signature state rather than
+  failing the analysis. Signed events
+  retain the public key and fingerprint needed for independent verification.
+- Model-authored Python is untrusted code, not an additional trusted analyzer.
+  The model writes reviewable helpers below `/workspace/output` or
+  `/workspace/tools`; provenance records payload hashes rather than copying source.
+  The fixed Python runner denies subprocess/fork/exec, sockets, native loading,
+  input mutation, and reads outside workspace/Python library paths. Python audit
+  hooks are defense in depth,
+  not a substitute for the Docker boundary; container escape risk is a remaining
+  limitation, so Docker Desktop and the host kernel must remain patched.
+
+Docker is optional and never contacted during normal startup. Building the image
+requires the explicit `python run.py --build-reverse-sandbox` action. Docker is a
+meaningful local privilege boundary: users should keep Docker Desktop and the host
+kernel patched, and must not weaken the container flags or add sample-execution
+tools without a separate dynamic-analysis threat model.
 
 ## Case Isolation And Concurrency
 

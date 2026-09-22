@@ -1,4 +1,4 @@
-import { useEffect, type ButtonHTMLAttributes, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { clsx } from "clsx";
 import { X } from "lucide-react";
@@ -220,22 +220,13 @@ export function DetailDrawer({
   // a focused node -- keeps working. Escape and the X still close.
   dismissOnOutsideClick?: boolean;
 }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  const dialog = useDialog(dismissOnOutsideClick);
 
   const drawer = (
     <>
       {/* Transparent click-catcher: dismiss on outside click without obscuring
           the map/timeline behind the drawer, so context stays readable. Omitted
           when the caller wants the content behind to stay interactive. */}
-      {dismissOnOutsideClick && (
-        <div className="fixed inset-0 z-[999]" onClick={onClose} aria-hidden="true" />
-      )}
       {/* A narrow blurred strip hugging the drawer's left edge, fading out to the
           left, gives a soft seam instead of frosting the whole screen. */}
       <div
@@ -248,11 +239,18 @@ export function DetailDrawer({
         }}
         aria-hidden="true"
       />
-      <div
-        className="detail-drawer-surface fixed inset-y-0 right-0 z-[1000] w-full max-w-md overflow-y-auto p-5"
-        role="dialog"
+      <dialog
+        ref={dialog}
+        className="detail-drawer-surface fixed inset-y-0 right-0 z-[1000] m-0 ml-auto h-screen max-h-none w-full max-w-md overflow-y-auto p-5"
         aria-modal={dismissOnOutsideClick}
         aria-label={ariaLabel ?? "Detail drawer"}
+        onCancel={(event) => { event.preventDefault(); onClose(); }}
+        onKeyDown={(event) => { if (!dismissOnOutsideClick && event.key === "Escape") onClose(); }}
+        onClick={(event) => {
+          if (!dismissOnOutsideClick || event.target !== event.currentTarget) return;
+          const bounds = event.currentTarget.getBoundingClientRect();
+          if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose();
+        }}
       >
       <div className="mb-4 flex items-start justify-between gap-3">
         <div className="min-w-0">
@@ -263,16 +261,45 @@ export function DetailDrawer({
           className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[rgb(var(--panel-strong)/0.78)] text-ink-400 transition hover:bg-[rgb(var(--panel-strong)/0.96)] hover:text-ink-100 active:scale-95"
           onClick={onClose}
           title="Close"
+          aria-label="Close detail drawer"
         >
           <X size={18} />
         </button>
       </div>
         {children}
-      </div>
+      </dialog>
     </>
   );
 
   return createPortal(drawer, document.body);
+}
+
+function useDialog(modal: boolean) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const opener = useRef(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+  useLayoutEffect(() => {
+    const node = dialog.current!;
+    if (modal) node.showModal(); else node.show();
+    return () => {
+      node.close();
+      if (opener.current?.isConnected) opener.current.focus();
+    };
+  }, [modal]);
+  return dialog;
+}
+
+export function Modal({ title, children, onClose, busy = false, className = "max-w-lg" }: {
+  title: string; children: ReactNode; onClose: () => void; busy?: boolean; className?: string;
+}) {
+  const dialog = useDialog(true);
+  // The native modal dialog traps focus, makes the background inert, and
+  // restores focus to its opener, including when dialogs are stacked.
+  return createPortal(<dialog ref={dialog} aria-label={title}
+    className="modal-backdrop fixed inset-0 m-0 h-screen max-h-none w-screen max-w-none bg-transparent p-4 open:grid open:place-items-center"
+    onCancel={(event) => { event.preventDefault(); if (!busy) onClose(); }}
+    onClick={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+    <div className={clsx("modal-panel w-full max-h-[90vh] overflow-y-auto rounded-2xl p-6", className)}>{children}</div>
+  </dialog>, document.body);
 }
 
 export function ConfirmDialog({
@@ -294,39 +321,19 @@ export function ConfirmDialog({
   onConfirm: () => void;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, busy]);
-
-  return createPortal(
-    <div
-      className="modal-backdrop fixed inset-0 z-[1000] grid place-items-center p-4"
-      onClick={() => !busy && onClose()}
-    >
-      <div
-        className="modal-panel w-full max-w-sm rounded-2xl p-6"
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        onClick={(e) => e.stopPropagation()}
-      >
+  return (
+    <Modal title={title} busy={busy} onClose={onClose} className="max-w-sm">
         <h2 className="text-lg font-semibold text-ink-50">{title}</h2>
         <div className="mt-2 text-sm text-ink-300">{message}</div>
         <div className="mt-6 flex justify-end gap-2">
-          <button className="btn-ghost" onClick={onClose} disabled={busy}>
+          <button className="btn-ghost" autoFocus onClick={onClose} disabled={busy}>
             {cancelLabel}
           </button>
           <button className={danger ? "btn-danger" : "btn-primary"} onClick={onConfirm} disabled={busy}>
             {busy ? "Working…" : confirmLabel}
           </button>
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }
 

@@ -3,8 +3,13 @@
 These limitations apply to the `0.1.x` public beta and are part of the release
 acceptance criteria.
 
-- Investigator is a single-user loopback application with no authentication.
-  Do not bind it to a LAN or the Internet without adding authentication and TLS.
+- Authentication is disabled by default and the standard launcher remains a
+  loopback-only single-user workflow. Optional OIDC SSO supports one IdP and one
+  shared organization pool, not per-case RBAC, SAML, SCIM, or Graph-backed group
+  expansion. The optional admin marker is informational only. Use HTTPS and
+  follow [SSO.md](SSO.md) before any shared deployment.
+  Entra group-overage tokens are rejected closed and must be handled with app
+  roles or application-assigned groups.
 - Only one backend process may operate on a case directory. The operation and
   writer coordinators are process-local.
 - Case databases migrate forward on open and cannot be downgraded. Back up the

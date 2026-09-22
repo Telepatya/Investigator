@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import traceback
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +22,7 @@ MEMORY_EXTENSIONS = {".raw", ".dmp", ".mem", ".vmem", ".bin", ".img", ".lime", "
 DEFAULT_INGEST_BATCH_SIZE = 10000
 MIN_INGEST_BATCH_SIZE = 1000
 MAX_INGEST_BATCH_SIZE = 50000
+LISTENER_QUEUE_SIZE = 100
 
 ProgressCallback = Callable[[str, float, str, bool, str | None], Any]
 logger = logging.getLogger(__name__)
@@ -226,6 +228,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
             cmdline=info["cmdline"],
             start_time=start,
             session_id=sid,
+            upload_name=file_path.name,
             extra={"source": info["origin"], "user": info["user"], "host": host},
         ))
         stats["processes"] += 1
@@ -241,6 +244,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
                 cmdline=info["parent_cmdline"],
                 start_time=None,
                 session_id=sid,
+                upload_name=file_path.name,
                 extra={"synthesized_from": "parent-fields", "host": host},
             ))
             stats["processes"] += 1
@@ -260,6 +264,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
             progress("parsing", -1, f"{stats['events']} events from {source}", False, None)
 
         for event_kwargs in parse_file(path, source):
+            event_kwargs["upload_name"] = file_path.name
             pending_events.append(event_kwargs)
             stats["events"] += 1
             batch += 1
@@ -267,7 +272,7 @@ def ingest_file_sync(case_id: str, file_path: Path, progress: ProgressCallback) 
                 proc = _extract_process(event_kwargs["raw"])
                 if proc and (proc["session_id"], proc["pid"]) not in seen_pids:
                     seen_pids.add((proc["session_id"], proc["pid"]))
-                    session.add(Process(**proc))
+                    session.add(Process(**proc, upload_name=file_path.name))
                     stats["processes"] += 1
             else:
                 # Sysmon-1 / Security-4688 rows appear in .evtx files and in
@@ -330,9 +335,12 @@ class IngestionManager:
         # that at least one of those files added events so detections can be
         # coalesced into a single pass after the final queued file is parsed.
         self._detections_pending: set[str] = set()
+        # Replacements invalidate findings derived from the removed generation.
+        # Keep this obligation until one atomic full rebuild succeeds.
+        self._full_rebuild_pending: set[str] = set()
 
     def subscribe(self, case_id: str) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=LISTENER_QUEUE_SIZE)
         self.listeners.setdefault(case_id, []).append(queue)
         return queue
 
@@ -346,10 +354,22 @@ class IngestionManager:
             try:
                 queue.put_nowait(payload)
             except asyncio.QueueFull:
-                logger.debug("Dropped ingestion update for a full listener queue")
+                # Coalesce the oldest progress item so the latest update,
+                # especially a terminal done/error state, remains observable.
+                try:
+                    queue.get_nowait()
+                    queue.put_nowait(payload)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    logger.debug("Could not coalesce a full ingestion listener queue")
 
     def get_status(self, case_id: str) -> dict[str, Any] | None:
         return self.jobs.get(case_id)
+
+    def require_detection_rebuild(self, case_id: str, *, full: bool = False) -> None:
+        """Ensure the next non-memory ingestion rebuilds case findings."""
+        self._detections_pending.add(case_id)
+        if full:
+            self._full_rebuild_pending.add(case_id)
 
     async def run_ingestion(
         self,
@@ -403,7 +423,8 @@ class IngestionManager:
 
         case_store.update_case_meta(case_id, include_stats=False, status="ingesting")
         try:
-            if file_type == "memory" or file_path.suffix.lower() in MEMORY_EXTENSIONS:
+            is_memory = file_type == "memory" or file_path.suffix.lower() in MEMORY_EXTENSIONS
+            if is_memory:
                 case_store.update_case_meta(case_id, include_stats=False, has_memory_dump=True)
                 from app.memory.pipeline import analyze_memory_dump_sync
                 await loop.run_in_executor(
@@ -416,27 +437,26 @@ class IngestionManager:
                 if stats["events"] > 0:
                     self._detections_pending.add(case_id)
 
-                queued = int(coordinator.snapshot(case_id).get("queued") or 0)
-                if case_id in self._detections_pending and queued == 0:
-                    progress(
-                        "detection", 90.0,
-                        "All queued evidence is ingested; running detections", False, None,
-                    )
-                    from app.detect.engine import run_detections_sync
-                    await loop.run_in_executor(None, run_detections_sync, case_id)
-                    self._detections_pending.discard(case_id)
-                elif queued > 0:
-                    progress(
-                        "queued", 90.0,
-                        f"Evidence ingested; waiting for {queued} queued file(s)", False, None,
-                    )
-                else:
-                    progress(
-                        "parsing", 90.0,
-                        "No events were parsed; skipping detections", False, None,
-                    )
-
             queued = int(coordinator.snapshot(case_id).get("queued") or 0)
+            if case_id in self._detections_pending and queued == 0:
+                full_rebuild = case_id in self._full_rebuild_pending
+                progress(
+                    "detection", 90.0,
+                    "All queued evidence is ingested; running detections", False, None,
+                )
+                from app.detect.engine import run_detections_sync
+                await loop.run_in_executor(
+                    None,
+                    partial(run_detections_sync, case_id, rebuild=full_rebuild),
+                )
+                self._detections_pending.discard(case_id)
+                self._full_rebuild_pending.discard(case_id)
+            elif queued == 0 and not is_memory:
+                progress(
+                    "parsing", 90.0,
+                    "No events were parsed; skipping detections", False, None,
+                )
+
             if queued > 0:
                 progress(
                     "queued", 90.0,
@@ -447,8 +467,30 @@ class IngestionManager:
                 progress("done", 100.0, "Ingestion complete", True, None)
         except Exception as e:
             traceback.print_exc()
+            recovery_error: Exception | None = None
+            if case_id in self._full_rebuild_pending:
+                try:
+                    progress(
+                        "detection", 95.0,
+                        "Replacement failed; rebuilding findings from retained case data",
+                        False,
+                        None,
+                    )
+                    from app.detect.engine import run_detections_sync
+                    await loop.run_in_executor(
+                        None,
+                        partial(run_detections_sync, case_id, rebuild=True),
+                    )
+                except Exception as exc:
+                    recovery_error = exc
+                else:
+                    self._detections_pending.discard(case_id)
+                    self._full_rebuild_pending.discard(case_id)
             case_store.update_case_meta(case_id, include_stats=False, status="error")
-            progress("error", 100.0, f"Ingestion failed: {e}", True, str(e))
+            detail = str(e)
+            if recovery_error is not None:
+                detail += f"; finding recovery failed: {recovery_error}"
+            progress("error", 100.0, f"Ingestion failed: {detail}", True, detail)
 
 
 manager = IngestionManager()

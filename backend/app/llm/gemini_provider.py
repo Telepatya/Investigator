@@ -14,6 +14,7 @@ from google.genai import types as genai_types
 
 from app.config import get_api_key
 from app.llm.base import LLMProvider
+from app.llm.endpoints import provider_http_client, validate_endpoint
 from app.models.schemas import ModelInfo
 
 
@@ -24,6 +25,10 @@ DEFAULT_MODELS = [
     "gemini-1.5-pro",
     "gemini-1.5-flash",
 ]
+# Long forensic prompts can take several minutes on Gemini. The async client
+# keeps FastAPI responsive during this wait, so this deadline can be generous
+# without reintroducing the UI freeze caused by the old synchronous call.
+GEMINI_REQUEST_TIMEOUT_MS = 300_000
 
 
 def _response_text(response) -> str:
@@ -59,7 +64,15 @@ class GeminiProvider(LLMProvider):
         key = get_api_key("gemini")
         if not key:
             raise ValueError("Gemini API key not configured")
-        return genai.Client(api_key=key)
+        base_url = validate_endpoint("gemini")
+        return genai.Client(
+            api_key=key, vertexai=False,
+            http_options=genai_types.HttpOptions(
+                timeout=GEMINI_REQUEST_TIMEOUT_MS, base_url=base_url,
+                httpx_async_client=provider_http_client("gemini", base_url),
+                client_args={"trust_env": False, "follow_redirects": False},
+            ),
+        )
 
     def _model_name(self) -> str:
         """Return a valid Gemini model name, guarding against stale/cross-provider values."""
@@ -83,7 +96,8 @@ class GeminiProvider(LLMProvider):
         try:
             client = self._client()
             models = []
-            for m in client.models.list():
+            page = await client.aio.models.list()
+            async for m in page:
                 actions = (
                     getattr(m, "supported_actions", None)
                     or getattr(m, "supported_generation_methods", None)
@@ -100,7 +114,9 @@ class GeminiProvider(LLMProvider):
     async def test_connection(self) -> tuple[bool, str]:
         try:
             client = self._client()
-            resp = client.models.generate_content(model=self._model_name(), contents="ping")
+            resp = await client.aio.models.generate_content(
+                model=self._model_name(), contents="ping"
+            )
             _ = _response_text(resp)
             return True, f"Gemini API key is valid (using {self._model_name()})"
         except Exception as e:
@@ -117,13 +133,13 @@ class GeminiProvider(LLMProvider):
         prompt = "\n\n".join(parts)
 
         if not stream:
-            resp = client.models.generate_content(
+            resp = await client.aio.models.generate_content(
                 model=model_name, contents=prompt, config=self._config(),
             )
             return _response_text(resp)
 
         async def _stream() -> AsyncIterator[str]:
-            for chunk in client.models.generate_content_stream(
+            async for chunk in await client.aio.models.generate_content_stream(
                 model=model_name, contents=prompt, config=self._config(),
             ):
                 text = _response_text(chunk)

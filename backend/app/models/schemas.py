@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-ProviderType = Literal["ollama", "openai", "gemini", "anthropic"]
+ProviderType = Literal["ollama", "openai", "openrouter", "gemini", "anthropic"]
 Severity = Literal["info", "low", "medium", "high", "critical"]
 CaseStatus = Literal["created", "ingesting", "analyzing", "ready", "error"]
 
 
 class CaseCreate(BaseModel):
-    name: str
-    description: str = ""
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=20_000)
 
 
 class CaseResponse(BaseModel):
@@ -127,20 +127,22 @@ class ReportResponse(BaseModel):
 
 class LLMConfigUpdate(BaseModel):
     provider: ProviderType | None = None
-    model: str | None = None
-    ollama_base_url: str | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=256)
+    ollama_base_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    openrouter_base_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    temperature: float | None = Field(default=None, ge=0, le=2, allow_inf_nan=False)
+    max_tokens: int | None = Field(default=None, ge=1, le=131_072, strict=True)
     analysis_max_tool_calls: int | None = Field(default=None, ge=0, le=20)
     chat_max_tool_calls: int | None = Field(default=None, ge=0, le=20)
     entity_max_tool_calls: int | None = Field(default=None, ge=0, le=20)
-    api_key: str | None = None
+    api_key: str | None = Field(default=None, max_length=4096)
 
 
 class LLMConfigResponse(BaseModel):
     provider: ProviderType
     model: str
     ollama_base_url: str
+    openrouter_base_url: str
     temperature: float
     max_tokens: int
     analysis_max_tool_calls: int
@@ -174,3 +176,52 @@ class ChatRequest(BaseModel):
 
 class AnalysisRequest(BaseModel):
     rerun: bool = False
+
+
+class APIKeyUpdate(BaseModel):
+    api_key: str = Field(min_length=1, max_length=4096)
+
+
+class GeneralSettingsUpdate(BaseModel):
+    yara_rules_dir: str | None = Field(default=None, max_length=4096)
+
+
+class ChatCreate(BaseModel):
+    title: str = Field(default="New chat", max_length=200)
+
+
+class ChatTurn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    message: str = Field(min_length=1, max_length=32_000)
+    chat_id: str = Field(min_length=1, max_length=64)
+
+
+class EntityInvestigation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    entity_id: str = Field(min_length=1, max_length=4096)
+
+
+class FindingBenignUpdate(BaseModel):
+    benign: bool = Field(default=True, strict=True)
+    rationale: str = Field(default="Analyst marked this finding benign", max_length=20_000)
+
+
+class RuleDisabledUpdate(BaseModel):
+    rule_id: str = Field(min_length=1, max_length=256)
+    disabled: bool = Field(default=True, strict=True)
+
+
+class ManualFindingCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
+    severity: Severity
+    description: str = Field(default="", max_length=32_000)
+    mitre_techniques: list[str] = Field(default_factory=list, max_length=100)
+    ref_type: Literal["event", "entity", ""] = ""
+    ref_id: str = Field(default="", max_length=4096)
+    ref_label: str = Field(default="", max_length=4096)
+    entity_type: str = Field(default="", max_length=128)
+    ref_entity: str = Field(default="", max_length=4096)
+
+
+class VFSArchiveRequest(BaseModel):
+    paths: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(min_length=1, max_length=1000)

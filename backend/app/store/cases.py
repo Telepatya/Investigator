@@ -292,10 +292,12 @@ def cleanup_stale_case_artifacts() -> list[dict[str, str]]:
 
         mem_root = case_dir / "derived" / "memprocfs"
         if mem_root.is_dir():
+            from app.memory.identity import memory_upload_key
+            upload_keys = {memory_upload_key(path.name) for path in uploads.iterdir() if path.is_file()} if uploads.is_dir() else set()
             for derived in mem_root.iterdir():
                 if not derived.is_dir():
                     continue
-                if derived.name in upload_stems:
+                if derived.name in upload_stems or derived.name in upload_keys:
                     continue
                 try:
                     _rmtree_with_retries(derived)
@@ -362,6 +364,8 @@ def get_case_stats(case_id: str) -> dict:
 
 
 def add_event(session: Session, **kwargs) -> Event:
+    if session.info.get("upload_name"):
+        kwargs["upload_name"] = session.info["upload_name"]
     event = Event(**kwargs)
     session.add(event)
     session.flush()
@@ -376,7 +380,8 @@ def add_events_bulk(session: Session, rows: Iterable[dict]) -> None:
     contentless-external events_fts table stays in sync with a single
     executemany rather than a get+insert per row.
     """
-    events = [Event(**row) for row in rows]
+    upload = {"upload_name": session.info["upload_name"]} if session.info.get("upload_name") else {}
+    events = [Event(**{**row, **upload}) for row in rows]
     if not events:
         return
     session.add_all(events)

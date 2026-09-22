@@ -148,7 +148,7 @@ export default function EvidencePage() {
                         {f.memory_result_count.toLocaleString()} memory results
                       </>
                     ) : (
-                      <>{f.event_count.toLocaleString()} events</>
+                      <>{f.event_count.toLocaleString()} events{f.attribution_warning && <span className="ml-2 text-sev-medium" title={f.attribution_warning}>· legacy attribution incomplete</span>}</>
                     )}
                   </td>
                   <td className="px-4 py-3">

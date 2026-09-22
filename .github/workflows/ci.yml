@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Validate label definitions
         run: python .github/scripts/sync_labels.py --check
@@ -39,14 +39,32 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: backend/requirements-dev.lock
+
+      # A direct dependency added to requirements.in but missing from the locks is
+      # invisible to every other step: installs run --require-hashes --no-deps, so
+      # they silently omit it and the backend only fails at import time on a user's
+      # machine. Recompile each lock in place and fail on any difference.
+      - name: Check dependency locks are current
+        run: |
+          python -m pip install uv
+          # Recompile in place, exactly as scripts/update-locks.sh does, then let git
+          # report any change. Compiling to a temporary path instead would always
+          # differ, because uv records the -o argument in the file header.
+          # uv preserves the pins already in each lock, so this reports drift from
+          # requirements.in rather than failing on every unrelated upstream release.
+          sh scripts/update-locks.sh
+          if ! git diff --exit-code -- requirements.lock requirements-memory.lock requirements-dev.lock; then
+            echo "::error file=backend/requirements.in::Dependency locks are out of date. Run backend/scripts/update-locks.sh and commit the result."
+            exit 1
+          fi
 
       - name: Install locked dependencies
         run: >
@@ -80,10 +98,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -111,9 +129,9 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           fail-on-severity: moderate

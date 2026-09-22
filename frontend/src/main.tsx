@@ -15,12 +15,18 @@ import EventsPage from "./pages/EventsPage";
 import ChatPage from "./pages/ChatPage";
 import ReportPage from "./pages/ReportPage";
 import { ThemeProvider } from "./lib/theme";
+import ReversePage, { ReverseCasePage } from "./pages/ReversePage";
+import ReverseProjectPage from "./pages/ReverseProjectPage";
+import { AuthGate, AuthProvider } from "./components/AuthGate";
 
 // Split the two heaviest routes into on-demand chunks: TimelinePage pulls in
 // vis-timeline and EntityMapPage pulls in reactflow, so neither weighs down the
 // initial load of the case list, dashboard, or settings.
 const TimelinePage = lazy(() => import("./pages/TimelinePage"));
 const EntityMapPage = lazy(() => import("./pages/EntityMapPage"));
+// The rules catalog and its editor are only needed when the analyst opens the
+// Rules page, so they stay out of the initial bundle too.
+const RulesPage = lazy(() => import("./pages/RulesPage"));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -40,6 +46,9 @@ const router = createBrowserRouter([
     element: <App />,
     children: [
       { index: true, element: <CasesPage /> },
+      { path: "reverse", element: <ReversePage /> },
+      { path: "reverse/:projectId", element: <ReverseProjectPage /> },
+      { path: "rules", element: <RulesPage /> },
       { path: "settings", element: <SettingsPage /> },
       {
         path: "cases/:caseId",
@@ -55,6 +64,7 @@ const router = createBrowserRouter([
           { path: "events", element: <EventsPage /> },
           { path: "report", element: <ReportPage /> },
           { path: "chat", element: <ChatPage /> },
+          { path: "reverse", element: <ReverseCasePage /> },
         ],
       },
     ],
@@ -65,7 +75,11 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
+        <AuthProvider>
+          <AuthGate>
+            <RouterProvider router={router} />
+          </AuthGate>
+        </AuthProvider>
       </QueryClientProvider>
     </ThemeProvider>
   </React.StrictMode>,

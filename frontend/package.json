@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:auth": "node scripts/test-auth-gate.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.62.0",
@@ -14,9 +15,8 @@
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.28.0",
+    "react-router-dom": "^7.18.2",
     "reactflow": "^11.11.4",
-    "recharts": "^2.13.3",
     "vis-data": "^7.1.9",
     "vis-timeline": "^7.7.3"
   },

@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Upload, HardDrive, FileArchive, Loader2, X } from "lucide-react";
 import { uploadFile, wsUrl } from "../lib/api";
 import type { CaseStatus, Progress } from "../lib/types";
+import { Modal } from "./common";
 
 export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseStatus }) {
   const qc = useQueryClient();
@@ -118,17 +119,24 @@ export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseS
       )}
 
       {open && (
-        <div className="modal-backdrop fixed inset-0 z-50 grid place-items-center p-4">
-          <div className="modal-panel w-full max-w-md rounded-2xl p-6">
+        <Modal title="Upload evidence" onClose={() => setOpen(false)} busy={Boolean(busy)} className="max-w-md">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold text-ink-50">Upload evidence</h2>
-              <button className="text-ink-400 transition hover:text-ink-100 active:scale-95" onClick={() => setOpen(false)}>
+              <button
+                type="button"
+                aria-label="Close upload evidence"
+                className="text-ink-400 transition hover:text-ink-100 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => setOpen(false)}
+                disabled={Boolean(busy)}
+              >
                 <X size={18} />
               </button>
             </div>
 
             <div className="grid grid-cols-2 gap-2 mb-4">
               <button
+                type="button"
+                aria-pressed={fileType === "artifact"}
                 onClick={() => setFileType("artifact")}
                 className={`rounded-xl border p-3 text-left transition-all duration-200 active:scale-[0.98] ${
                   fileType === "artifact"
@@ -141,6 +149,8 @@ export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseS
                 <div className="text-[11px] text-ink-500">ZIP, JSON, JSONL, CSV, EVTX</div>
               </button>
               <button
+                type="button"
+                aria-pressed={fileType === "memory"}
                 onClick={() => setFileType("memory")}
                 className={`rounded-xl border p-3 text-left transition-all duration-200 active:scale-[0.98] ${
                   fileType === "memory"
@@ -203,6 +213,15 @@ export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseS
                 handleFiles(e.dataTransfer.files);
               }}
               onClick={() => inputRef.current?.click()}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  inputRef.current?.click();
+                }
+              }}
+              role="button"
+              tabIndex={0}
+              aria-label={fileType === "memory" ? "Choose memory dump files" : "Choose log and artifact files"}
               className={`rounded-2xl border border-dashed p-8 text-center cursor-pointer transition-all duration-200 active:scale-[0.99] ${
                 dragOver
                   ? "border-accent-blue bg-accent-blue/5"
@@ -222,6 +241,7 @@ export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseS
                 ref={inputRef}
                 type="file"
                 multiple
+                aria-label={fileType === "memory" ? "Memory dump files" : "Log and artifact files"}
                 className="hidden"
                 onChange={(e) => handleFiles(e.target.files)}
               />
@@ -240,8 +260,7 @@ export function UploadPanel({ caseId, status }: { caseId: string; status?: CaseS
                 {error}
               </div>
             )}
-          </div>
-        </div>
+        </Modal>
       )}
     </>
   );

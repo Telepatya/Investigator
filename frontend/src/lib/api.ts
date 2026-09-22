@@ -18,16 +18,37 @@ import type {
   Provider,
   ProviderTestResult,
   Report,
+  RuleDetail,
+  RuleImportResponse,
+  RuleListResponse,
+  RuleValidateResponse,
   TimelineEvt,
 } from "./types";
 
 const BASE = "/api";
 
+export interface AuthBootstrap {
+  enabled: boolean;
+  configured: boolean;
+  authenticated: boolean;
+  user: { subject: string; display_name: string | null; email: string | null; is_admin: boolean } | null;
+  login_url: string | null;
+}
+
+function notifyUnauthorized(path: string) {
+  if (!path.startsWith("/auth/")) {
+    window.dispatchEvent(new CustomEvent("investigator:auth-required"));
+  }
+}
+
 async function req<T>(path: string, opts?: RequestInit): Promise<T> {
+  const contentHeaders = opts?.body instanceof FormData ? undefined : { "Content-Type": "application/json" };
   const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
     ...opts,
+    credentials: "same-origin",
+    headers: { ...contentHeaders, ...(opts?.headers ?? {}) },
   });
+  if (res.status === 401) notifyUnauthorized(path);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `Request failed: ${res.status}`);
@@ -36,6 +57,9 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  authBootstrap: () => req<AuthBootstrap>("/auth/bootstrap"),
+  logout: () => req<{ ok: boolean }>("/auth/logout", { method: "POST" }),
+
   // Cases
   listCases: () => req<Case[]>("/cases"),
   getCase: (id: string, signal?: AbortSignal) => req<Case>(`/cases/${id}`, { signal }),
@@ -146,6 +170,11 @@ export const api = {
   },
   getEntityDossier: (id: string, entityId: string, signal?: AbortSignal) =>
     req<EntityDossier>(`/cases/${id}/entity-dossier?entity_id=${encodeURIComponent(entityId)}`, { signal }),
+  sendMemoryProcessToReverse: (caseId: string, sessionId: string, pid: number) =>
+    req<import("./types").ReverseProcessHandoff>(
+      `/cases/${caseId}/memory/${encodeURIComponent(sessionId)}/processes/${pid}/reverse`,
+      { method: "POST" },
+    ),
 
   // Evidence
   listEvidence: (id: string) => req<{ files: EvidenceFile[] }>(`/cases/${id}/evidence`),
@@ -241,6 +270,83 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  // Reverse workspaces
+  listReverseProjects: (caseId?: string) =>
+    req<import("./types").ReverseProject[]>(`/reverse/projects${caseId ? `?case_id=${encodeURIComponent(caseId)}` : ""}`),
+  getReverseProject: (id: string) => req<import("./types").ReverseProject>(`/reverse/projects/${id}`),
+  createReverseProject: (body: { name: string; description?: string; linked_case_id?: string | null }) =>
+    req<import("./types").ReverseProject>("/reverse/projects", { method: "POST", body: JSON.stringify(body) }),
+  updateReverseProject: (id: string, body: Record<string, unknown>) =>
+    req<import("./types").ReverseProject>(`/reverse/projects/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteReverseProject: (id: string) => req<{ ok: boolean }>(`/reverse/projects/${id}`, { method: "DELETE" }),
+  getReverseProjectTools: (id: string) =>
+    req<import("./types").ReverseToolPolicy>(`/reverse/projects/${id}/tools`),
+  updateReverseProjectTools: (id: string, enabledTools: string[]) =>
+    req<import("./types").ReverseToolPolicy>(`/reverse/projects/${id}/tools`, {
+      method: "PUT", body: JSON.stringify({ enabled_tools: enabledTools }),
+    }),
+  getReverseHealth: () => req<import("./types").ReverseHealth>("/reverse/health"),
+  listReverseArtifacts: (id: string) =>
+    req<import("./types").ReverseArtifact[]>(`/reverse/projects/${id}/artifacts`),
+  uploadReverseArtifact: (id: string, file: File) => {
+    const body = new FormData();
+    body.append("file", file);
+    return req<import("./types").ReverseArtifact>(`/reverse/projects/${id}/artifacts`, { method: "POST", body });
+  },
+  deleteReverseArtifact: (id: string, artifactId: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/artifacts/${artifactId}`, { method: "DELETE" }),
+  startReverseAnalysis: (id: string, notes: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/start`, {
+      method: "POST", body: JSON.stringify({ notes }),
+    }),
+  getReverseStatus: (id: string) =>
+    req<import("./types").ReverseStatus>(`/reverse/projects/${id}/analysis/status`),
+  stopReverseAnalysis: (id: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/analysis/stop`, { method: "POST" }),
+  resumeReverseAnalysis: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/resume`, { method: "POST" }),
+  continueReverseInvestigation: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/continue`, { method: "POST" }),
+  decideReverseExtension: (id: string, decision: "approve" | "deny") =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/turn-extension/${decision}`, { method: "POST" }),
+  replayReverseAnalysis: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/analysis/replay`, { method: "POST" }),
+  getReverseReport: (id: string) =>
+    req<import("./types").ReverseReport>(`/reverse/projects/${id}/report`),
+  regenerateReverseIocs: (id: string) =>
+    req<{ iocs: string }>(`/reverse/projects/${id}/report/iocs`, { method: "POST" }),
+  retryReverseReportSignature: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/sign`, { method: "POST" }),
+  retryReverseReportVerification: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/verify`, { method: "POST" }),
+  reviewReverseReport: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/review`, { method: "POST" }),
+  getReverseEvidence: (id: string, messageId: number) =>
+    req<import("./types").ReverseEvidence>(`/reverse/projects/${id}/evidence/${messageId}`),
+  recoverReverseReport: (id: string) =>
+    req<import("./types").ReverseRun>(`/reverse/projects/${id}/report/recover`, { method: "POST" }),
+  getReverseMessages: (id: string) =>
+    req<import("./types").ReverseChatMessage[]>(`/reverse/projects/${id}/messages`),
+  sendReverseMessage: (id: string, message: string) =>
+    req<import("./types").ReverseChatMessage>(`/reverse/projects/${id}/messages`, {
+      method: "POST", body: JSON.stringify({ message }),
+    }),
+  clearReverseMessages: (id: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/messages`, { method: "DELETE" }),
+  pauseReverseChat: (id: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/chat/pause`, { method: "POST" }),
+  resumeReverseChat: (id: string) =>
+    req<{ ok: boolean }>(`/reverse/projects/${id}/chat/resume`, { method: "POST" }),
+  getReverseTrace: (id: string) =>
+    req<import("./types").ReverseTraceEntry[]>(`/reverse/projects/${id}/trace`),
+  verifyReverseTrace: (id: string) =>
+    req<{ valid: boolean; entries: number; failed_sequences: number[]; failed_signature_sequences: number[] }>(`/reverse/projects/${id}/trace/verify`),
+  getReverseAudit: (id: string) =>
+    req<import("./types").ReverseAuditEvent[]>(`/reverse/projects/${id}/audit`),
+  getReverseSettings: () => req<import("./types").ReverseSettings>("/settings/reverse"),
+  updateReverseSettings: (body: Partial<import("./types").ReverseSettings>) =>
+    req<import("./types").ReverseSettings>("/settings/reverse", { method: "PUT", body: JSON.stringify(body) }),
+
   health: () =>
     req<{
       status: string;
@@ -250,6 +356,7 @@ export const api = {
       credit: string;
       memprocfs: boolean;
       yara: boolean;
+      reverse: import("./types").ReverseHealth & { store_ready: boolean };
     }>(
       "/health",
     ),
@@ -259,15 +366,54 @@ export function downloadUrl(path: string): string {
   return `${BASE}${path}`;
 }
 
+export function reverseArtifactDownloadUrl(projectId: string, artifactId: string): string {
+  return downloadUrl(`/reverse/projects/${projectId}/artifacts/${artifactId}/download`);
+}
+
 export function memoryProcessDownloadUrl(
   caseId: string,
   sessionId: string,
   pid: number,
-  kind: "image" | "vmem" = "image",
+  kind: "image" | "minidump" = "image",
 ): string {
   return downloadUrl(
     `/cases/${caseId}/memory/${encodeURIComponent(sessionId)}/processes/${pid}/download?kind=${kind}`,
   );
+}
+
+async function saveDownloadResponse(res: Response, fallbackFilename: string, requestPath?: string) {
+  if (!res.ok) {
+    if (res.status === 401 && requestPath) notifyUnauthorized(requestPath);
+    const text = await res.text();
+    try {
+      const parsed = JSON.parse(text) as { detail?: string };
+      throw new Error(parsed.detail || text || `Download failed: ${res.status}`);
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error(text || `Download failed: ${res.status}`);
+      throw error;
+    }
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get("content-disposition") || "";
+  const match = /filename="?([^";]+)"?/i.exec(disposition);
+  const filename = match?.[1] || fallbackFilename;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function downloadMemoryProcessMinidump(
+  caseId: string,
+  sessionId: string,
+  pid: number,
+) {
+  const res = await fetch(memoryProcessDownloadUrl(caseId, sessionId, pid, "minidump"), { credentials: "same-origin" });
+  await saveDownloadResponse(res, `process-${pid}.minidump.dmp`, "/cases/download");
 }
 
 export function memoryModuleDownloadUrl(
@@ -295,23 +441,12 @@ export async function downloadMemoryVfsArchive(caseId: string, sessionId: string
     downloadUrl(`/cases/${caseId}/memory/${encodeURIComponent(sessionId)}/vfs/archive`),
     {
       method: "POST",
+      credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ paths }),
     },
   );
-  if (!res.ok) throw new Error(await res.text());
-  const blob = await res.blob();
-  const disposition = res.headers.get("content-disposition") || "";
-  const match = /filename="?([^";]+)"?/i.exec(disposition);
-  const filename = match?.[1] || "memprocfs-selection.zip";
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+  await saveDownloadResponse(res, "memprocfs-selection.zip", "/cases/memory/vfs/archive");
 }
 
 export function uploadFile(
@@ -331,16 +466,71 @@ export function uploadFile(
       params.set("mem_eventlogs", String(Boolean(memoryOptions.eventlogs)));
     }
     xhr.open("POST", `${BASE}/cases/${caseId}/upload?${params.toString()}`);
+    xhr.withCredentials = true;
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) onProgress((e.loaded / e.total) * 100);
     };
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
-      else reject(new Error(xhr.responseText || "Upload failed"));
+      else {
+        if (xhr.status === 401) notifyUnauthorized(`/cases/${caseId}/upload`);
+        reject(new Error(xhr.responseText || "Upload failed"));
+      }
     };
     xhr.onerror = () => reject(new Error("Upload failed"));
     xhr.send(form);
   });
+}
+
+export const rulesApi = {
+  list: (params: { q?: string; source?: string; kind?: string; platform?: string; severity?: string } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(params).filter(([, value]) => Boolean(value)) as [string, string][],
+    ).toString();
+    return req<RuleListResponse>(`/rules${query ? `?${query}` : ""}`);
+  },
+  get: (ruleId: string) => req<RuleDetail>(`/rules/${encodeURIComponent(ruleId)}`),
+  updateBuiltin: (
+    ruleId: string,
+    body: { enabled?: boolean; severity_override?: string | null; clear_severity?: boolean; note?: string },
+  ) =>
+    req<{ ok: boolean; revision: number }>(`/rules/builtin/${encodeURIComponent(ruleId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  createCustom: (yamlSource: string, enabled = true) =>
+    req<{ ok: boolean; revision: number }>("/rules/custom", {
+      method: "POST",
+      body: JSON.stringify({ yaml_source: yamlSource, enabled }),
+    }),
+  updateCustom: (ruleId: string, body: { yaml_source?: string; enabled?: boolean }) =>
+    req<{ ok: boolean; revision: number }>(`/rules/custom/${encodeURIComponent(ruleId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  deleteCustom: (ruleId: string) =>
+    req<{ ok: boolean; revision: number }>(`/rules/custom/${encodeURIComponent(ruleId)}`, {
+      method: "DELETE",
+    }),
+  validate: (yamlSource: string) =>
+    req<RuleValidateResponse>("/rules/validate", {
+      method: "POST",
+      body: JSON.stringify({ yaml_source: yamlSource }),
+    }),
+  fork: (ruleId: string, disableBuiltin: boolean) =>
+    req<{ id: string; slug: string; yaml_source: string; revision: number }>(
+      `/rules/builtin/${encodeURIComponent(ruleId)}/fork`,
+      { method: "POST", body: JSON.stringify({ disable_builtin: disableBuiltin }) },
+    ),
+  import: (yamlSource: string) =>
+    req<RuleImportResponse>("/rules/import", {
+      method: "POST",
+      body: JSON.stringify({ yaml_source: yamlSource }),
+    }),
+};
+
+export function rulesExportUrl(): string {
+  return `${BASE}/rules/export/bundle`;
 }
 
 export function wsUrl(path: string): string {

@@ -78,7 +78,13 @@ class MemProcFSRunner:
 
         _VMM_LOCK.acquire()
         self._lock_acquired = True
-        self._vmm = memprocfs.Vmm(["-device", str(self.dump_path), "-forensic", FORENSIC_MODE])
+        try:
+            self._vmm = memprocfs.Vmm(["-device", str(self.dump_path), "-forensic", FORENSIC_MODE])
+        except BaseException:
+            # A context manager whose __enter__ raises never receives __exit__.
+            self._lock_acquired = False
+            _VMM_LOCK.release()
+            raise
         return self
 
     def __exit__(self, _exc_type, _exc, _tb) -> None:
@@ -275,6 +281,8 @@ class MemProcFSRunner:
                         copied += len(data)
                         if size_hint is None and len(data) < length:
                             break
+            if size_hint is not None and copied != size_hint:
+                raise ValueError(f"Incomplete VFS read: expected {size_hint} bytes, received {copied}")
             artifact["size"] = copied
             artifact["sha256"] = hasher.hexdigest()
         except Exception as exc:

@@ -1,14 +1,15 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Clock, Folder, Moon, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
+import { Binary, Clock, Folder, Menu, Moon, ScrollText, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
 import { clsx } from "clsx";
-import { CodeBlock, DetailDrawer, IconButton, SeverityBadge } from "./components/common";
+import { CodeBlock, DetailDrawer, IconButton, SeverityBadge, Spinner } from "./components/common";
 import { FlagAsFinding } from "./components/FlagAsFinding";
 import { useTheme } from "./lib/theme";
 import { api } from "./lib/api";
 import { fmtTime } from "./lib/ui";
 import type { EventRow } from "./lib/types";
+import { useAuth } from "./components/AuthGate";
 
 const BRAND_CREDIT = "Made by Roei.f";
 const APP_VERSION = "0.1.0";
@@ -16,15 +17,19 @@ const RELEASE_LABEL = "Public Beta";
 
 const NAV = [
   { to: "/", label: "Cases", icon: <Folder size={19} /> },
+  { to: "/reverse", label: "Reverse", icon: <Binary size={19} /> },
+  { to: "/rules", label: "Rules", icon: <ScrollText size={19} /> },
   { to: "/settings", label: "Settings", icon: <Settings size={19} /> },
 ];
 
 export default function App() {
   const loc = useLocation();
   const { theme, toggleTheme } = useTheme();
+  const { auth, logout } = useAuth();
   const inCase = loc.pathname.startsWith("/cases/");
   const caseId = inCase ? loc.pathname.split("/")[2] : "";
   const [searchOpen, setSearchOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [selectedEvent, setSelectedEvent] = useState<EventRow | null>(null);
   const q = search.trim();
@@ -35,6 +40,10 @@ export default function App() {
     queryFn: ({ signal }) => api.getEvents(caseId, { q, limit: 8 }, signal),
     enabled: searchOpen && Boolean(caseId) && q.length >= 2,
   });
+
+  useEffect(() => {
+    setMenuOpen(false);
+  }, [loc.pathname]);
 
   useEffect(() => {
     setSearchOpen(false);
@@ -77,18 +86,26 @@ export default function App() {
                 <ShieldCheck size={18} />
               </div>
               <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-semibold text-ink-100">Local session</div>
-                <div className="truncate text-xs text-ink-300">Offline analysis</div>
+                <div className="truncate text-sm font-semibold text-ink-100">{auth?.user?.display_name || "Local session"}</div>
+                <div className="truncate text-xs text-ink-300">{auth?.enabled ? (auth.user?.email || "Organization SSO") : "Offline analysis"}</div>
               </div>
+              {auth?.enabled && <button className="text-xs text-ink-300 hover:text-accent-blue" onClick={() => void logout()}>Log out</button>}
             </div>
           </div>
 
           <div className="flex items-center gap-2 lg:hidden">
+            <IconButton label={menuOpen ? "Close navigation" : "Open navigation"} aria-expanded={menuOpen} aria-controls="mobile-navigation" onClick={() => setMenuOpen(!menuOpen)}>
+              {menuOpen ? <X size={18} /> : <Menu size={18} />}
+            </IconButton>
             <IconButton label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"} onClick={toggleTheme}>
               {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
             </IconButton>
           </div>
         </div>
+        {menuOpen && <nav id="mobile-navigation" aria-label="Main navigation" className="surface mt-2 space-y-2 p-4 lg:hidden" onKeyDown={(event) => { if (event.key === "Escape") setMenuOpen(false); }}>
+          {NAV.map((item) => <SidebarItem key={item.label} item={item} pathname={loc.pathname} />)}
+          {auth?.enabled && <button className="btn-ghost w-full" onClick={() => void logout()}>Log out</button>}
+        </nav>}
       </aside>
 
       <div className="flex min-h-screen flex-1 flex-col pt-24 lg:ml-[260px] lg:pt-5">
@@ -183,7 +200,9 @@ export default function App() {
         </header>
 
         <main className="mx-auto w-full max-w-[1680px] flex-1 px-3 pb-6 lg:px-6">
-          <Outlet />
+          <Suspense fallback={<Spinner label="Loading…" />}>
+            <Outlet />
+          </Suspense>
         </main>
       </div>
 
@@ -261,6 +280,8 @@ function SidebarItem({
 }) {
   const active =
     (item.label === "Settings" && pathname.startsWith("/settings")) ||
+    (item.label === "Reverse" && pathname.startsWith("/reverse")) ||
+    (item.label === "Rules" && pathname.startsWith("/rules")) ||
     (item.label === "Cases" && (pathname === "/" || pathname.startsWith("/cases/")));
 
   return (

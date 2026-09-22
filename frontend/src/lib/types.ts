@@ -1,4 +1,4 @@
-export type Provider = "ollama" | "openai" | "gemini" | "anthropic";
+export type Provider = "ollama" | "openai" | "openrouter" | "gemini" | "anthropic";
 export type Severity = "info" | "low" | "medium" | "high" | "critical";
 export type CaseStatus = "created" | "ingesting" | "analyzing" | "ready" | "error";
 
@@ -27,6 +27,7 @@ export interface LLMConfig {
   provider: Provider;
   model: string;
   ollama_base_url: string;
+  openrouter_base_url: string;
   temperature: number;
   max_tokens: number;
   analysis_max_tool_calls: number;
@@ -125,6 +126,7 @@ export interface ProcessTree {
 }
 
 export interface EvidenceFile {
+  attribution_warning?: string | null;
   name: string;
   kind: "memory" | "archive" | "eventlog" | "textlog" | "artifact" | "other";
   size: number;
@@ -178,6 +180,7 @@ export interface EntityEdge {
   id: string;
   source: string;
   target: string;
+  assumption?: string;
   verb: string;
   severity: Severity;
   count: number;
@@ -272,7 +275,7 @@ export interface MemoryProcessCandidate {
   handles_on_demand?: boolean;
   downloads: {
     image: boolean;
-    full_memory: boolean;
+    minidump: boolean;
     modules: boolean;
   };
 }
@@ -352,4 +355,302 @@ export interface Progress {
   message: string;
   done: boolean;
   error?: string | null;
+}
+
+export interface ReverseProject {
+  id: string;
+  name: string;
+  description: string;
+  linked_case_id: string | null;
+  status: string;
+  active_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+  artifact_count: number;
+  latest_run_status: string | null;
+  analysis_note: string | null;
+}
+
+export interface ReverseArtifact {
+  id: string;
+  project_id: string;
+  name: string;
+  artifact_type: string;
+  content_type: string;
+  file_size: number;
+  sha256: string;
+  source_case_id: string | null;
+  source_session_id: string | null;
+  source_pid: number | null;
+  source_process_name: string | null;
+  source_vfs_path: string | null;
+  source_kind: string | null;
+  source_hashes: Record<string, string> | null;
+  created_at: string;
+}
+
+export interface ReverseProcessHandoff {
+  project_id: string;
+  status: "ready";
+  artifact_ids: string[];
+}
+
+export interface ReverseRun {
+  id: string;
+  project_id: string;
+  status: string;
+  provider: Provider;
+  model: string;
+  temperature: number;
+  max_tokens: number;
+  max_turns: number;
+  turns_used: number;
+  awaiting_reason: string | null;
+  analysis_outcome: "complete" | "partial" | "blocked" | "legacy" | null;
+  analysis_state: ReverseAnalysisState;
+  error: string | null;
+  image_digest: string | null;
+  tool_versions: Record<string, string>;
+  report_signature_status: string;
+  report_signature_error: string | null;
+  report_verification_status: string;
+  report_verification_summary: string | null;
+  report_verification_error: string | null;
+  report_review_status: string;
+  report_review_passes: number;
+  report_review_details: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface ReverseStatus {
+  project_id: string;
+  status: string;
+  run: ReverseRun | null;
+  active: boolean;
+  can_resume: boolean;
+  can_recover_report: boolean;
+  can_continue_investigation: boolean;
+}
+
+export interface ReverseReport {
+  project_id: string;
+  run_id: string;
+  content: string;
+  iocs: string | null;
+  structured_iocs: ReverseIoc[];
+  analysis_outcome: "complete" | "partial" | "blocked" | "legacy" | null;
+  analysis_state: ReverseAnalysisState;
+  signature_status: string;
+  signature_error: string | null;
+  verification_status: string;
+  verification_summary: string | null;
+  verification_error: string | null;
+  verification_details: Record<string, unknown>;
+  review_status: string;
+  review_passes: number;
+  review_history: Record<string, unknown>[];
+}
+
+export interface ReverseCoverageItem {
+  id?: string;
+  objective?: string;
+  text?: string;
+  status: string;
+  summary?: string;
+  confidence?: string;
+  evidence_ids?: number[];
+}
+
+export interface ReverseAnalysisState {
+  version?: number;
+  objectives?: ReverseCoverageItem[];
+  coverage?: ReverseCoverageItem[];
+  findings?: Record<string, unknown>[];
+  unresolved_items?: string[];
+  next_steps?: string[];
+  review_summary?: string;
+  latest_checkpoint_markdown?: string;
+  latest_checkpoint_turn?: number;
+  progress_controller?: ReverseProgressController;
+}
+
+export interface ReverseProgressAttempt {
+  trace_id: number;
+  family: string;
+  semantic_key: string;
+  target: string;
+  success: boolean;
+  failure_fingerprint?: string | null;
+  evidence_hash?: string | null;
+  novel_evidence: boolean;
+}
+
+export interface ReverseProgressController {
+  version: number;
+  no_evidence_streak: number;
+  diagnostic: {
+    active: boolean;
+    family?: string;
+    semantic_key?: string;
+    failure_fingerprint?: string | null;
+    trigger?: string;
+    required_pivot?: string;
+    activated_at_trace?: number;
+    cleared_at_trace?: number;
+  };
+  attempts: ReverseProgressAttempt[];
+}
+
+export interface ReverseIoc {
+  type: string;
+  value: string;
+  confidence: string;
+  evidence_ids: number[];
+}
+
+export interface ReverseEvidence {
+  id: number;
+  project_id: string;
+  run_id: string;
+  tool: string | null;
+  target: unknown;
+  success: boolean | null;
+  returncode: number | null;
+  stdout: string;
+  stderr: string;
+  error: string | null;
+  output_truncated: boolean;
+  stdout_original_length: number | null;
+  stdout_returned_length: number | null;
+  stderr_original_length: number | null;
+  stderr_returned_length: number | null;
+  output_note: string | null;
+  output_sha256: string;
+  created_at: string;
+}
+
+export interface ReverseTraceEntry {
+  id: number;
+  sequence: number;
+  event_type: string;
+  payload: Record<string, unknown>;
+  previous_hash: string;
+  entry_hash: string;
+  signature: string | null;
+  created_at: string;
+}
+
+export interface ReverseChatMessage {
+  id: number;
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  phase: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface ReverseAuditEvent {
+  id: number;
+  event_type: string;
+  details: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface ReverseHealth {
+  docker_available: boolean;
+  image_available: boolean;
+  image: string;
+  image_digest: string | null;
+  message: string;
+}
+
+export interface ReverseToolPolicy {
+  enabled_tools: string[];
+  available_tools: { id: string; description: string }[];
+}
+
+export interface ReverseSettings {
+  sandbox_image: string;
+  sandbox_idle_ttl_minutes: number;
+  sandbox_memory_limit_mb: number;
+  sandbox_cpu_limit: number;
+  sandbox_pids_limit: number;
+  analysis_max_turns: number;
+  analysis_extension_turns: number;
+  max_upload_bytes: number;
+  max_project_bytes: number;
+  max_tool_output_chars: number;
+  enabled_tools: string[];
+  available_tools: { id: string; description: string }[];
+}
+
+// --- Detection rules ---------------------------------------------------------
+
+export interface RuleSummary {
+  id: string;
+  title: string;
+  kind: string;
+  platform: string;
+  severity: Severity;
+  techniques: string[];
+  source: "builtin" | "custom";
+  enabled: boolean;
+  family: string | null;
+  is_family: boolean;
+  editable: string[];
+  forkable: boolean;
+  severity_override: Severity | null;
+  /** Ids the per-case suppression system uses for this rule. */
+  legacy_rule_ids: string[];
+  /** False when no literal prefilter could be derived, so the rule runs on every subject. */
+  gated: boolean;
+  compile_status: string;
+  compile_error: string | null;
+  warnings: string[];
+}
+
+export interface RuleDetail extends RuleSummary {
+  description: string;
+  logic: string;
+  yaml_source: string;
+  logsource: string;
+  unmapped_fields: string[];
+  note: string;
+  origin: string;
+  source_builtin_id: string | null;
+}
+
+export interface RuleListResponse {
+  revision: number;
+  rules: RuleSummary[];
+  total: number;
+  builtin_total: number;
+  custom_total: number;
+  disabled_total: number;
+  ungated_total: number;
+  ungated_limit: number;
+  /** Built-in rule management works without pySigma; custom Sigma authoring does not. */
+  sigma_available: boolean;
+  sigma_error: string;
+}
+
+export interface RuleValidateResponse {
+  ok: boolean;
+  error: string | null;
+  title: string;
+  severity: Severity;
+  techniques: string[];
+  logsource: string;
+  literals: string[];
+  gated: boolean;
+  warnings: string[];
+  unmapped_fields: string[];
+}
+
+export interface RuleImportResponse {
+  imported: { index: number; id: string; slug: string }[];
+  rejected: { index: number; error: string }[];
+  revision: number;
 }

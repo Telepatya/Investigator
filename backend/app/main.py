@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import logging
+import asyncio
 
 from contextlib import asynccontextmanager
 
@@ -15,7 +16,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api import analysis_router, cases_router, settings_router
-from app.api.security import ALLOWED_HOSTS, allowed_origins, authorize_http
+from app.api.http_limits import HTTPBoundaryMiddleware
+from app.api.security import allowed_hosts, allowed_origins, authorize_http
+from app.auth.middleware import AuthMiddleware
+from app.auth.router import router as auth_router
 from app.config import ensure_dirs
 from app.store.cases import (
     CaseNotFoundError,
@@ -24,6 +28,18 @@ from app.store.cases import (
     recover_interrupted_case_operations,
 )
 from app.store.database import dispose_all_db_engines
+from app.reverse.analysis import analysis_manager
+from app.reverse.database import dispose_reverse_db, init_reverse_db
+from app.reverse.router import router as reverse_router
+from app.reverse.sandbox import sandbox_manager
+from app.rules.database import dispose_rules_db
+from app.rules.router import router as rules_router
+from app.reverse.store import (
+    cleanup_staging_files,
+    recover_interrupted_chats,
+    recover_interrupted_runs,
+    repair_case_links,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +53,14 @@ APP_CREDIT = "Made by Roei.f"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_dirs()
+    init_reverse_db()
+    for run_id in recover_interrupted_runs():
+        logger.warning("Recovered interrupted Reverse run %s", run_id)
+    for project_id in recover_interrupted_chats():
+        logger.warning("Recovered interrupted Reverse chat state for project %s", project_id)
+    for project_id in repair_case_links():
+        logger.warning("Cleared stale case link for Reverse project %s", project_id)
+    cleanup_staging_files()
     for case_id in recover_interrupted_case_operations():
         logger.warning("Recovered interrupted operation state for case %s", case_id)
     for result in cleanup_orphan_case_dirs():
@@ -62,9 +86,22 @@ async def lifespan(app: FastAPI):
                 result.get("path"),
                 result.get("case_id"),
             )
+    async def _reverse_cleanup_loop() -> None:
+        while True:
+            await asyncio.sleep(60)
+            for project_id in await asyncio.to_thread(sandbox_manager.cleanup_idle):
+                logger.info("Destroyed idle Reverse sandbox for %s", project_id)
+
+    cleanup_task = asyncio.create_task(_reverse_cleanup_loop(), name="reverse-sandbox-cleanup")
     try:
         yield
     finally:
+        cleanup_task.cancel()
+        await asyncio.gather(cleanup_task, return_exceptions=True)
+        await analysis_manager.shutdown()
+        await asyncio.to_thread(sandbox_manager.shutdown)
+        dispose_reverse_db()
+        dispose_rules_db()
         dispose_all_db_engines()
 
 
@@ -79,7 +116,7 @@ app = FastAPI(
 # DNS-rebinding, where a hostile page resolves its own domain to 127.0.0.1 and
 # reaches this backend from the victim's browser: the rebound request still
 # carries the attacker's hostname in Host and is refused here.
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts())
 
 # Local-only tool: restrict cross-origin reads to our own frontend origins
 # (built app served by this backend, plus the Vite dev server).
@@ -90,6 +127,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Authentication is enforced for both HTTP and WebSocket scopes before any
+# product route runs. Static SPA assets remain public for the login shell.
+app.add_middleware(AuthMiddleware)
 
 
 @app.middleware("http")
@@ -102,6 +143,10 @@ async def _enforce_http_origin(request: Request, call_next):
     return await call_next(request)
 
 
+# Outermost application middleware also protects rejected requests and SPA assets.
+app.add_middleware(HTTPBoundaryMiddleware)
+
+
 @app.exception_handler(CaseNotFoundError)
 async def _case_not_found_handler(_request: Request, _exc: CaseNotFoundError) -> JSONResponse:
     # A session was requested for an id absent from the registry; surface it as a
@@ -111,12 +156,17 @@ async def _case_not_found_handler(_request: Request, _exc: CaseNotFoundError) ->
 app.include_router(settings_router.router)
 app.include_router(cases_router.router)
 app.include_router(analysis_router.router)
+app.include_router(reverse_router)
+app.include_router(rules_router)
+app.include_router(auth_router)
 
 
 @app.get("/api/health")
 async def health() -> dict:
     from app.memory.memprocfs_runner import is_memprocfs_available
     from app.memory.yara_scanner import get_scanner
+    from app.rules.sigma_compile import sigma_available
+    reverse = await asyncio.to_thread(sandbox_manager.health)
     return {
         "status": "ok",
         "brand": APP_TITLE,
@@ -125,6 +175,12 @@ async def health() -> dict:
         "credit": APP_CREDIT,
         "memprocfs": is_memprocfs_available(),
         "yara": get_scanner().available(),
+        # Custom Sigma rule authoring; built-in rule management works without it.
+        "sigma": sigma_available(),
+        "reverse": {
+            **reverse,
+            "store_ready": True,
+        },
     }
 
 
@@ -149,7 +205,7 @@ if FRONTEND_DIST.exists():
 def main() -> None:
     import uvicorn
     port = int(os.environ.get("INVESTIGATOR_PORT", "8400"))
-    uvicorn.run("app.main:app", host="127.0.0.1", port=port, reload=False)
+    uvicorn.run("app.main:app", host="127.0.0.1", port=port, reload=False, ws_max_size=131_072)
 
 
 if __name__ == "__main__":

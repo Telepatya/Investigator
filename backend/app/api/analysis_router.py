@@ -7,6 +7,9 @@ import logging
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
+from pydantic import ValidationError
+
+from app.models.schemas import ChatCreate, ChatTurn, EntityInvestigation
 
 from app.api.security import authorize_ws
 from app.llm.orchestrator import analyze_case, chat_stream, investigate_entity_stream
@@ -73,7 +76,7 @@ async def analyze_ws(websocket: WebSocket, case_id: str) -> None:
     if not await authorize_ws(websocket, case_id):
         return
     await websocket.accept()
-    queue: asyncio.Queue = asyncio.Queue()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=100)
     _analysis_listeners.setdefault(case_id, []).append(queue)
     try:
         await websocket.send_json({
@@ -140,6 +143,24 @@ def get_report(case_id: str) -> dict:
         session.close()
 
 
+async def _validated_ws_message(websocket: WebSocket, schema):
+    frame = await websocket.receive()
+    if frame["type"] == "websocket.disconnect":
+        raise WebSocketDisconnect(code=frame.get("code", 1000))
+    raw = frame.get("text")
+    if not isinstance(raw, str):
+        await websocket.close(code=1003, reason="Expected a JSON text message")
+        raise WebSocketDisconnect(code=1003)
+    if len(raw) > 131_072:
+        await websocket.close(code=1009, reason="Message too large")
+        raise WebSocketDisconnect(code=1009)
+    try:
+        return schema.model_validate_json(raw)
+    except ValidationError:
+        await websocket.send_json({"type": "error", "content": "Invalid message: check field types and lengths"})
+        return None
+
+
 @router.websocket("/{case_id}/chat-ws")
 async def chat_ws(websocket: WebSocket, case_id: str) -> None:
     if not await authorize_ws(websocket, case_id):
@@ -147,9 +168,11 @@ async def chat_ws(websocket: WebSocket, case_id: str) -> None:
     await websocket.accept()
     try:
         while True:
-            data = await websocket.receive_json()
-            question = data.get("message", "")
-            chat_id = str(data.get("chat_id") or "")
+            data = await _validated_ws_message(websocket, ChatTurn)
+            if data is None:
+                continue
+            question = data.message
+            chat_id = data.chat_id
             if not question or not chat_id:
                 await websocket.send_json({"type": "error", "content": "A chat session is required"})
                 continue
@@ -175,8 +198,10 @@ async def investigate_entity_ws(websocket: WebSocket, case_id: str) -> None:
     await websocket.accept()
     try:
         while True:
-            data = await websocket.receive_json()
-            entity_id = data.get("entity_id", "")
+            data = await _validated_ws_message(websocket, EntityInvestigation)
+            if data is None:
+                continue
+            entity_id = data.entity_id
             if not entity_id:
                 continue
             await websocket.send_json({"type": "start"})
@@ -202,12 +227,12 @@ def list_chats(case_id: str) -> dict:
 
 
 @router.post("/{case_id}/chats")
-def create_chat(case_id: str, payload: dict | None = None) -> dict:
+def create_chat(case_id: str, payload: ChatCreate | None = None) -> dict:
     if not case_store.case_exists(case_id):
         raise HTTPException(404, "Case not found")
     session = case_store.get_session(case_id)
     try:
-        chat = case_store.create_chat_session(session, str((payload or {}).get("title") or "New chat"))
+        chat = case_store.create_chat_session(session, (payload.title or "New chat") if payload else "New chat")
         session.commit()
         return {"id": chat.id, "title": chat.title, "messages": [], "memo": None}
     finally:

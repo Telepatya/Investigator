@@ -15,6 +15,7 @@ from typing import Any
 
 from app.config import case_uploads_path
 from app.memory.forensics import memprocfs_artifact_dir
+from app.memory.identity import is_memory_upload, memory_upload_key
 from app.memory.memprocfs_runner import (
     VFS_CHUNK_SIZE,
     _VMM_LOCK,
@@ -24,11 +25,9 @@ from app.memory.memprocfs_runner import (
     is_memprocfs_available,
 )
 
-MEMORY_EXTENSIONS = {".raw", ".dmp", ".mem", ".vmem", ".bin", ".img", ".lime", ".dd"}
 MAX_ARCHIVE_DEPTH = 6
 MAX_ARCHIVE_FILES = 1000
 MAX_MODULE_HASH_BYTES = 512 * 1024 * 1024
-MAX_PROCESS_VMEM_EXTRACT_BYTES = 512 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -54,8 +53,8 @@ def list_memory_dumps(case_id: str) -> list[dict[str, Any]]:
         if path.is_file() and _looks_like_memory_dump(path):
             stat = path.stat()
             dumps.append({
-                "session_id": f"mem-{path.stem}",
-                "dump_stem": path.stem,
+                "session_id": f"mem-{memory_upload_key(path.name)}",
+                "dump_stem": memory_upload_key(path.name),
                 "filename": path.name,
                 "size": stat.st_size,
             })
@@ -102,7 +101,7 @@ def memory_process_candidates(session, entity_value: str) -> list[dict[str, Any]
             "handles_on_demand": True,
             "downloads": {
                 "image": True,
-                "full_memory": True,
+                "minidump": True,
                 "modules": True,
             },
         })
@@ -145,6 +144,29 @@ def list_process_handles(
             "limit": limit,
             "handles": rows[offset:offset + limit],
         }
+    finally:
+        session.close()
+
+
+def export_process_handles(case_id: str, session_id: str, pid: int) -> list[dict[str, Any]]:
+    """Return the complete cached/on-demand handle set for one exact memory process."""
+    from app.store import cases as case_store
+    from app.store.database import Process
+    from sqlalchemy import select
+
+    session = case_store.get_session(case_id)
+    try:
+        proc = session.scalars(
+            select(Process).where(Process.session_id == session_id, Process.pid == int(pid))
+        ).first()
+        if not proc:
+            raise MemoryExplorerError("Memory-backed process not found", 404)
+        events = _handle_events_for_process(session, proc)
+        if not events:
+            _collect_and_cache_process_handles(case_id, session, proc)
+            session.commit()
+            events = _handle_events_for_process(session, proc)
+        return _process_handle_rows(proc, events)[0]
     finally:
         session.close()
 
@@ -208,6 +230,7 @@ def _collect_and_cache_process_handles(case_id: str, session, proc) -> None:
             timestamp=None,
             host=None,
             source="memory:handles",
+            upload_name=getattr(proc, "upload_name", None),
             category="handle",
             entity=proc.name,
             severity=severity,
@@ -359,33 +382,55 @@ def list_process_modules(case_id: str, session_id: str, pid: int) -> dict[str, A
     return {"session_id": session_id, "pid": pid, "process": process_info, "modules": modules}
 
 
-def extract_process_image(case_id: str, session_id: str, pid: int, kind: str = "image") -> Path:
+def extract_process_image(
+    case_id: str,
+    session_id: str,
+    pid: int,
+    kind: str = "image",
+    *,
+    exact_vfs_path: bool = False,
+) -> Path:
     dump = resolve_memory_dump(case_id, session_id)
-    if kind not in {"image", "vmem"}:
+    if kind not in {"image", "minidump"}:
         raise MemoryExplorerError("Unsupported process download kind")
     with _open_vmm(dump.path) as vmm:
         proc = _process(vmm, pid)
-        if kind == "vmem":
-            source = f"/pid/{pid}/memory.vmem"
+        if kind == "minidump":
+            source = f"/pid/{pid}/minidump/minidump.dmp"
             entry = _vfs_entry(vmm, source)
-            size = _entry_size(entry)
+            if entry is None and not exact_vfs_path:
+                # `/pid` and `/name` are aliases in MemProcFS. Prefer the stable
+                # PID path, but tolerate builds/dumps that expose only `/name`.
+                try:
+                    name_entries = _vfs_list(vmm, "/name")
+                except MemoryExplorerError:
+                    name_entries = {}
+                for directory, candidate in name_entries.items():
+                    if not _entry_is_dir(candidate) or not directory.endswith(f"-{pid}"):
+                        continue
+                    candidate_source = f"/name/{directory}/minidump/minidump.dmp"
+                    candidate_entry = _vfs_entry(vmm, candidate_source)
+                    if candidate_entry is not None:
+                        source, entry = candidate_source, candidate_entry
+                        break
             if entry is None:
-                raise MemoryExplorerError("Full process memory is unavailable for this process", 404)
-            if size is None:
                 raise MemoryExplorerError(
-                    "Full process memory size is unknown; refusing open-ended sparse VMEM extraction. "
-                    "Use Process image or module downloads instead.",
-                    413,
+                    f"The MemProcFS minidump for exactly pid {pid} is unavailable at {source}. "
+                    "MemProcFS only generates it for supported active user-mode processes.",
+                    404,
                 )
-            if size > MAX_PROCESS_VMEM_EXTRACT_BYTES:
-                raise MemoryExplorerError(
-                    f"Full process memory is {size / (1024 * 1024):.0f} MB, above the "
-                    f"{MAX_PROCESS_VMEM_EXTRACT_BYTES // (1024 * 1024)} MB safety limit. "
-                    "Use Process image or module downloads instead.",
-                    413,
-                )
-            output = _cache_path(case_id, dump.dump_stem, "processes", f"{_safe_filename(_proc_name(proc, pid))}_{pid}.vmem.extracted")
-            info = _copy_vfs_file(vmm, source, output, entry)
+            output = _cache_path(
+                case_id,
+                dump.dump_stem,
+                "processes",
+                f"{_safe_filename(_proc_name(proc, pid))}_{pid}.minidump.dmp",
+            )
+            info = {
+                **_copy_vfs_file(vmm, source, output, entry),
+                "kind": "process_minidump",
+                "pid": pid,
+                "process": _proc_name(proc, pid),
+            }
         else:
             module = _main_module(proc)
             if not module:
@@ -424,18 +469,20 @@ def resolve_memory_dump(case_id: str, session_id: str) -> MemoryDumpRef:
         raise MemoryExplorerError("Not a memory-backed session")
     dump_stem = session_id[4:]
     uploads = case_uploads_path(case_id)
-    for path in uploads.iterdir():
-        if path.is_file() and path.stem == dump_stem and _looks_like_memory_dump(path):
-            return MemoryDumpRef(session_id, dump_stem, path.name, path, path.stat().st_size)
+    paths = [path for path in uploads.iterdir() if path.is_file() and _looks_like_memory_dump(path)]
+    exact = [path for path in paths if memory_upload_key(path.name) == dump_stem]
+    legacy = [path for path in paths if path.stem == dump_stem]
+    candidates = exact or legacy
+    if len(candidates) > 1:
+        raise MemoryExplorerError("Legacy memory session matches multiple uploads; re-ingest into separate cases before browsing it", 409)
+    if candidates:
+        path = candidates[0]
+        return MemoryDumpRef(session_id, dump_stem, path.name, path, path.stat().st_size)
     raise MemoryExplorerError("Original memory dump is unavailable", 404)
 
 
 def _looks_like_memory_dump(path: Path) -> bool:
-    if path.suffix.lower() in MEMORY_EXTENSIONS:
-        return True
-    # Velociraptor/collector outputs may retain a dump as "PhysicalMemory"
-    # without an extension; the session id is still mem-PhysicalMemory.
-    return path.suffix == "" and path.name.lower() in {"physicalmemory", "memory", "ram"}
+    return is_memory_upload(path)
 
 
 def sanitize_vfs_path(raw_path: str | None) -> str:
@@ -607,6 +654,8 @@ def _copy_process_range(proc, base: int, size: int, output: Path, metadata: dict
                 copied += len(data)
                 if len(data) < length:
                     break
+        if copied != size:
+            raise ValueError(f"Incomplete memory read: expected {size} bytes, received {copied}")
         return {
             **metadata,
             "local_path": str(output),
@@ -648,6 +697,8 @@ def _copy_vfs_file(vmm, source: str, output: Path, entry: Any | None) -> dict[st
                 copied += len(data)
                 if size_hint is None and len(data) < length:
                     break
+        if size_hint is not None and copied != size_hint:
+            raise ValueError(f"Incomplete VFS read: expected {size_hint} bytes, received {copied}")
     except Exception as exc:
         try:
             output.unlink(missing_ok=True)
@@ -688,6 +739,8 @@ def _write_vfs_to_zip(vmm, zf: zipfile.ZipFile, source: str, entry: Any | None, 
             copied += len(data)
             if size_hint is None and len(data) < length:
                 break
+    if size_hint is not None and copied != size_hint:
+        raise ValueError(f"Incomplete VFS read: expected {size_hint} bytes, received {copied}")
     return copied, hasher.hexdigest()
 
 
@@ -708,7 +761,7 @@ def _hash_process_range(proc, base: int, size: int) -> str | None:
             copied += len(data)
             if len(data) < length:
                 break
-        return hasher.hexdigest() if copied else None
+        return hasher.hexdigest() if copied == size else None
     except Exception:
         return None
 
@@ -821,6 +874,10 @@ def _entry_is_dir(entry: Any) -> bool:
 
 
 def _memory_result_matches_process(result, proc) -> bool:
+    upload = getattr(result, "upload_name", None)
+    process_upload = getattr(proc, "upload_name", None)
+    if upload or process_upload:
+        return bool(upload and upload == process_upload)
     data = result.data if isinstance(result.data, dict) else {}
     source = str(data.get("source") or "")
     result_session = str(data.get("session_id") or "")

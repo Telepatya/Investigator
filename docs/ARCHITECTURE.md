@@ -20,6 +20,7 @@ usage are covered in the [README](../README.md); security reporting is covered i
   - [Long-running operation coordination](#long-running-operation-coordination)
   - [Ingestion and memory analysis](#ingestion-and-memory-analysis)
   - [Detection and analyst findings](#detection-and-analyst-findings)
+  - [Global rule management](#global-rule-management)
   - [Entity graph and dossiers](#entity-graph-and-dossiers)
   - [AI orchestration](#ai-orchestration)
   - [API and WebSockets](#api-and-websockets)
@@ -56,6 +57,10 @@ principles:
 6. **Exact identity beats convenient matching.** Full file/process paths are
    normalized and matched exactly. Basename fallback is used only when the source
    identity is basename-only and unambiguous.
+7. **Static Reverse isolation.** Reverse workspaces have a separate versioned
+   SQLite store. Untrusted artifacts enter only a non-root, no-network Docker
+   sandbox through generated UUID paths and a shared argv/file-operation policy;
+   uploaded samples are not executed.
 
 ## Migration summary
 
@@ -87,6 +92,7 @@ flowchart LR
     USER["Analyst actions"]
 
     subgraph BACKEND["FastAPI backend"]
+        AUTH["Optional OIDC boundary + SQLite sessions"]
         API["REST and WebSocket routers"]
         OPS["Per-case operation coordinator"]
         INGEST["Ingest pipeline"]
@@ -109,7 +115,8 @@ flowchart LR
     MEMORY --> API --> OPS --> MEM --> DB
     INGEST --> DETECT --> DB
     MEM --> DETECT
-    USER --> SHELL --> API
+    USER --> SHELL --> AUTH --> API
+    IDP["One configured organization IdP"] --> AUTH
     API --> MANUAL --> DB
     DB <--> GRAPH
     DB <--> LLM
@@ -121,6 +128,91 @@ flowchart LR
 The production frontend is built into `frontend/dist` and served by FastAPI, so
 the normal deployment is one local process on `127.0.0.1:8400`. Development mode
 uses Vite on `:5173` with `/api` proxied to the backend.
+
+### Optional organization SSO
+
+When enabled with environment variables, ASGI middleware authenticates every API
+and WebSocket scope before route code runs. Health and auth bootstrap/login/
+callback endpoints remain anonymous so the SPA can render a login or
+configuration error; FastAPI documentation metadata endpoints are protected,
+while static assets remain public. OIDC discovery, authorization
+code exchange, and ID-token signature/issuer/audience/time checks use Authlib and
+an explicit asymmetric algorithm allowlist. State, nonce, and PKCE verifier are
+one-time SQLite transactions. Successful identities are reduced to a subject,
+display name/email, and admin bit; full claims and tokens are not persisted.
+
+Session cookies are opaque random values whose SHA-256 hashes are stored in
+`~/.investigator/auth.db`, with idle and absolute expiry and logout revocation.
+OIDC transactions also require a separate browser-bound, short-lived HttpOnly
+cookie whose hash is stored server-side, preventing one browser from replaying
+another browser's state. The exact configured public origin drives callback,
+CORS, Host, HTTP Origin, and WebSocket Origin policy; forwarded headers are
+never trusted. Group/role claims
+are compared case-sensitively against one deployment allowlist. Entra
+`hasgroups`/`_claim_names` overage indicators fail closed rather than invoking
+Graph. SSO is intentionally one IdP and one shared pool of cases/rules/Reverse
+projects; it is not a multi-tenant authorization model.
+
+### Reverse workspaces
+
+Reverse is a native top-level module, not a second web service. Metadata is kept
+in `~/.investigator/reverse/reverse.db`; each project owns UUID-addressed upload,
+output, log, and staging directories. A nullable case ID provides an optional
+association without crossing SQLite foreign-key boundaries. Deleting a case
+clears that association and records an audit event but preserves Reverse work.
+
+Each analysis run snapshots the shared Investigator provider/model settings and
+the sandbox image digest/tool versions. The orchestration is an adaptive
+prompt-and-tool loop: one `run_cmd`, `read_file`, `write_file`,
+or `list_dir` operation per turn, optional completion/checkpoint signals, exact
+duplicate suppression, and an evidence-aware progress controller. The controller
+persists semantic method/target keys, normalized failure fingerprints, output
+novelty, and diagnostic state. A repeated failure or three no-evidence operations
+requires an independent invariant check before the same semantic method can run
+again. Host and container share the same
+argv/executable/path policy. Containers have no network or host
+mounts, run as a non-root user with all capabilities dropped, use a read-only root
+filesystem and bounded tmpfs, and are destroyed after the configured idle TTL.
+Artifacts are streamed into tmpfs through a fixed staging broker with UUID,
+offset, size, and SHA-256 checks; no project directory is mounted into Docker.
+The model may use `write_file` to create a Python parser/decoder below output or
+tools and invoke it through `run_cmd` with `python3`. The broker routes Python
+through a fixed audited runner that denies networking, child processes, native
+loading, root-filesystem access, and sample mutation.
+The fixed `pyinstaller-inspect` tool derives CArchive offsets from the cookie end,
+validates package/TOC/entry bounds and compression headers, reports embedded-versus-
+runtime Python compatibility, and can disassemble selected raw marshalled code with
+`xdis`. Its extraction output remains restricted to `/workspace/output`.
+
+Follow-up Reverse chat uses a 12-turn analyst loop and the same four
+operations, command policy, duplicate suppression, and evidence feedback. A chat
+answer can therefore inspect the sealed sample or create a bounded helper instead
+of relying only on the previously generated report.
+
+There is no host checklist, artifact-specific completion gate, completion-marker
+requirement, or report-format gate. Each run persists objectives, supported
+findings, unresolved work, next steps, and the latest substantive draft. Turn
+extensions resume that state; declining an extension publishes the strongest
+saved draft as partial or blocked instead of replacing it with a limitations-only
+fallback. Manual Stop remains resumable.
+An `ANALYSIS CHECKPOINT` is persisted separately from the publication draft and
+returns to the tool loop, preventing useful interim prose from triggering an early
+review cycle.
+An analyst can also continue a completed partial, blocked, or warning-bearing run.
+The operation preserves the current report as a content-addressed output artifact,
+keeps it readable and signed during the resumed tool loop, and only replaces the
+published report when new bytes have completed review and signing.
+
+Finalization extracts structured IOCs and gives a goal-driven reviewer the full
+compact tool chronology, objective coverage, cited output, and relevant failure
+evidence. The reviewer chooses publish, report-only revision, or targeted
+continued analysis. Review is capped at two passes, and its passed,
+passed-with-warnings, or failed result is independent from the complete, partial,
+or blocked analysis outcome. Material claims use stable `[trace:<message-id>]`
+references that resolve through a project-scoped evidence API. Exact UTF-8 report
+bytes are atomically committed and signed regardless of outcome or remaining
+review warnings. A later revision invalidates the prior signature state and signs
+the revised bytes; signing failures remain retryable without rerunning analysis.
 
 ## Repository layout
 
@@ -139,10 +231,13 @@ Investigator/
 |   |   |-- ingest/                parsers, normalization, evidence lifecycle
 |   |   |-- memory/                MemProcFS, YARA, forensic extraction
 |   |   |-- detect/                rules, overrides, manual findings, graphs
+|   |   |-- rules/                 rule catalog, global state, Sigma compiler
 |   |   |-- llm/                   providers, tools, prompts, orchestration
+|   |   |-- reverse/               projects, analysis, sandbox policy, provenance
 |   |   |-- store/                 registry, operation locks, SQLAlchemy storage
 |   |   `-- models/                request/response schemas
 |   `-- tests/                     unittest regression suite
+|-- backend/reverse_sandbox/       pinned optional static-analysis image source
 `-- frontend/
     |-- src/
     |   |-- App.tsx                global workstation shell and case search
@@ -376,6 +471,58 @@ fields regardless of whether they came from syslog, auditd, journald, or Sentine
 `case_meta`. These overrides survive a findings-table rebuild and are applied after
 detector output is materialized.
 
+### Global rule management
+
+`app/rules/` manages detection rules application-wide, separately from the per-case
+overrides above.
+
+`registry.py` reads the rule tables in `app/detect/rules.py` and presents them as one
+catalog of addressable rules. It holds references to the already-compiled patterns
+and compiles nothing. Rules are grouped by the slug of their description, because
+several tables carry more than one pattern under a single description and the
+per-case override system already treats those as one rule. Each entry also records
+the legacy id `overrides.rule_id_for()` derives from the finding title, which is what
+existing cases have persisted. Tables whose members all collapse to one legacy id —
+LOLBins, parent/child pairs, masquerade paths, execution directories — expose a
+family switch plus per-member rules, so a member can be toggled individually while an
+existing per-case disable of the family id keeps working.
+
+`profile.py` snapshots the active rule set once per detection run. With no
+customization it returns the module tables themselves, by identity, so behavior and
+memory are unchanged and the run costs one extra `stat`. Filtering only ever removes
+entries, which is why the literal command-line prefilters remain valid superset gates
+and are left untouched. Global state is also applied centrally in `_add_finding`,
+which is the only place that sees every finding and therefore the only way to cover
+detections written as imperative engine code; a shared legacy id is suppressed there
+only once every rule that can emit it is disabled.
+
+`sigma_compile.py` parses analyst rules with pySigma and compiles the condition tree
+into nested closures. pySigma is required for **custom** rules only: the catalog, the
+enable/disable state, the severity overrides, and the profile the engine runs are plain
+Python. The import is guarded, so an installation without the package still starts, still
+manages every built-in rule, and still runs detections — it reports `sigma: false` from
+`/api/health`, refuses rule authoring with `503`, and says so on the Rules page. This
+matters because `app/main.py` imports the rules router at module scope, so an unguarded
+dependency there would stop the whole workstation, not just one feature. There is no `eval`, no `exec`, and no generated source. pySigma
+resolves value modifiers before compilation, so `contains`, `all`, `base64offset` and
+`windash` arrive as ordinary string or expansion values. Constructs this build cannot
+execute are refused by name at save time rather than stored as a rule that silently
+never matches. Compilation also derives the literal strings a subject must contain
+for the rule to have any chance of matching; those become a prefilter gate, and a
+rule with no derivable literal is counted against a hard cap because it must be
+evaluated against every process and event.
+
+`safe_regex.py` uses the maintained `regex` engine with a 20 ms deadline on
+every authoring probe and runtime match, alongside pattern and subject-length
+limits. Probes catch expensive patterns early; runtime deadlines enforce the
+boundary for subjects the probes did not anticipate. A timeout is an explicit
+analysis error, never a silently missing detection.
+
+The two mechanisms are deliberately different, and the distinction is what the Rules
+page communicates: a globally disabled rule is removed before the run and produces
+nothing, while a per-case disabled rule still produces its finding and demotes it to
+`info` reversibly.
+
 `app/detect/manual.py` implements durable analyst-created findings:
 
 - intent is stored as JSON in `case_meta`, then materialized as `Finding` rows;
@@ -421,7 +568,7 @@ dossier and runs its synchronous construction off the asyncio event loop.
 
 ### AI orchestration
 
-`app/llm` is provider-neutral. Ollama stays local; OpenAI, Anthropic, and Gemini
+`app/llm` is provider-neutral. Ollama stays local; OpenAI, OpenRouter, Anthropic, and Gemini
 send only prompt/tool excerpts to the configured provider. The Gemini provider
 uses the maintained `google-genai` client (not the legacy `google-generativeai`
 package). API keys live in the OS credential vault, and the settings UI warns that
@@ -459,6 +606,7 @@ Model output remains advisory and never replaces raw evidence.
 | `cases_router` | Case CRUD, uploads, evidence, events, timeline/facets, findings, manual findings, detection rebuild, ATT&CK matrix, entity graph/dossiers, process and memory exploration. |
 | `analysis_router` | AI analysis start/progress, reports, chat history/streaming, entity investigation streaming. |
 | `settings_router` | Provider/model configuration, keyring operations, model discovery/testing, general settings. |
+| `rules_router` | Detection-rule catalog, enable/disable and severity overrides, custom Sigma rule CRUD, validation, fork, import/export. |
 
 | WebSocket | Purpose |
 | --- | --- |
@@ -754,3 +902,16 @@ Also verify manually:
 
 CI additionally performs linting, dependency audits/review, frontend type/build
 checks, and CodeQL analysis as configured under `.github/workflows/`.
+
+
+### Reverse evidence filesystem ownership
+
+The sandbox image uses staging protocol 3. After updating, rebuild it with
+`python run.py --build-reverse-sandbox`; older images are rejected before staging.
+The trusted host prepares and copies evidence using fixed Docker exec commands
+as UID 0/GID 10001. The workspace parent and staged inputs/context remain owned
+by root; sealed directories are mode 0550 and files 0440. Analyzer commands run
+as UID 10001 and cannot chmod, unlink, or replace that evidence boundary.
+Output/tools directories permit writes by GID 10001; `/tmp` remains scratch.
+No capabilities, additional mounts, or network access are needed for staging.
+The Docker permission regression is opt-in with `INVESTIGATOR_DOCKER_TESTS=1`.

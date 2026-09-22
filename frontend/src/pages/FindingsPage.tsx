@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { useParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { EmptyState, PageShell, PageTitle, Spinner, SeverityBadge, CodeBlock } from "../components/common";
@@ -117,6 +117,15 @@ export default function FindingsPage() {
           </button>
         }
       />
+      <div className="card p-3 text-xs text-ink-400">
+        Rules disabled here are suppressed for this case only, and stay reversible without a
+        rebuild. To turn a rule off everywhere, or to add your own,{" "}
+        <Link className="text-accent-blue hover:underline" to="/rules">
+          open Detection rules
+        </Link>{" "}
+        — those changes apply to new analyses, so rebuild detections here to apply them to this
+        case.
+      </div>
       {disabledRules.length > 0 && (
         <div className="card p-3">
           <div className="flex items-center gap-2 mb-2 text-xs font-semibold uppercase tracking-wider text-ink-400">

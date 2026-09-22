@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 from app.config import get_api_key
 from app.llm.base import LLMProvider
+from app.llm.endpoints import provider_http_client, validate_endpoint
 from app.models.schemas import ModelInfo
 
 
@@ -26,7 +27,11 @@ class OpenAIProvider(LLMProvider):
         key = get_api_key("openai")
         if not key:
             raise ValueError("OpenAI API key not configured")
-        return AsyncOpenAI(api_key=key)
+        base_url = validate_endpoint("openai")
+        return AsyncOpenAI(
+            api_key=key, base_url=base_url,
+            http_client=provider_http_client("openai", base_url),
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         try:

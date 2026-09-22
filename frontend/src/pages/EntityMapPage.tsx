@@ -34,7 +34,7 @@ import {
 import { api } from "../lib/api";
 import { EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
 import { SEVERITY_COLORS } from "../lib/ui";
-import type { EntityGraph, EntityNode, EntityType, Severity } from "../lib/types";
+import type { EntityNode, EntityType, Severity } from "../lib/types";
 import { EntityDossierPanel } from "../components/EntityDossierPanel";
 
 const TYPE_ICON: Record<EntityType, ReactNode> = {
