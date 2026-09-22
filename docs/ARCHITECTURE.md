@@ -512,10 +512,11 @@ for the rule to have any chance of matching; those become a prefilter gate, and 
 rule with no derivable literal is counted against a hard cap because it must be
 evaluated against every process and event.
 
-`safe_regex.py` bounds analyst-supplied regular expressions. The verdict is measured
-against adversarial subjects derived from the pattern itself rather than inferred
-syntactically, so ordinary patterns pass while catastrophically backtracking ones are
-rejected, and matching is capped by subject length.
+`safe_regex.py` uses the maintained `regex` engine with a 20 ms deadline on
+every authoring probe and runtime match, alongside pattern and subject-length
+limits. Probes catch expensive patterns early; runtime deadlines enforce the
+boundary for subjects the probes did not anticipate. A timeout is an explicit
+analysis error, never a silently missing detection.
 
 The two mechanisms are deliberately different, and the distinction is what the Rules
 page communicates: a globally disabled rule is removed before the run and produces
@@ -901,3 +902,16 @@ Also verify manually:
 
 CI additionally performs linting, dependency audits/review, frontend type/build
 checks, and CodeQL analysis as configured under `.github/workflows/`.
+
+
+### Reverse evidence filesystem ownership
+
+The sandbox image uses staging protocol 3. After updating, rebuild it with
+`python run.py --build-reverse-sandbox`; older images are rejected before staging.
+The trusted host prepares and copies evidence using fixed Docker exec commands
+as UID 0/GID 10001. The workspace parent and staged inputs/context remain owned
+by root; sealed directories are mode 0550 and files 0440. Analyzer commands run
+as UID 10001 and cannot chmod, unlink, or replace that evidence boundary.
+Output/tools directories permit writes by GID 10001; `/tmp` remains scratch.
+No capabilities, additional mounts, or network access are needed for staging.
+The Docker permission regression is opt-in with `INVESTIGATOR_DOCKER_TESTS=1`.

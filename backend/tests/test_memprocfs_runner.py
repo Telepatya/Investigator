@@ -5,8 +5,10 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from threading import Lock
 from unittest.mock import patch
 
+from app.memory import memprocfs_runner
 from app.memory.memprocfs_runner import MemProcFSRunner
 
 
@@ -257,6 +259,45 @@ class MemProcFSRunnerTests(unittest.TestCase):
 
         self.assertEqual(results["psscan"][0]["PID"], 456)
         self.assertEqual(results["psscan"][0]["ImageFileName"], "hidden.exe")
+
+
+class MemProcFSFailureTests(unittest.TestCase):
+    def test_constructor_failure_releases_lock_and_next_session_opens(self):
+        lock = Lock()
+        runner = MemProcFSRunner(Path("synthetic.raw"))
+        for error in (RuntimeError("invalid synthetic dump"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                with (
+                    patch.object(memprocfs_runner, "_VMM_LOCK", lock),
+                    patch.dict(sys.modules, {"memprocfs": types.SimpleNamespace(Vmm=lambda *_args: None)}),
+                    patch.object(sys.modules["memprocfs"], "Vmm", side_effect=error),
+                ):
+                    with self.assertRaises(type(error)):
+                        with runner:
+                            self.fail("failed initialization must not enter the body")
+                self.assertFalse(runner._lock_acquired)
+                self.assertTrue(lock.acquire(blocking=False))
+                lock.release()
+        with (
+            patch.object(memprocfs_runner, "_VMM_LOCK", lock),
+            patch.dict(sys.modules, {"memprocfs": types.SimpleNamespace(Vmm=FakeVmm)}),
+        ):
+            with MemProcFSRunner(Path("synthetic.raw")):
+                self.assertTrue(lock.locked())
+        self.assertFalse(lock.locked())
+
+    def test_known_size_incomplete_copy_fails_and_removes_partial_file(self):
+        runner = MemProcFSRunner(Path("synthetic.raw"))
+        runner._vmm = types.SimpleNamespace(vfs=types.SimpleNamespace(
+            read=lambda _path, length, offset: b"abc"[offset:offset + length],
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "artifact.csv"
+            result = runner._copy_vfs_file("/synthetic.csv", target, {"size": 5})
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("Incomplete VFS read", result["error"])
+            self.assertIsNone(result["sha256"])
+            self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":

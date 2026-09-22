@@ -54,4 +54,4 @@ USER reverse:reverse
 WORKDIR /workspace
 ENV HOME=/tmp PATH=/usr/local/bin:/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONHASHSEED=0
 
-CMD ["sh", "-c", "mkdir -p /workspace/inputs /workspace/context /workspace/output /workspace/tools && exec sleep infinity"]
+CMD ["sleep", "infinity"]

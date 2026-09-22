@@ -277,12 +277,12 @@ def create_custom_rule(
         session.close()
 
 
-def _count_ungated(session) -> int:
+def _count_ungated(session, exclude_id: str | None = None) -> int:
     count = 0
     for row in session.scalars(
         select(CustomRule).where(CustomRule.enabled.is_(True)).where(CustomRule.compile_status == "ok")
     ):
-        if not (row.compiled_meta or {}).get("gated", True):
+        if row.id != exclude_id and not (row.compiled_meta or {}).get("gated", True):
             count += 1
     return count
 
@@ -329,6 +329,12 @@ def update_custom_rule(
         if row.compile_status != "ok":
             # Never let a rule that failed to compile become active.
             row.enabled = False
+        if row.enabled and not (row.compiled_meta or {}).get("gated", True):
+            if _count_ungated(session, exclude_id=rule_id) >= limits.MAX_UNFILTERED_RULES:
+                raise ValueError(
+                    f"At most {limits.MAX_UNFILTERED_RULES} rules without a literal "
+                    "prefilter can be enabled"
+                )
         row.updated_at = _utcnow()
         revision = _bump_revision(session)
         session.commit()

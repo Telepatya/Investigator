@@ -15,6 +15,7 @@ from typing import Any
 
 from app.config import case_uploads_path
 from app.memory.forensics import memprocfs_artifact_dir
+from app.memory.identity import is_memory_upload, memory_upload_key
 from app.memory.memprocfs_runner import (
     VFS_CHUNK_SIZE,
     _VMM_LOCK,
@@ -24,7 +25,6 @@ from app.memory.memprocfs_runner import (
     is_memprocfs_available,
 )
 
-MEMORY_EXTENSIONS = {".raw", ".dmp", ".mem", ".vmem", ".bin", ".img", ".lime", ".dd"}
 MAX_ARCHIVE_DEPTH = 6
 MAX_ARCHIVE_FILES = 1000
 MAX_MODULE_HASH_BYTES = 512 * 1024 * 1024
@@ -53,8 +53,8 @@ def list_memory_dumps(case_id: str) -> list[dict[str, Any]]:
         if path.is_file() and _looks_like_memory_dump(path):
             stat = path.stat()
             dumps.append({
-                "session_id": f"mem-{path.stem}",
-                "dump_stem": path.stem,
+                "session_id": f"mem-{memory_upload_key(path.name)}",
+                "dump_stem": memory_upload_key(path.name),
                 "filename": path.name,
                 "size": stat.st_size,
             })
@@ -230,6 +230,7 @@ def _collect_and_cache_process_handles(case_id: str, session, proc) -> None:
             timestamp=None,
             host=None,
             source="memory:handles",
+            upload_name=getattr(proc, "upload_name", None),
             category="handle",
             entity=proc.name,
             severity=severity,
@@ -468,18 +469,20 @@ def resolve_memory_dump(case_id: str, session_id: str) -> MemoryDumpRef:
         raise MemoryExplorerError("Not a memory-backed session")
     dump_stem = session_id[4:]
     uploads = case_uploads_path(case_id)
-    for path in uploads.iterdir():
-        if path.is_file() and path.stem == dump_stem and _looks_like_memory_dump(path):
-            return MemoryDumpRef(session_id, dump_stem, path.name, path, path.stat().st_size)
+    paths = [path for path in uploads.iterdir() if path.is_file() and _looks_like_memory_dump(path)]
+    exact = [path for path in paths if memory_upload_key(path.name) == dump_stem]
+    legacy = [path for path in paths if path.stem == dump_stem]
+    candidates = exact or legacy
+    if len(candidates) > 1:
+        raise MemoryExplorerError("Legacy memory session matches multiple uploads; re-ingest into separate cases before browsing it", 409)
+    if candidates:
+        path = candidates[0]
+        return MemoryDumpRef(session_id, dump_stem, path.name, path, path.stat().st_size)
     raise MemoryExplorerError("Original memory dump is unavailable", 404)
 
 
 def _looks_like_memory_dump(path: Path) -> bool:
-    if path.suffix.lower() in MEMORY_EXTENSIONS:
-        return True
-    # Velociraptor/collector outputs may retain a dump as "PhysicalMemory"
-    # without an extension; the session id is still mem-PhysicalMemory.
-    return path.suffix == "" and path.name.lower() in {"physicalmemory", "memory", "ram"}
+    return is_memory_upload(path)
 
 
 def sanitize_vfs_path(raw_path: str | None) -> str:
@@ -651,6 +654,8 @@ def _copy_process_range(proc, base: int, size: int, output: Path, metadata: dict
                 copied += len(data)
                 if len(data) < length:
                     break
+        if copied != size:
+            raise ValueError(f"Incomplete memory read: expected {size} bytes, received {copied}")
         return {
             **metadata,
             "local_path": str(output),
@@ -692,6 +697,8 @@ def _copy_vfs_file(vmm, source: str, output: Path, entry: Any | None) -> dict[st
                 copied += len(data)
                 if size_hint is None and len(data) < length:
                     break
+        if size_hint is not None and copied != size_hint:
+            raise ValueError(f"Incomplete VFS read: expected {size_hint} bytes, received {copied}")
     except Exception as exc:
         try:
             output.unlink(missing_ok=True)
@@ -732,6 +739,8 @@ def _write_vfs_to_zip(vmm, zf: zipfile.ZipFile, source: str, entry: Any | None, 
             copied += len(data)
             if size_hint is None and len(data) < length:
                 break
+    if size_hint is not None and copied != size_hint:
+        raise ValueError(f"Incomplete VFS read: expected {size_hint} bytes, received {copied}")
     return copied, hasher.hexdigest()
 
 
@@ -752,7 +761,7 @@ def _hash_process_range(proc, base: int, size: int) -> str | None:
             copied += len(data)
             if len(data) < length:
                 break
-        return hasher.hexdigest() if copied else None
+        return hasher.hexdigest() if copied == size else None
     except Exception:
         return None
 
@@ -865,6 +874,10 @@ def _entry_is_dir(entry: Any) -> bool:
 
 
 def _memory_result_matches_process(result, proc) -> bool:
+    upload = getattr(result, "upload_name", None)
+    process_upload = getattr(proc, "upload_name", None)
+    if upload or process_upload:
+        return bool(upload and upload == process_upload)
     data = result.data if isinstance(result.data, dict) else {}
     source = str(data.get("source") or "")
     result_session = str(data.get("session_id") or "")

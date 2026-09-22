@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -17,6 +17,7 @@ import {
   ConfirmDialog,
   DetailDrawer,
   EmptyState,
+  Modal,
   PageShell,
   PageTitle,
   SegmentedControl,
@@ -471,9 +472,10 @@ function RuleDetailDrawer({
 
           {rule.source === "builtin" && rule.editable.includes("severity") && (
             <div>
-              <label className="label">Severity</label>
+              <label className="label" htmlFor={`rule-severity-${ruleId}`}>Severity</label>
               <select
                 className="input"
+                id={`rule-severity-${ruleId}`}
                 value={rule.severity_override ?? ""}
                 disabled={severity.isPending}
                 onChange={(event) => severity.mutate(event.target.value)}
@@ -568,6 +570,7 @@ function RuleDetailDrawer({
 
 function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
   const [text, setText] = useState("");
+  const sourceId = useId();
   const importer = useMutation({
     mutationFn: () => rulesApi.import(text),
     onSuccess: onDone,
@@ -575,15 +578,17 @@ function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: () => 
   const result = importer.data;
 
   return (
-    <div className="modal-backdrop fixed inset-0 z-50 grid place-items-center p-4">
-      <div className="modal-panel w-full max-w-2xl rounded-2xl p-6">
+    <Modal title="Import Sigma rules" onClose={onClose} busy={importer.isPending} className="max-w-2xl">
         <h2 className="mb-1 text-lg font-semibold text-ink-50">Import Sigma rules</h2>
         <p className="mb-4 text-xs text-ink-400">
           Paste one or more Sigma rules separated by <code>---</code>. Rules are imported
           disabled so you can review them first, and each is reported on its own — one bad rule
           never blocks the rest.
         </p>
+        <label className="label" htmlFor={sourceId}>Sigma rules YAML</label>
         <textarea
+          id={sourceId}
+          autoFocus
           className="input min-h-64 font-mono text-xs"
           spellCheck={false}
           value={text}
@@ -591,7 +596,7 @@ function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: () => 
           placeholder="title: ...&#10;logsource: ...&#10;detection: ..."
         />
         {result && (
-          <div className="mt-3 space-y-2 text-xs">
+          <div className="mt-3 space-y-2 text-xs" role="status" aria-live="polite">
             <div className="text-emerald-400">Imported {result.imported.length} rule(s).</div>
             {result.rejected.map((item) => (
               <div key={item.index} className="text-sev-critical">
@@ -601,10 +606,10 @@ function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: () => 
           </div>
         )}
         {importer.error && (
-          <div className="mt-3 text-sm text-sev-critical">{String(importer.error)}</div>
+          <div className="mt-3 text-sm text-sev-critical" role="alert">{String(importer.error)}</div>
         )}
         <div className="mt-4 flex justify-end gap-2">
-          <button className="btn-ghost" onClick={onClose}>
+          <button className="btn-ghost" disabled={importer.isPending} onClick={onClose}>
             Close
           </button>
           <button
@@ -615,7 +620,6 @@ function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: () => 
             {importer.isPending ? "Importing…" : "Import"}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Binary, Box, ExternalLink, Link2, Plus, ShieldAlert, Trash2, X } from "lucide-react";
+import { Binary, Box, Link2, Plus, ShieldAlert, Trash2, X } from "lucide-react";
 import { api } from "../lib/api";
 import type { ReverseProject } from "../lib/types";
-import { ConfirmDialog, EmptyState, PageShell, PageTitle, Spinner } from "../components/common";
+import { ConfirmDialog, EmptyState, Modal, PageShell, PageTitle, Spinner } from "../components/common";
 import { fmtRelative } from "../lib/ui";
 
 const STATUS: Record<string, string> = {
@@ -98,20 +98,18 @@ export default function ReversePage({ caseId: fixedCaseId }: { caseId?: string }
       {pendingDelete && <ConfirmDialog title="Delete Reverse workspace?" danger busy={remove.isPending} confirmLabel="Delete workspace" message={<>All artifacts, reports, chat, and local audit data for <strong>{pendingDelete.name}</strong> will be removed.</>} onConfirm={() => remove.mutate(pendingDelete.id)} onClose={() => setPendingDelete(null)} />}
 
       {showCreate && (
-        <div className="modal-backdrop fixed inset-0 z-50 grid place-items-center p-4">
-          <div className="modal-panel w-full max-w-lg rounded-2xl p-6">
-            <div className="mb-4 flex items-center justify-between"><h2 className="text-lg font-semibold text-ink-50">New Reverse workspace</h2><button className="text-ink-400" onClick={() => setShowCreate(false)}><X size={18} /></button></div>
+        <Modal title="New Reverse workspace" onClose={() => setShowCreate(false)} busy={create.isPending}>
+            <div className="mb-4 flex items-center justify-between"><h2 className="text-lg font-semibold text-ink-50">New Reverse workspace</h2><button aria-label="Close new workspace" className="text-ink-400" onClick={() => setShowCreate(false)}><X size={18} /></button></div>
             <div className="space-y-4">
-              <div><label className="label">Workspace name</label><input className="input" autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Suspicious loader triage" /></div>
-              <div><label className="label">Description</label><textarea className="input min-h-20" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Sample source, scope, and analyst context" /></div>
+              <div><label className="label" htmlFor="new-workspace-name">Workspace name</label><input id="new-workspace-name" className="input" autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Suspicious loader triage" /></div>
+              <div><label className="label" htmlFor="new-workspace-description">Description</label><textarea id="new-workspace-description" className="input min-h-20" value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Sample source, scope, and analyst context" /></div>
               {caseId ? <div className="rounded-xl bg-accent-blue/10 p-3 text-sm text-accent-blue"><Link2 size={14} className="mr-2 inline" />Linked to case {caseId}</div> : (
-                <div><label className="label">Linked case (optional)</label><select className="input" value={linkedCaseId} onChange={(e) => setLinkedCaseId(e.target.value)}><option value="">Standalone workspace</option>{cases.data?.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.id})</option>)}</select></div>
+                <div><label className="label" htmlFor="new-workspace-case">Linked case (optional)</label><select id="new-workspace-case" className="input" value={linkedCaseId} onChange={(e) => setLinkedCaseId(e.target.value)}><option value="">Standalone workspace</option>{cases.data?.map((item) => <option key={item.id} value={item.id}>{item.name} ({item.id})</option>)}</select></div>
               )}
               {create.error && <div className="text-sm text-sev-critical">{String(create.error)}</div>}
               <div className="flex justify-end gap-2"><button className="btn-ghost" onClick={() => setShowCreate(false)}>Cancel</button><button className="btn-primary" disabled={!name.trim() || create.isPending} onClick={() => create.mutate()}>{create.isPending ? "Creating…" : "Create workspace"}</button></div>
             </div>
-          </div>
-        </div>
+        </Modal>
       )}
     </PageShell>
   );

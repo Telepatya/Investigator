@@ -14,6 +14,7 @@ from google.genai import types as genai_types
 
 from app.config import get_api_key
 from app.llm.base import LLMProvider
+from app.llm.endpoints import provider_http_client, validate_endpoint
 from app.models.schemas import ModelInfo
 
 
@@ -63,9 +64,14 @@ class GeminiProvider(LLMProvider):
         key = get_api_key("gemini")
         if not key:
             raise ValueError("Gemini API key not configured")
+        base_url = validate_endpoint("gemini")
         return genai.Client(
-            api_key=key,
-            http_options=genai_types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS),
+            api_key=key, vertexai=False,
+            http_options=genai_types.HttpOptions(
+                timeout=GEMINI_REQUEST_TIMEOUT_MS, base_url=base_url,
+                httpx_async_client=provider_http_client("gemini", base_url),
+                client_args={"trust_env": False, "follow_redirects": False},
+            ),
         )
 
     def _model_name(self) -> str:

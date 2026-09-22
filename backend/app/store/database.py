@@ -35,6 +35,8 @@ class Event(Base):
     timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     host: Mapped[str | None] = mapped_column(String(256), index=True)
     source: Mapped[str] = mapped_column(String(128), index=True)
+    # Server-assigned upload basename; display source may repeat across archives.
+    upload_name: Mapped[str | None] = mapped_column(String(256), index=True)
     category: Mapped[str] = mapped_column(String(64), index=True)
     entity: Mapped[str | None] = mapped_column(String(512), index=True)
     severity: Mapped[str] = mapped_column(String(16), default="info", index=True)
@@ -56,6 +58,7 @@ class Process(Base):
     cmdline: Mapped[str | None] = mapped_column(Text)
     start_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     session_id: Mapped[str] = mapped_column(String(64), default="default", index=True)
+    upload_name: Mapped[str | None] = mapped_column(String(256), index=True)
     flags: Mapped[list] = mapped_column(JSON, default=list)
     severity: Mapped[str] = mapped_column(String(16), default="info")
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -79,6 +82,7 @@ class MemoryResult(Base):
     __tablename__ = "memory_results"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    upload_name: Mapped[str | None] = mapped_column(String(256), index=True)
     plugin: Mapped[str] = mapped_column(String(64), index=True)
     pid: Mapped[int | None] = mapped_column(Integer, index=True)
     process_name: Mapped[str | None] = mapped_column(String(256))
@@ -276,6 +280,17 @@ def _initialize_schema(path: Path, engine: Engine) -> None:
         existing_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(events)")}
         if "severity_reason" not in existing_cols:
             conn.exec_driver_sql("ALTER TABLE events ADD COLUMN severity_reason TEXT")
+        if "upload_name" not in existing_cols:
+            conn.exec_driver_sql("ALTER TABLE events ADD COLUMN upload_name TEXT")
+        process_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(processes)")}
+        if "upload_name" not in process_cols:
+            conn.exec_driver_sql("ALTER TABLE processes ADD COLUMN upload_name TEXT")
+        conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_events_upload_name ON events (upload_name)")
+        conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_processes_upload_name ON processes (upload_name)")
+        memory_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(memory_results)")}
+        if "upload_name" not in memory_cols:
+            conn.exec_driver_sql("ALTER TABLE memory_results ADD COLUMN upload_name TEXT")
+        conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_memory_results_upload_name ON memory_results (upload_name)")
         report_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(reports)")}
         if "timeline_entries" not in report_cols:
             conn.exec_driver_sql("ALTER TABLE reports ADD COLUMN timeline_entries JSON DEFAULT '[]'")

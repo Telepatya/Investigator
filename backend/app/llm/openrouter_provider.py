@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-import httpx
 from openai import AsyncOpenAI
 
 from app.config import get_api_key
 from app.llm.base import LLMProvider
+from app.llm.endpoints import provider_http_client, validate_endpoint
 from app.models.schemas import ModelInfo
 
 
@@ -25,7 +25,7 @@ class OpenRouterProvider(LLMProvider):
 
     @property
     def base_url(self) -> str:
-        return self.config.llm.openrouter_base_url.rstrip("/")
+        return validate_endpoint("openrouter", self.config.llm.openrouter_base_url)
 
     def _api_key(self) -> str:
         key = get_api_key("openrouter")
@@ -34,9 +34,11 @@ class OpenRouterProvider(LLMProvider):
         return key
 
     def _client(self) -> AsyncOpenAI:
+        base_url = self.base_url
         return AsyncOpenAI(
             api_key=self._api_key(),
-            base_url=self.base_url,
+            base_url=base_url,
+            http_client=provider_http_client("openrouter", base_url),
             default_headers={"X-OpenRouter-Title": "Investigator"},
         )
 
@@ -61,7 +63,7 @@ class OpenRouterProvider(LLMProvider):
 
     async def test_connection(self) -> tuple[bool, str]:
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with provider_http_client("openrouter", self.base_url, timeout=30.0) as client:
                 response = await client.get(
                     f"{self.base_url}/key",
                     headers={"Authorization": f"Bearer {self._api_key()}"},

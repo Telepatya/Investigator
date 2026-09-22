@@ -2,41 +2,9 @@ from __future__ import annotations
 
 # ruff: noqa: E402
 
-import sys
 import types
 import unittest
 from unittest.mock import patch
-
-
-class _BaseModel:
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-
-sys.modules.setdefault("keyring", types.SimpleNamespace(
-    get_password=lambda *_a, **_k: None,
-    set_password=lambda *_a, **_k: None,
-    delete_password=lambda *_a, **_k: None,
-    errors=types.SimpleNamespace(PasswordDeleteError=Exception),
-))
-sys.modules.setdefault("pydantic", types.SimpleNamespace(
-    BaseModel=_BaseModel,
-    Field=lambda default=None, default_factory=None, **_k: (
-        default_factory() if default_factory else default
-    ),
-))
-_google_mod = types.ModuleType("google")
-_genai_mod = types.ModuleType("google.genai")
-_genai_types_mod = types.ModuleType("google.genai.types")
-_genai_types_mod.GenerateContentConfig = lambda **_k: None
-_genai_types_mod.HttpOptions = lambda **_k: None
-_genai_mod.types = _genai_types_mod
-_genai_mod.Client = lambda **_k: None
-_google_mod.genai = _genai_mod
-sys.modules.setdefault("google", _google_mod)
-sys.modules.setdefault("google.genai", _genai_mod)
-sys.modules.setdefault("google.genai.types", _genai_types_mod)
 
 from app.llm.gemini_provider import (
     GEMINI_REQUEST_TIMEOUT_MS,

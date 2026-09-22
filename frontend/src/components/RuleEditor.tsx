@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { CheckCircle2, Plus, X, XCircle } from "lucide-react";
 import { rulesApi } from "../lib/api";
 import type { RuleValidateResponse } from "../lib/types";
-import { SegmentedControl, Spinner } from "./common";
+import { Modal, SegmentedControl, Spinner } from "./common";
 
 type Mode = "form" | "yaml";
 
@@ -106,6 +106,8 @@ export function RuleEditor({
   onSaved: () => void;
 }) {
   const editing = Boolean(ruleId);
+  const editorId = useId();
+  const title = editing ? "Edit Sigma rule" : "New Sigma rule";
   const existing = useQuery({
     queryKey: ["rule", ruleId],
     queryFn: () => rulesApi.get(ruleId as string),
@@ -157,6 +159,8 @@ export function RuleEditor({
     onSuccess: onSaved,
   });
 
+  const busy = save.isPending || validate.isPending;
+
   const setCondition = (index: number, patch: Partial<Condition>) =>
     setDraft((current) => ({
       ...current,
@@ -166,13 +170,12 @@ export function RuleEditor({
     }));
 
   return (
-    <div className="modal-backdrop fixed inset-0 z-50 grid place-items-center p-4">
-      <div className="modal-panel flex max-h-[92vh] w-full max-w-3xl flex-col rounded-2xl p-6">
+    <Modal title={title} onClose={onClose} busy={busy} className="flex max-w-3xl flex-col">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-lg font-semibold text-ink-50">
-            {editing ? "Edit Sigma rule" : "New Sigma rule"}
+            {title}
           </h2>
-          <button className="text-ink-400" onClick={onClose}>
+          <button className="text-ink-400" aria-label="Close rule editor" disabled={busy} onClick={onClose}>
             <X size={18} />
           </button>
         </div>
@@ -207,10 +210,11 @@ export function RuleEditor({
                   <div className="space-y-4">
                     <div className="grid gap-4 sm:grid-cols-2">
                       <div>
-                        <label className="label">Title</label>
+                        <label className="label" htmlFor={`${editorId}-title`}>Title</label>
                         <input
                           className="input"
                           autoFocus
+                          id={`${editorId}-title`}
                           value={draft.title}
                           onChange={(event) =>
                             setDraft({ ...draft, title: event.target.value })
@@ -219,9 +223,10 @@ export function RuleEditor({
                         />
                       </div>
                       <div>
-                        <label className="label">Severity</label>
+                        <label className="label" htmlFor={`${editorId}-severity`}>Severity</label>
                         <select
                           className="input"
+                          id={`${editorId}-severity`}
                           value={draft.level}
                           onChange={(event) => setDraft({ ...draft, level: event.target.value })}
                         >
@@ -235,10 +240,11 @@ export function RuleEditor({
                     </div>
 
                     <div>
-                      <label className="label">Description</label>
+                      <label className="label" htmlFor={`${editorId}-description`}>Description</label>
                       <textarea
                         className="input min-h-16"
-                        value={draft.description}
+                        id={`${editorId}-description`}
+                          value={draft.description}
                         onChange={(event) =>
                           setDraft({ ...draft, description: event.target.value })
                         }
@@ -248,9 +254,10 @@ export function RuleEditor({
 
                     <div className="grid gap-4 sm:grid-cols-2">
                       <div>
-                        <label className="label">Log source</label>
+                        <label className="label" htmlFor={`${editorId}-logsource`}>Log source</label>
                         <select
                           className="input"
+                          id={`${editorId}-logsource`}
                           value={draft.logsource}
                           onChange={(event) =>
                             setDraft({ ...draft, logsource: event.target.value })
@@ -264,9 +271,10 @@ export function RuleEditor({
                         </select>
                       </div>
                       <div>
-                        <label className="label">ATT&CK technique (optional)</label>
+                        <label className="label" htmlFor={`${editorId}-technique`}>ATT&CK technique (optional)</label>
                         <input
                           className="input"
+                          id={`${editorId}-technique`}
                           value={draft.technique}
                           onChange={(event) =>
                             setDraft({ ...draft, technique: event.target.value })
@@ -278,7 +286,7 @@ export function RuleEditor({
 
                     <div>
                       <div className="mb-2 flex items-center justify-between">
-                        <label className="label mb-0">Match conditions (all must hold)</label>
+                        <span className="label mb-0">Match conditions (all must hold)</span>
                         <button
                           className="btn-ghost text-xs"
                           onClick={() =>
@@ -300,6 +308,7 @@ export function RuleEditor({
                             <div className="flex flex-wrap gap-2">
                               <select
                                 className="input flex-1"
+                                aria-label={`Condition ${index + 1} field`}
                                 value={condition.field}
                                 onChange={(event) =>
                                   setCondition(index, { field: event.target.value })
@@ -313,6 +322,7 @@ export function RuleEditor({
                               </select>
                               <select
                                 className="input flex-1"
+                                aria-label={`Condition ${index + 1} modifier`}
                                 value={condition.modifier}
                                 onChange={(event) =>
                                   setCondition(index, { modifier: event.target.value })
@@ -327,6 +337,7 @@ export function RuleEditor({
                               {draft.conditions.length > 1 && (
                                 <button
                                   className="btn-ghost text-sev-critical"
+                                  aria-label={`Remove condition ${index + 1}`}
                                   onClick={() =>
                                     setDraft({
                                       ...draft,
@@ -341,6 +352,7 @@ export function RuleEditor({
                             <textarea
                               className="input mt-2 min-h-16 font-mono text-xs"
                               spellCheck={false}
+                              aria-label={`Condition ${index + 1} values`}
                               value={condition.values}
                               onChange={(event) =>
                                 setCondition(index, { values: event.target.value })
@@ -358,6 +370,8 @@ export function RuleEditor({
                   className="input min-h-[420px] w-full font-mono text-xs"
                   spellCheck={false}
                   wrap="off"
+                  aria-label="Sigma rule YAML"
+                  autoFocus={editing}
                   value={yaml}
                   onChange={(event) => {
                     setYaml(event.target.value);
@@ -367,7 +381,7 @@ export function RuleEditor({
               )}
 
               {validation && (
-                <div className="mt-4 space-y-2 text-xs">
+                <div className="mt-4 space-y-2 text-xs" role="status" aria-live="polite">
                   {validation.ok ? (
                     <div className="flex items-start gap-2 rounded-xl border border-emerald-400/25 bg-emerald-400/10 p-3 text-emerald-300">
                       <CheckCircle2 size={15} className="mt-0.5 shrink-0" />
@@ -402,26 +416,26 @@ export function RuleEditor({
               )}
 
               {save.error && (
-                <div className="mt-3 whitespace-pre-wrap text-sm text-sev-critical">
+                <div className="mt-3 whitespace-pre-wrap text-sm text-sev-critical" role="alert">
                   {String(save.error)}
                 </div>
               )}
             </div>
 
             <div className="mt-4 flex flex-wrap justify-end gap-2 border-t border-white/5 pt-4">
-              <button className="btn-ghost" onClick={onClose}>
+              <button className="btn-ghost" disabled={busy} onClick={onClose}>
                 Cancel
               </button>
               <button
                 className="btn-ghost"
-                disabled={validate.isPending || !source.trim()}
+                disabled={busy || !source.trim()}
                 onClick={() => validate.mutate()}
               >
                 {validate.isPending ? "Checking…" : "Validate"}
               </button>
               <button
                 className="btn-primary"
-                disabled={save.isPending || !source.trim()}
+                disabled={busy || !source.trim()}
                 onClick={() => save.mutate()}
               >
                 {save.isPending ? "Saving…" : editing ? "Save changes" : "Create rule"}
@@ -429,7 +443,6 @@ export function RuleEditor({
             </div>
           </>
         )}
-      </div>
-    </div>
+    </Modal>
   );
 }

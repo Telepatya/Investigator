@@ -138,7 +138,7 @@ class ReverseSandboxManager:
                 pids_limit=cfg.sandbox_pids_limit,
                 tmpfs={
                     "/workspace": (
-                        "rw,nosuid,nodev,noexec,uid=10001,gid=10001,mode=0700,"
+                        "rw,nosuid,nodev,noexec,uid=0,gid=10001,mode=0750,"
                         f"size={cfg.sandbox_memory_limit_mb // 2}m"
                     ),
                     "/tmp": "rw,nosuid,nodev,noexec,uid=10001,gid=10001,mode=0700,size=64m",
@@ -168,25 +168,22 @@ class ReverseSandboxManager:
                 protocol_version = (protocol_output or b"").decode(
                     "utf-8", errors="replace"
                 ).strip()
-                if protocol.exit_code != 0 or protocol_version != "2":
+                if protocol.exit_code != 0 or protocol_version != "3":
                     raise SandboxUnavailable(
                         "Reverse sandbox image is outdated or incompatible; "
                         "rebuild investigator-reverse:latest"
                     )
                 prepared = container.exec_run(
-                    [
-                        "mkdir", "-p", "/workspace/inputs", "/workspace/context",
-                        "/workspace/output", "/workspace/tools",
-                    ],
-                    user="reverse",
+                    ["reverse-stage", "prepare"],
+                    user="0:10001",
                     workdir="/workspace",
                 )
                 if prepared.exit_code != 0:
                     raise SandboxUnavailable("Reverse sandbox workspace could not be prepared")
                 self._copy_inputs(container, project_id)
                 sealed_inputs = container.exec_run(
-                    ["chmod", "0500", "/workspace/inputs", "/workspace/context"],
-                    user="reverse",
+                    ["chmod", "0550", "/workspace/inputs", "/workspace/context"],
+                    user="0:10001",
                     workdir="/workspace",
                 )
                 if sealed_inputs.exit_code != 0:
@@ -224,7 +221,7 @@ class ReverseSandboxManager:
                             "reverse-stage", "write", namespace, sandbox_name,
                             str(offset), encoded,
                         ],
-                        user="reverse",
+                        user="0:10001",
                         workdir="/workspace",
                     )
                     if result.exit_code != 0:
@@ -237,7 +234,7 @@ class ReverseSandboxManager:
                     "reverse-stage", "seal", namespace, sandbox_name,
                     str(artifact.file_size), artifact.sha256,
                 ],
-                user="reverse",
+                user="0:10001",
                 workdir="/workspace",
             )
             if sealed.exit_code != 0:

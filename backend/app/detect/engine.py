@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Text, cast, or_, select
+from sqlalchemy import Text, cast, delete as sqldelete, or_, select, update as sqlupdate
 
 from app.detect.rules import (
     DGA_MIN_ENTROPY,
@@ -29,7 +29,7 @@ from app.detect.rules import (
     SUSPICIOUS_TLDS,
     TASK_UPDATER_MASQUERADES,
 )
-from app.detect.manual import apply_manual_findings
+from app.detect.manual import apply_manual_findings, restore_manual_event_severities
 from app.detect.overrides import (
     apply_overrides,
     get_benign_keys,
@@ -2959,10 +2959,22 @@ def _corroborate_findings(session, processes, disabled: set[str], benign: set[st
     return changed
 
 
-def run_detections_sync(case_id: str) -> int:
-    """Run all detection heuristics for a case. Returns number of findings added."""
+def run_detections_sync(case_id: str, *, rebuild: bool = False) -> int:
+    """Commit a complete detection run atomically, retaining prior results on error."""
     session = case_store.get_session(case_id)
     try:
+        if rebuild:
+            restore_manual_event_severities(session)
+            session.execute(sqldelete(Finding))
+            session.execute(
+                sqlupdate(Event)
+                .where(
+                    Event.severity_reason.like("Detection:%")
+                    | Event.severity_reason.like("Context:%")
+                    | Event.severity_reason.like("Flagged-entity match:%")
+                )
+                .values(severity="info", severity_reason=None)
+            )
         total_started = time.perf_counter()
         phase_started = total_started
 
@@ -3245,14 +3257,14 @@ def run_detections_sync(case_id: str) -> int:
             if SEVERITY_RANK[severity] > SEVERITY_RANK.get(proc.severity, 0):
                 proc.severity = severity
 
-        session.commit()
+        session.flush()
         mark_phase("process heuristics", processes=len(processes), findings=len(existing) - before)
 
         # --- MemoryResult bridge ---
         # Memory analysis can produce high-confidence indicators even when no
         # event-log fields exist to match, so promote those rows into Findings.
         _promote_memory_results(session, existing)
-        session.commit()
+        session.flush()
         mark_phase("memory promotion", findings=len(existing) - before)
 
         # --- Event heuristics ---
@@ -4117,6 +4129,9 @@ def run_detections_sync(case_id: str) -> int:
             case_id, time.perf_counter() - total_started, after - before, after,
         )
         return after - before
+    except BaseException:
+        session.rollback()
+        raise
     finally:
         session.close()
 

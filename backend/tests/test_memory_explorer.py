@@ -462,7 +462,8 @@ class MemoryExplorerTests(unittest.TestCase):
         dumps = explorer.list_memory_dumps("deadbeef")
 
         self.assertEqual(dump.filename, "PhysicalMemory")
-        self.assertIn("mem-PhysicalMemory", {row["session_id"] for row in dumps})
+        row = next(row for row in dumps if row["filename"] == "PhysicalMemory")
+        self.assertEqual(explorer.resolve_memory_dump("deadbeef", row["session_id"]).filename, "PhysicalMemory")
 
     def test_dd_memory_upload_resolves_as_dump(self) -> None:
         (self.uploads / "memory.dd").write_bytes(b"raw")
@@ -471,7 +472,8 @@ class MemoryExplorerTests(unittest.TestCase):
         dumps = explorer.list_memory_dumps("deadbeef")
 
         self.assertEqual(dump.filename, "memory.dd")
-        self.assertIn("mem-memory", {row["session_id"] for row in dumps})
+        row = next(row for row in dumps if row["filename"] == "memory.dd")
+        self.assertEqual(explorer.resolve_memory_dump("deadbeef", row["session_id"]).filename, "memory.dd")
 
     def test_vfs_folder_archive_includes_manifest_and_file(self) -> None:
         archive = explorer.archive_vfs_selection("deadbeef", "mem-dump", ["/sys"])
@@ -481,6 +483,47 @@ class MemoryExplorerTests(unittest.TestCase):
             manifest = json.loads(zf.read("manifest.json"))
         self.assertEqual(manifest[0]["source"], "/sys/version.txt")
         self.assertEqual(manifest[0]["status"], "ok")
+
+
+class MemoryExtractionCompletenessTests(unittest.TestCase):
+    def test_incomplete_module_range_has_no_complete_image_hash(self):
+        process = types.SimpleNamespace(memory=_FakeMemory({0x1000: b"MZ"}))
+        self.assertIsNone(explorer._hash_process_range(process, 0x1000, 8))
+        self.assertIsNotNone(explorer._hash_process_range(process, 0x1000, 2))
+
+    def test_short_process_range_is_not_published_as_complete(self):
+        process = types.SimpleNamespace(memory=_FakeMemory({0x1000: b"MZ"}))
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "image.extracted"
+            with self.assertRaisesRegex(explorer.MemoryExplorerError, "Incomplete memory read"):
+                explorer._copy_process_range(process, 0x1000, 8, output, {})
+            self.assertFalse(output.exists())
+
+    def test_known_size_short_vfs_file_is_removed(self):
+        vmm = types.SimpleNamespace(vfs=_FakeVfs())
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "version.extracted"
+            with self.assertRaisesRegex(explorer.MemoryExplorerError, "Incomplete VFS read"):
+                explorer._copy_vfs_file(vmm, "/sys/version.txt", output, {"size": 10})
+            self.assertFalse(output.exists())
+
+    def test_unknown_size_vfs_file_still_completes_at_eof(self):
+        vmm = types.SimpleNamespace(vfs=_FakeVfs())
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "version.extracted"
+            result = explorer._copy_vfs_file(vmm, "/sys/version.txt", output, None)
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["size"], 5)
+            self.assertEqual(output.read_bytes(), b"build")
+
+    def test_short_archive_member_reports_failure(self):
+        vmm = types.SimpleNamespace(vfs=_FakeVfs())
+        with tempfile.TemporaryDirectory() as directory:
+            with zipfile.ZipFile(Path(directory) / "selection.zip", "w") as archive:
+                with self.assertRaisesRegex(ValueError, "Incomplete VFS read"):
+                    explorer._write_vfs_to_zip(
+                        vmm, archive, "/sys/version.txt", {"size": 10}, "sys/version.txt"
+                    )
 
 
 if __name__ == "__main__":

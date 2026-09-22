@@ -1,7 +1,6 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 sqlalchemy>=2.0.36
-aiosqlite>=0.20.0
 pydantic>=2.10.0
 # Sigma rule parsing for analyst-authored detection rules. PyYAML is declared
 # explicitly (it was previously only a transitive dependency) because the rules
@@ -11,6 +10,10 @@ PyYAML>=6.0.2
 pydantic-settings>=2.6.0
 python-multipart>=0.0.17
 httpx>=0.28.0
+# Security floor for the HTTP transport's transitive dependency.
+anyio==4.14.2
+# Runtime deadlines for analyst-authored regular expressions.
+regex>=2026.9.10
 authlib>=1.3.2,<2
 keyring>=25.5.0
 cryptography>=50.0.0

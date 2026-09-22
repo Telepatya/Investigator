@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 FRONTEND_BUILD_CONFIG_FILES = (
     "index.html", "package.json", "package-lock.json",
     "vite.config.ts", "tsconfig.json", "tsconfig.app.json", "tsconfig.node.json",
+    "tailwind.config.js", "postcss.config.js",
 )
 
 
@@ -150,9 +151,10 @@ def frontend_source_digest() -> str:
     when the source actually changed."""
     h = hashlib.sha256()
     inputs: list[Path] = []
-    src = FRONTEND / "src"
-    if src.exists():
-        inputs.extend(p for p in src.rglob("*") if p.is_file())
+    for directory in ("src", "public"):
+        src = FRONTEND / directory
+        if src.exists():
+            inputs.extend(p for p in src.rglob("*") if p.is_file())
     for name in FRONTEND_BUILD_CONFIG_FILES:
         p = FRONTEND / name
         if p.is_file():

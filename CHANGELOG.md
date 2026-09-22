@@ -43,6 +43,25 @@ migration, and verification details live in `docs/releases/`.
 
 ### Fixed
 
+- Enforce upload request byte limits before multipart spooling, including chunked
+  transfer, and require HTTPS for hosted non-loopback provider gateways.
+
+- Custom rule matching now has an enforced runtime deadline, and edits/enabling
+  respect the same unfiltered-rule quota as creation.
+- Upload attribution separates overlapping archive sources and same-stem memory
+  dumps. Legacy ambiguous deletion/replacement fails safely; see
+  [migration guidance](docs/MIGRATIONS.md#upload-attribution).
+- Same-name evidence replacement now atomically swaps file bytes with the purge
+  of prior derived rows, restores the original on setup/commit failure, and
+  bounds/coalesces stalled ingestion progress listeners.
+- Mobile navigation and modal keyboard access are available throughout the app;
+  the default page no longer requests third-party fonts.
+- Release archives include referenced requirements inputs, and frontend rebuild
+  caching tracks public assets and Tailwind/PostCSS configuration.
+- Patched AnyIO and pip are locked; unused Recharts/aiosqlite dependencies and
+  unused frontend imports were removed. The upstream diskcache advisory remains
+  tracked without suppressing dependency scans.
+
 - The backend failed to start with `ModuleNotFoundError: No module named 'sigma'`
   because `pysigma` was added to `requirements.in` without regenerating the lock
   files, and installs run `pip --require-hashes --no-deps` against the locks. All

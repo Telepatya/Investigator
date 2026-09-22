@@ -1,7 +1,7 @@
 import { Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, Outlet, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { Binary, Clock, Folder, Moon, ScrollText, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
+import { Binary, Clock, Folder, Menu, Moon, ScrollText, Search, Settings, ShieldCheck, Sun, X } from "lucide-react";
 import { clsx } from "clsx";
 import { CodeBlock, DetailDrawer, IconButton, SeverityBadge, Spinner } from "./components/common";
 import { FlagAsFinding } from "./components/FlagAsFinding";
@@ -29,6 +29,7 @@ export default function App() {
   const inCase = loc.pathname.startsWith("/cases/");
   const caseId = inCase ? loc.pathname.split("/")[2] : "";
   const [searchOpen, setSearchOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [selectedEvent, setSelectedEvent] = useState<EventRow | null>(null);
   const q = search.trim();
@@ -39,6 +40,10 @@ export default function App() {
     queryFn: ({ signal }) => api.getEvents(caseId, { q, limit: 8 }, signal),
     enabled: searchOpen && Boolean(caseId) && q.length >= 2,
   });
+
+  useEffect(() => {
+    setMenuOpen(false);
+  }, [loc.pathname]);
 
   useEffect(() => {
     setSearchOpen(false);
@@ -89,11 +94,18 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 lg:hidden">
+            <IconButton label={menuOpen ? "Close navigation" : "Open navigation"} aria-expanded={menuOpen} aria-controls="mobile-navigation" onClick={() => setMenuOpen(!menuOpen)}>
+              {menuOpen ? <X size={18} /> : <Menu size={18} />}
+            </IconButton>
             <IconButton label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"} onClick={toggleTheme}>
               {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
             </IconButton>
           </div>
         </div>
+        {menuOpen && <nav id="mobile-navigation" aria-label="Main navigation" className="surface mt-2 space-y-2 p-4 lg:hidden" onKeyDown={(event) => { if (event.key === "Escape") setMenuOpen(false); }}>
+          {NAV.map((item) => <SidebarItem key={item.label} item={item} pathname={loc.pathname} />)}
+          {auth?.enabled && <button className="btn-ghost w-full" onClick={() => void logout()}>Log out</button>}
+        </nav>}
       </aside>
 
       <div className="flex min-h-screen flex-1 flex-col pt-24 lg:ml-[260px] lg:pt-5">

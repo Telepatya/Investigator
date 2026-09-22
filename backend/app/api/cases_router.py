@@ -9,11 +9,12 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Annotated
 
 import aiofiles
-from fastapi import APIRouter, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
-from sqlalchemy import delete as sqldelete, func, select, update as sqlupdate
+from sqlalchemy import func, select
 
 from app.api.security import authorize_ws
 from app.config import (
@@ -41,7 +42,7 @@ from app.memory.explorer import (
 )
 from app.reverse.handoff import ProcessHandoffError, handoff_process_to_reverse
 from app.reverse.schemas import ReverseProcessHandoffResponse
-from app.models.schemas import CaseCreate
+from app.models.schemas import CaseCreate, FindingBenignUpdate, ManualFindingCreate, RuleDisabledUpdate, VFSArchiveRequest
 from app.store import cases as case_store
 from app.store.database import Event, Finding, MemoryResult
 from app.store.operations import coordinator
@@ -226,6 +227,67 @@ def _truncate_file(path: Path, size: int) -> None:
         handle.truncate(size)
 
 
+def _schedule_background(coroutine) -> asyncio.Task:
+    """Create a background task without leaking a coroutine on setup failure."""
+    try:
+        return asyncio.create_task(coroutine)
+    except Exception:
+        coroutine.close()
+        raise
+
+
+async def _finish_replacement(
+    case_id: str,
+    destination: Path,
+    staged: Path,
+    ingestion_task: asyncio.Task,
+) -> None:
+    """Wait for a replacement worker even if its request is cancelled.
+
+    ``asyncio.to_thread`` cannot stop its thread when the awaiting request is
+    cancelled. Shielding and retaining the worker keeps the case coordinator
+    locked until the file/database transaction reaches a final state. Ingestion
+    is cancelled only when that transaction failed; a committed replacement is
+    still ingested after the cancelled request releases the coordinator.
+    """
+    worker_coroutine = asyncio.to_thread(
+        evidence_store.replace_file_data,
+        case_id,
+        destination,
+        staged,
+    )
+    try:
+        worker = asyncio.create_task(worker_coroutine)
+    except BaseException:
+        worker_coroutine.close()
+        ingestion_task.cancel()
+        await asyncio.gather(ingestion_task, return_exceptions=True)
+        raise
+    cancellation: asyncio.CancelledError | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except BaseException:
+            break
+
+    try:
+        worker.result()
+    except BaseException:
+        ingestion_task.cancel()
+        await asyncio.gather(ingestion_task, return_exceptions=True)
+        if cancellation is not None:
+            raise cancellation
+        raise
+    # The replacement now owns a full rebuild obligation. Register it only
+    # after the swap succeeds so a failed replacement cannot erase or alter
+    # detection work left pending by an earlier ingestion.
+    manager.require_detection_rebuild(case_id, full=True)
+    if cancellation is not None:
+        raise cancellation
+
+
 async def _stage_upload(
     upload: UploadFile,
     target: Path,
@@ -262,6 +324,11 @@ async def upload_file(
 ) -> dict:
     validated_case_id = _validated_case_id(case_id)
     safe_name = _safe_upload_name(file.filename)
+    memory_options = {
+        "forensic_timeline": bool(mem_forensic_timeline),
+        "eventlogs": bool(mem_eventlogs),
+    }
+    replacement = False
     async with coordinator.run(validated_case_id, "evidence upload"):
         safe_name, dest = _upload_destination(validated_case_id, safe_name)
         _discard_chunk_upload(validated_case_id, safe_name)
@@ -270,24 +337,46 @@ async def upload_file(
         try:
             total = await asyncio.to_thread(_uploads_total_bytes, validated_case_id)
             replaced_size = await asyncio.to_thread(_file_size, dest)
+            if dest.exists():
+                replacement = True
+                try:
+                    await asyncio.to_thread(evidence_store.validate_purge_attribution, validated_case_id, dest)
+                except evidence_store.LegacyEvidenceAttributionError as exc:
+                    raise HTTPException(409, str(exc)) from exc
             await _stage_upload(
                 file,
                 staging,
                 existing_file_bytes=0,
                 other_case_bytes=max(total - replaced_size, 0),
             )
-            await asyncio.to_thread(os.replace, staging, dest)
-            committed = True
+            if replacement:
+                try:
+                    ingestion_task = _schedule_background(
+                        manager.run_ingestion(
+                            validated_case_id, dest, file_type, memory_options,
+                        )
+                    )
+                except Exception as exc:
+                    raise HTTPException(500, "Could not schedule evidence replacement") from exc
+                try:
+                    await _finish_replacement(
+                        validated_case_id, dest, staging, ingestion_task,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(500, "Evidence replacement failed") from exc
+                committed = True
+            else:
+                await asyncio.to_thread(os.replace, staging, dest)
+                committed = True
         finally:
             if not committed:
                 await asyncio.to_thread(_remove_partial, staging)
 
     # kick off ingestion in the background
-    memory_options = {
-        "forensic_timeline": bool(mem_forensic_timeline),
-        "eventlogs": bool(mem_eventlogs),
-    }
-    asyncio.create_task(manager.run_ingestion(validated_case_id, dest, file_type, memory_options))
+    if not replacement:
+        _schedule_background(manager.run_ingestion(validated_case_id, dest, file_type, memory_options))
     return {"ok": True, "filename": safe_name, "path": str(dest)}
 
 
@@ -308,6 +397,7 @@ async def upload_chunk(
     validated_case_id = _validated_case_id(case_id)
     safe_name = _safe_upload_name(filename)
     complete = False
+    replacement = False
     async with coordinator.run(validated_case_id, "chunked evidence upload"):
         safe_name, dest = _upload_destination(validated_case_id, safe_name)
         state_key = (validated_case_id, safe_name)
@@ -353,6 +443,12 @@ async def upload_chunk(
         try:
             total = await asyncio.to_thread(_uploads_total_bytes, validated_case_id)
             replaced_size = await asyncio.to_thread(_file_size, dest)
+            if dest.exists():
+                replacement = True
+                try:
+                    await asyncio.to_thread(evidence_store.validate_purge_attribution, validated_case_id, dest)
+                except evidence_store.LegacyEvidenceAttributionError as exc:
+                    raise HTTPException(409, str(exc)) from exc
             chunk_bytes = await _stage_upload(
                 file,
                 request_staging,
@@ -368,11 +464,38 @@ async def upload_chunk(
                 state.bytes_written,
             )
             if chunk_index + 1 == state.total_chunks:
-                try:
-                    await asyncio.to_thread(os.replace, state.part_path, dest)
-                except BaseException:
-                    await asyncio.to_thread(_truncate_file, state.part_path, state.bytes_written)
-                    raise
+                memory_options = {
+                    "forensic_timeline": state.mem_forensic_timeline,
+                    "eventlogs": state.mem_eventlogs,
+                }
+                if replacement:
+                    try:
+                        ingestion_task = _schedule_background(
+                            manager.run_ingestion(
+                                validated_case_id, dest, state.file_type, memory_options,
+                            )
+                        )
+                    except Exception as exc:
+                        _CHUNK_UPLOADS.pop(state_key, None)
+                        await asyncio.to_thread(_remove_partial, state.part_path)
+                        raise HTTPException(500, "Could not schedule evidence replacement") from exc
+                    try:
+                        await _finish_replacement(
+                            validated_case_id, dest, state.part_path, ingestion_task,
+                        )
+                    except asyncio.CancelledError:
+                        _CHUNK_UPLOADS.pop(state_key, None)
+                        raise
+                    except Exception as exc:
+                        _CHUNK_UPLOADS.pop(state_key, None)
+                        await asyncio.to_thread(_remove_partial, state.part_path)
+                        raise HTTPException(500, "Evidence replacement failed") from exc
+                else:
+                    try:
+                        await asyncio.to_thread(os.replace, state.part_path, dest)
+                    except BaseException:
+                        await asyncio.to_thread(_truncate_file, state.part_path, state.bytes_written)
+                        raise
                 _CHUNK_UPLOADS.pop(state_key, None)
                 complete = True
             else:
@@ -382,13 +505,10 @@ async def upload_chunk(
             await asyncio.to_thread(_remove_partial, request_staging)
 
     if complete:
-        memory_options = {
-            "forensic_timeline": state.mem_forensic_timeline,
-            "eventlogs": state.mem_eventlogs,
-        }
-        asyncio.create_task(
-            manager.run_ingestion(validated_case_id, dest, state.file_type, memory_options),
-        )
+        if not replacement:
+            _schedule_background(
+                manager.run_ingestion(validated_case_id, dest, state.file_type, memory_options),
+            )
         return {"ok": True, "complete": True, "filename": safe_name}
     return {"ok": True, "complete": False, "chunk_index": chunk_index}
 
@@ -407,9 +527,12 @@ async def delete_evidence(case_id: str, name: str) -> dict:
     loop = asyncio.get_running_loop()
     async with coordinator.run(case_id, "evidence deletion"):
         safe_name = evidence_store.sanitize_upload_filename(name)
-        if safe_name:
+        try:
+            result = await loop.run_in_executor(None, evidence_store.delete_evidence, case_id, name)
+        except evidence_store.LegacyEvidenceAttributionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if result is not None and safe_name:
             _discard_chunk_upload(case_id, safe_name)
-        result = await loop.run_in_executor(None, evidence_store.delete_evidence, case_id, name)
     if result is None:
         raise HTTPException(404, "Evidence file not found")
     return result
@@ -421,7 +544,10 @@ async def reingest_evidence(case_id: str, name: str, file_type: str = "artifact"
         raise HTTPException(404, "Case not found")
     loop = asyncio.get_running_loop()
     async with coordinator.run(case_id, "evidence preparation"):
-        path = await loop.run_in_executor(None, evidence_store.prepare_reingest, case_id, name)
+        try:
+            path = await loop.run_in_executor(None, evidence_store.prepare_reingest, case_id, name)
+        except evidence_store.LegacyEvidenceAttributionError as exc:
+            raise HTTPException(409, str(exc)) from exc
     if path is None:
         raise HTTPException(404, "Evidence file not found")
     asyncio.create_task(manager.run_ingestion(case_id, path, file_type))
@@ -462,11 +588,11 @@ async def ingestion_ws(websocket: WebSocket, case_id: str) -> None:
 @router.get("/{case_id}/events")
 def get_events(
     case_id: str,
-    q: str | None = None,
-    category: str | None = None,
-    severity: str | None = None,
-    limit: int = 200,
-    offset: int = 0,
+    q: Annotated[str | None, Query(max_length=1024)] = None,
+    category: Annotated[str | None, Query(max_length=256)] = None,
+    severity: Annotated[str | None, Query(max_length=32)] = None,
+    limit: Annotated[int, Query(ge=1, le=5000)] = 200,
+    offset: Annotated[int, Query(ge=0, le=10_000_000)] = 0,
 ) -> dict:
     session = case_store.get_session(case_id)
     try:
@@ -548,10 +674,10 @@ _SEVERITY_LADDER = ["info", "low", "medium", "high", "critical"]
 @router.get("/{case_id}/timeline")
 def get_timeline(
     case_id: str,
-    limit: int = 2000,
-    sources: str | None = None,
-    categories: str | None = None,
-    q: str | None = None,
+    limit: Annotated[int, Query(ge=0, le=10_000)] = 2000,
+    sources: Annotated[str | None, Query(max_length=16_384)] = None,
+    categories: Annotated[str | None, Query(max_length=16_384)] = None,
+    q: Annotated[str | None, Query(max_length=1024)] = None,
     min_severity: str = "info",
     include_facets: bool = True,
 ) -> dict:
@@ -694,9 +820,9 @@ def get_finding(case_id: str, finding_id: int) -> dict:
 
 
 @router.post("/{case_id}/findings/{finding_id}/benign")
-def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
+def set_finding_benign(case_id: str, finding_id: int, body: FindingBenignUpdate) -> dict:
     """Mark a single finding benign (severity -> info) or restore it."""
-    benign = bool(body.get("benign", True))
+    benign = body.benign
     session = case_store.get_session(case_id)
     try:
         f = session.get(Finding, finding_id)
@@ -708,7 +834,7 @@ def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
             overrides.finding_key(f.title, f.evidence),
             benign,
             actor="analyst",
-            rationale=str(body.get("rationale") or "Analyst marked this finding benign"),
+            rationale=body.rationale,
         )
         if manual_finding:
             from app.detect import manual
@@ -721,12 +847,12 @@ def set_finding_benign(case_id: str, finding_id: int, body: dict) -> dict:
 
 
 @router.post("/{case_id}/rules/disable")
-def set_rule_disabled(case_id: str, body: dict) -> dict:
+def set_rule_disabled(case_id: str, body: RuleDisabledUpdate) -> dict:
     """Disable a detection rule (all its findings -> info) or re-enable it."""
-    rule_id = str(body.get("rule_id") or "").strip()
+    rule_id = body.rule_id.strip()
     if not rule_id:
         raise HTTPException(400, "rule_id required")
-    disabled = bool(body.get("disabled", True))
+    disabled = body.disabled
     session = case_store.get_session(case_id)
     try:
         rules = overrides.set_rule_disabled(session, rule_id, disabled)
@@ -738,9 +864,10 @@ def set_rule_disabled(case_id: str, body: dict) -> dict:
 
 
 @router.post("/{case_id}/findings/manual")
-def add_manual_finding(case_id: str, body: dict) -> dict:
+def add_manual_finding(case_id: str, body: ManualFindingCreate) -> dict:
     """Analyst-created finding for an event or entity, tagged manual and
     persisted so it survives detection rebuilds."""
+    body = body.model_dump()
     from app.detect import manual
     if not case_store.case_exists(case_id):
         raise HTTPException(404, "Case not found")
@@ -815,25 +942,7 @@ async def run_detections(case_id: str, rebuild: bool = True) -> dict:
     from app.detect.engine import run_detections_sync
 
     def _run() -> int:
-        if rebuild:
-            from app.detect import manual
-            session = case_store.get_session(case_id)
-            try:
-                manual.restore_manual_event_severities(session)
-                session.execute(sqldelete(Finding))
-                session.execute(
-                    sqlupdate(Event)
-                    .where(
-                        (Event.severity_reason.like("Detection:%"))
-                        | (Event.severity_reason.like("Context:%"))
-                        | (Event.severity_reason.like("Flagged-entity match:%"))
-                    )
-                    .values(severity="info", severity_reason=None)
-                )
-                session.commit()
-            finally:
-                session.close()
-        return run_detections_sync(case_id)
+        return run_detections_sync(case_id, rebuild=rebuild)
 
     async with coordinator.run(case_id, "detection rebuild"):
         added = await loop.run_in_executor(None, _run)
@@ -885,9 +994,9 @@ def get_process_dossier(case_id: str, session_id: str, pid: int) -> dict:
 @router.get("/{case_id}/entities")
 def get_entities(
     case_id: str,
-    types: str | None = None,
+    types: Annotated[str | None, Query(max_length=1024)] = None,
     min_severity: str = "info",
-    max_nodes: int = 300,
+    max_nodes: Annotated[int, Query(ge=1, le=5000)] = 300,
 ) -> dict:
     type_list = [t for t in types.split(",") if t] if types else None
     return build_entity_graph(case_id, entity_types=type_list, min_severity=min_severity, max_nodes=max_nodes)
@@ -956,12 +1065,10 @@ def download_memory_vfs_file(case_id: str, session_id: str, path: str) -> FileRe
 
 
 @router.post("/{case_id}/memory/{session_id}/vfs/archive")
-def archive_memory_vfs(case_id: str, session_id: str, body: dict) -> FileResponse:
+def archive_memory_vfs(case_id: str, session_id: str, body: VFSArchiveRequest) -> FileResponse:
     validated_case_id = _validated_case_id(case_id)
     validated_session_id = _validated_memory_session_id(session_id)
-    paths = body.get("paths") if isinstance(body, dict) else None
-    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
-        raise HTTPException(400, "Expected JSON body with string paths")
+    paths = body.paths
     try:
         local = archive_vfs_selection(validated_case_id, validated_session_id, paths)
         return _memory_file_response(validated_case_id, local, media_type="application/zip")
@@ -985,8 +1092,8 @@ def get_memory_process_handles(
     session_id: str,
     pid: int,
     type: str | None = None,
-    limit: int = 300,
-    offset: int = 0,
+    limit: Annotated[int, Query(ge=1, le=5000)] = 300,
+    offset: Annotated[int, Query(ge=0, le=10_000_000)] = 0,
 ) -> dict:
     if not case_store.get_case(case_id):
         raise HTTPException(404, "Case not found")

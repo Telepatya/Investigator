@@ -10,6 +10,7 @@ import resource
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -139,6 +140,34 @@ def schema_ok(request: dict) -> bool:
     return False
 
 
+def bounded_command(command: list[str], *, cwd: str, input: bytes | None, timeout: int):
+    """Spool output under the child's file-size limit; retain only bounded bytes.
+
+    Capturing pipes with subprocess.run accumulates their complete contents in
+    RAM before a caller can truncate them. Scratch files keep that allocation
+    bounded and inherit the existing RLIMIT_FSIZE protection on the child.
+    """
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            input=input,
+            stdout=stdout,
+            stderr=stderr,
+            timeout=timeout,
+            shell=False,
+            preexec_fn=limits,
+        )
+        stdout.seek(0)
+        stderr.seek(0)
+        return subprocess.CompletedProcess(
+            completed.args,
+            completed.returncode,
+            stdout.read(MAX_BROKER_OUTPUT + 1),
+            stderr.read(MAX_BROKER_OUTPUT + 1),
+        )
+
+
 def run_cmd(request: dict) -> dict:
     cmd = request["cmd"]
     executable = os.path.basename(cmd[0])
@@ -156,14 +185,11 @@ def run_cmd(request: dict) -> dict:
         fail("stdin_base64 is malformed")
     started = time.monotonic()
     try:
-        completed = subprocess.run(
+        completed = bounded_command(
             command,
             cwd=cwd,
             input=stdin_bytes,
-            capture_output=True,
             timeout=timeout,
-            shell=False,
-            preexec_fn=limits,
         )
     except subprocess.TimeoutExpired:
         return {

@@ -8,6 +8,7 @@ from anthropic import AsyncAnthropic
 
 from app.config import get_api_key
 from app.llm.base import LLMProvider
+from app.llm.endpoints import provider_http_client, validate_endpoint
 from app.models.schemas import ModelInfo
 
 
@@ -26,7 +27,11 @@ class AnthropicProvider(LLMProvider):
         key = get_api_key("anthropic")
         if not key:
             raise ValueError("Anthropic API key not configured")
-        return AsyncAnthropic(api_key=key)
+        base_url = validate_endpoint("anthropic")
+        return AsyncAnthropic(
+            api_key=key, base_url=base_url,
+            http_client=provider_http_client("anthropic", base_url),
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         return [ModelInfo(id=m, name=m, provider="anthropic") for m in DEFAULT_MODELS]

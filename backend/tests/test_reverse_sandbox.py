@@ -36,7 +36,7 @@ class _Container:
 
     class _Result:
         exit_code = 0
-        output = b"2\n"
+        output = b"3\n"
 
     def __init__(self):
         self.status = "created"
@@ -117,7 +117,10 @@ class ReverseSandboxTests(unittest.TestCase):
         self.assertNotIn("ports", args)
         self.assertIn("/workspace", args["tmpfs"])
         self.assertIn("noexec", args["tmpfs"]["/workspace"])
-        self.assertIn("uid=10001", args["tmpfs"]["/workspace"])
+        self.assertIn("uid=0,gid=10001,mode=0750", args["tmpfs"]["/workspace"])
+        commands = fake.containers.container.calls
+        prepare = next(call for call in commands if call[0][0] == ["reverse-stage", "prepare"])
+        self.assertEqual(prepare[1]["user"], "0:10001")
         self.assertGreater(args["pids_limit"], 0)
 
     def test_truncated_disassembly_keeps_entrypoint_header_and_tail(self) -> None:
@@ -146,6 +149,9 @@ class ReverseSandboxTests(unittest.TestCase):
         manager = ReverseSandboxManager()
         with patch.object(manager, "_docker", return_value=fake):
             manager.ensure(project.id)
+        for args, kwargs in fake.containers.container.calls:
+            if args[0][:2] in (["reverse-stage", "write"], ["reverse-stage", "seal"]):
+                self.assertEqual(kwargs["user"], "0:10001")
         commands = [call[0][0] for call in fake.containers.container.calls]
         self.assertTrue(any(command[:4] == [
             "reverse-stage", "write", "context", "process-context.json"
@@ -300,7 +306,35 @@ class ReverseSandboxTests(unittest.TestCase):
             }]))
             permission_result = manager.execute(project.id, permissions)
             self.assertTrue(permission_result["success"], permission_result)
-            self.assertEqual(permission_result["stdout"].strip(), "500")
+            self.assertEqual(permission_result["stdout"].strip(), "550")
+
+            active = manager.ensure(project.id)
+            container = manager._docker().containers.get(active.container_id)
+            permission_check = container.exec_run(
+                ["python3", "-c", (
+                    "import os, pathlib, sys\n"
+                    "assert os.geteuid() == 10001\n"
+                    "sample = pathlib.Path(sys.argv[1])\n"
+                    "assert sample.read_bytes() == b'MZ static integration fixture'\n"
+                    "for path in (sample, sample.parent, pathlib.Path('/workspace/context'), pathlib.Path('/workspace')):\n"
+                    " assert path.stat().st_uid == 0\n"
+                    " try: path.chmod(0o777)\n"
+                    " except PermissionError: pass\n"
+                    " else: raise AssertionError('analyst could chmod evidence boundary')\n"
+                    "try: sample.unlink()\n"
+                    "except PermissionError: pass\n"
+                    "else: raise AssertionError('analyst could unlink evidence')\n"
+                    "try: sample.parent.rename('/workspace/renamed-inputs')\n"
+                    "except PermissionError: pass\n"
+                    "else: raise AssertionError('analyst could replace input directory')\n"
+                    "for name in ('output', 'tools'):\n"
+                    " path = pathlib.Path('/workspace') / name / 'permission-probe'\n"
+                    " path.write_text('synthetic')\n"
+                    " path.unlink()\n"
+                ), sample],
+                user="reverse", workdir="/workspace",
+            )
+            self.assertEqual(permission_check.exit_code, 0, permission_check.output)
 
             source = (
                 "import hashlib, sys\n"

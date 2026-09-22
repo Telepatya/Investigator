@@ -126,6 +126,7 @@ export interface ProcessTree {
 }
 
 export interface EvidenceFile {
+  attribution_warning?: string | null;
   name: string;
   kind: "memory" | "archive" | "eventlog" | "textlog" | "artifact" | "other";
   size: number;

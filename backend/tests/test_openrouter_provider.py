@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from app import config as config_module
 from app.config import AppConfig
@@ -79,6 +79,7 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
         constructor.assert_called_once_with(
             api_key="sk-or-test",
             base_url="https://openrouter.ai/api/v1",
+            http_client=ANY,
             default_headers={"X-OpenRouter-Title": "Investigator"},
         )
 
@@ -164,7 +165,7 @@ class OpenRouterProviderTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("app.llm.openrouter_provider.get_api_key", return_value="sk-or-test"),
-            patch("app.llm.openrouter_provider.httpx.AsyncClient", return_value=context),
+            patch("app.llm.openrouter_provider.provider_http_client", return_value=context),
         ):
             ok, message = await OpenRouterProvider(_config()).test_connection()
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,7 @@ def _run_without_pysigma(body: str) -> dict:
             text=True,
             timeout=180,
             env={
+                **{key: os.environ[key] for key in ("SystemRoot", "WINDIR", "TEMP", "TMP") if key in os.environ},
                 "HOME": home,
                 "USERPROFILE": home,
                 "PATH": "/usr/bin:/bin:/usr/local/bin",

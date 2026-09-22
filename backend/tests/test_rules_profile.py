@@ -17,7 +17,7 @@ from unittest.mock import patch
 from app.detect import rules as R
 from app.rules import database as rules_database
 from app.rules import profile as profile_module
-from app.rules import store
+from app.rules import limits, store
 from app.rules.profile import DEFAULT_PROFILE, load_profile
 
 
@@ -39,6 +39,41 @@ class _RulesDbTestBase(unittest.TestCase):
         for item in reversed(self.patches):
             item.stop()
         self.tmp.cleanup()
+
+
+class UngatedQuotaTests(_RulesDbTestBase):
+    UNGATED = """title: Synthetic ungated rule
+logsource:
+  category: process_creation
+detection:
+  selection:
+    CommandLine|re: '^x$'
+  condition: selection
+level: medium
+"""
+    GATED = UNGATED.replace("CommandLine|re: '^x$'", "CommandLine|contains: 'example-marker'")
+
+    def test_enable_and_edit_obey_quota_without_partial_updates(self) -> None:
+        with patch.object(limits, "MAX_UNFILTERED_RULES", 1):
+            first = store.create_custom_rule(self.UNGATED)
+            disabled = store.create_custom_rule(self.UNGATED, enabled=False)
+            gated = store.create_custom_rule(self.GATED)
+            revision = store.current_revision()
+            for rule_id, update in (
+                (disabled["id"], {"enabled": True}),
+                (gated["id"], {"yaml_source": self.UNGATED}),
+            ):
+                with self.assertRaisesRegex(ValueError, "without a literal"):
+                    store.update_custom_rule(rule_id, **update)
+                self.assertEqual(store.current_revision(), revision)
+                self.assertEqual(store.count_ungated_enabled(), 1)
+            # Editing a rule already counted at the ceiling stays valid.
+            store.update_custom_rule(first["id"], yaml_source=self.UNGATED)
+            store.update_custom_rule(first["id"], enabled=False)
+            store.update_custom_rule(disabled["id"], enabled=True)
+            self.assertEqual(store.count_ungated_enabled(), 1)
+            rows = {row.id: row for row in store.list_custom_rules()}
+            self.assertEqual(rows[gated["id"]].yaml_source, self.GATED)
 
 
 class DefaultProfileTests(_RulesDbTestBase):

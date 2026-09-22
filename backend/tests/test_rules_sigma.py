@@ -8,11 +8,13 @@ from __future__ import annotations
 # passing the ones real rules use, and that the derived literal prefilter is sound.
 
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from app.rules import limits
 from app.rules.fieldmap import MatchCtx
-from app.rules.safe_regex import UnsafeRegexError, compile_bounded
+from app.rules import safe_regex
+from app.rules.safe_regex import UnsafeRegexError, bounded_search, compile_bounded
 from app.rules.sigma_compile import (
     SigmaLimitError,
     SigmaRuleError,
@@ -195,6 +197,23 @@ class RejectionTests(unittest.TestCase):
 
 
 class RegexGuardTests(unittest.TestCase):
+    def test_runtime_deadline_applies_to_subjects_not_seen_at_compile_time(self) -> None:
+        import regex
+
+        # Compile directly to isolate the runtime boundary from authoring probes.
+        pattern = regex.compile(r"^(x|xx)+$")
+        with patch.object(safe_regex, "BACKTRACK_BUDGET_SECONDS", 0.001):
+            with self.assertRaisesRegex(UnsafeRegexError, "deadline"):
+                bounded_search(pattern, "x" * 5000 + "!")
+
+    def test_timeout_is_an_error_not_a_false_negative(self) -> None:
+        import regex
+
+        pattern = regex.compile("example")
+        with patch.object(safe_regex, "BACKTRACK_BUDGET_SECONDS", 0):
+            with self.assertRaises(UnsafeRegexError):
+                bounded_search(pattern, "example")
+
     def test_patterns_used_by_real_rules_are_accepted(self) -> None:
         for pattern in (
             r"\bmimikatz\b",

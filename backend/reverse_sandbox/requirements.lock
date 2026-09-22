@@ -45,7 +45,6 @@ colorama==0.4.6 \
     #   flare-capa
     #   halo
     #   log-symbols
-    #   xdis
 cxxfilt==0.3.0 \
     --hash=sha256:774e85a8d0157775ed43276d89397d924b104135762d86b3a95f81f203094e07 \
     --hash=sha256:7df6464ba5e8efbf0d8974c0b2c78b32546676f06059a83515dbdfa559b34214
@@ -350,10 +349,12 @@ pefile==2024.8.26 \
     #   flare-capa
     #   flare-floss
     #   viv-utils
-pip==26.1.2 \
-    --hash=sha256:382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab \
-    --hash=sha256:f49cd134c61cf2fd75e0ce2676db03e4054504a5a4986d00f8299ae632dc4605
-    # via ida-hcli
+pip==26.2.1 \
+    --hash=sha256:71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e \
+    --hash=sha256:f6ad667e89a1fe78046c8f13232b247200f5258d7828f3f7883d660878e0813f
+    # via
+    #   -r backend/reverse_sandbox/requirements.in
+    #   ida-hcli
 platformdirs==4.10.0 \
     --hash=sha256:31e761a6a0ca04faf7353ea759bdba55652be214725111e5aac52dfa29d4bef7 \
     --hash=sha256:fb516cdb12eb0d857d0cd85a7c57cea4d060bee4578d6cf5a14dfdf8cbf8784a

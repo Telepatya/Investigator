@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api import analysis_router, cases_router, settings_router
+from app.api.http_limits import HTTPBoundaryMiddleware
 from app.api.security import allowed_hosts, allowed_origins, authorize_http
 from app.auth.middleware import AuthMiddleware
 from app.auth.router import router as auth_router
@@ -142,6 +143,10 @@ async def _enforce_http_origin(request: Request, call_next):
     return await call_next(request)
 
 
+# Outermost application middleware also protects rejected requests and SPA assets.
+app.add_middleware(HTTPBoundaryMiddleware)
+
+
 @app.exception_handler(CaseNotFoundError)
 async def _case_not_found_handler(_request: Request, _exc: CaseNotFoundError) -> JSONResponse:
     # A session was requested for an id absent from the registry; surface it as a
@@ -200,7 +205,7 @@ if FRONTEND_DIST.exists():
 def main() -> None:
     import uvicorn
     port = int(os.environ.get("INVESTIGATOR_PORT", "8400"))
-    uvicorn.run("app.main:app", host="127.0.0.1", port=port, reload=False)
+    uvicorn.run("app.main:app", host="127.0.0.1", port=port, reload=False, ws_max_size=131_072)
 
 
 if __name__ == "__main__":

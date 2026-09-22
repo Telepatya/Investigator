@@ -107,3 +107,44 @@ admin settings endpoint.
 - Changing environment configuration requires a process restart. Existing
   server-side sessions remain bounded by their configured expiry; revoke them by
   removing `~/.investigator/auth.db` only during a planned maintenance window.
+
+
+## Provider destinations and request limits
+
+With SSO enabled, Ollama and OpenRouter base URLs are restricted to their exact
+built-in defaults (`http://localhost:11434` and `https://openrouter.ai/api/v1`).
+To use an internal gateway, the operator must set
+`INVESTIGATOR_OLLAMA_APPROVED_URLS` or `INVESTIGATOR_OPENROUTER_APPROVED_URLS`
+to a comma-separated list of approved absolute HTTP(S) bases, then select that
+base in Settings. Hosted non-loopback destinations must use HTTPS, even when
+explicitly approved. HTTP remains available for `localhost` and literal loopback
+IP addresses. Approval includes the exact path; it is not a host wildcard.
+Approving a gateway authorizes it to receive that provider's key and case data.
+Only approve endpoints and DNS that the operator trusts. Apply network egress
+controls in hosted deployments as an additional boundary.
+
+Both settings saves and outgoing requests check this policy, including old
+`config.json` values. Invalid URLs, credentials in URLs, query strings, fragments,
+and ambiguous paths are rejected. Local mode still supports analyst-selected
+custom Ollama and OpenRouter endpoints, including loopback services. OpenAI,
+Anthropic, and Gemini use explicit official endpoints. Provider HTTP clients do
+not follow redirects or inherit proxy/base URL overrides from SDK environment
+variables; configure a trusted gateway through the supported URL settings.
+
+Responses prohibit framing and include `nosniff` and `no-referrer` headers. The
+CSP limits framing only, so scripts, styles, assets, and OIDC navigation retain
+their existing behavior. Non-upload request bodies are limited to 1 MiB before
+JSON parsing. Upload bodies are counted as they arrive, before multipart file
+spooling, and rejected with 413 when the route's configured limit is exceeded.
+Case uploads use the lesser of `INVESTIGATOR_MAX_UPLOAD_BYTES` and
+`INVESTIGATOR_MAX_CASE_BYTES`; Reverse uses the lesser of its configured file and
+project limits. A 1 MiB multipart framing allowance applies, with a 1 TiB hard
+request ceiling. Chunk upload requests allow at most 64 MiB of payload plus the
+framing allowance, while the assembled file retains the configured file quota.
+Declared lengths are checked early and actual streamed bytes are authoritative.
+Route handlers also retain cumulative file and case/project storage quotas. Events
+and memory handle queries allow 1–5000 rows, timeline queries 0–10000 rows (zero
+loads facets only), and offsets are nonnegative. Chat messages allow 32000
+characters and entity IDs 4096; invalid WebSocket inputs never start a model
+request. The built-in server also limits incoming WebSocket messages to 128 KiB.
+Operators launching Uvicorn separately should set `--ws-max-size 131072`.

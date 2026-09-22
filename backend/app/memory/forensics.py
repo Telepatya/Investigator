@@ -194,7 +194,7 @@ def _ingest_evtx(session, path: Path, source: str) -> dict[str, int]:
             if key not in seen_evtx_procs:
                 seen_evtx_procs.add(key)
                 known_pids.add((proc["session_id"], proc["pid"]))
-                session.add(Process(**proc))
+                session.add(Process(**proc, upload_name=session.info.get("upload_name")))
                 stats["processes"] += 1
         if len(pending) >= BATCH_SIZE:
             case_store.add_events_bulk(session, pending)
@@ -341,6 +341,7 @@ def _upsert_process(session, row: dict[str, Any], dump_stem: str, known_pids: se
         cmdline=str(cmdline) if cmdline else None,
         start_time=start_time,
         session_id=session_id,
+        upload_name=session.info.get("upload_name"),
         flags=[],
         severity="info",
         extra={"source": "memprocfs.forensic.process"},
@@ -353,6 +354,7 @@ def _add_artifact_memory_result(session, csv_name: str, row: dict[str, Any], sou
     proc_name = _row_get(row, "Process", "ProcessName", "Name", "ImageFileName")
     severity = _csv_severity(csv_name, row)
     session.add(MemoryResult(
+        upload_name=session.info.get("upload_name"),
         plugin=f"memprocfs_{Path(csv_name).stem}",
         pid=pid,
         process_name=str(proc_name) if proc_name else None,
@@ -363,7 +365,7 @@ def _add_artifact_memory_result(session, csv_name: str, row: dict[str, Any], sou
 
 
 def _add_diagnostic(session, plugin: str, summary: str, data: dict[str, Any], severity: str) -> MemoryResult:
-    result = MemoryResult(plugin=plugin, pid=None, process_name=None, summary=summary, data=data, severity=severity)
+    result = MemoryResult(upload_name=session.info.get("upload_name"), plugin=plugin, pid=None, process_name=None, summary=summary, data=data, severity=severity)
     session.add(result)
     return result
 

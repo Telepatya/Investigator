@@ -12,7 +12,10 @@ from app.config import (
     save_config,
 )
 from app.llm.base import list_models_for_provider, test_provider
+from app.llm.endpoints import ProviderEndpointError, validate_endpoint
 from app.models.schemas import (
+    APIKeyUpdate,
+    GeneralSettingsUpdate,
     LLMConfigResponse,
     LLMConfigUpdate,
     ModelInfo,
@@ -51,7 +54,15 @@ async def get_llm_config() -> LLMConfigResponse:
 
 @router.put("/llm", response_model=LLMConfigResponse)
 async def update_llm_config(update: LLMConfigUpdate) -> LLMConfigResponse:
-    cfg = load_config()
+    cfg = load_config().model_copy(deep=True)
+    try:
+        for provider in ("ollama", "openrouter"):
+            field = f"{provider}_base_url"
+            value = getattr(update, field)
+            # Enforce saved configuration too, before key/config mutations.
+            validate_endpoint(provider, value if value is not None else getattr(cfg.llm, field))
+    except ProviderEndpointError as exc:
+        raise HTTPException(422, str(exc)) from exc
     if update.provider is not None:
         cfg.llm.provider = update.provider
     if update.model is not None:
@@ -115,10 +126,10 @@ async def test_llm(provider: str) -> ProviderTestResult:
 
 
 @router.post("/llm/key/{provider}")
-async def set_api_key(provider: str, body: dict) -> dict:
+async def set_api_key(provider: str, body: APIKeyUpdate) -> dict:
     if provider not in API_KEY_PROVIDERS:
         raise HTTPException(400, "This provider does not use an API key")
-    key = body.get("api_key", "")
+    key = body.api_key
     if not key:
         raise HTTPException(400, "api_key required")
     save_api_key(provider, key)  # type: ignore[arg-type]
@@ -140,10 +151,10 @@ async def get_general_settings() -> dict:
 
 
 @router.put("/general")
-async def update_general_settings(body: dict) -> dict:
+async def update_general_settings(body: GeneralSettingsUpdate) -> dict:
     cfg = load_config()
-    if "yara_rules_dir" in body:
-        cfg.yara_rules_dir = body["yara_rules_dir"] or ""
+    if "yara_rules_dir" in body.model_fields_set:
+        cfg.yara_rules_dir = body.yara_rules_dir or ""
     save_config(cfg)
     return {"cases_dir": cfg.cases_dir, "yara_rules_dir": cfg.yara_rules_dir}
 

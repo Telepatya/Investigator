@@ -37,6 +37,7 @@ sys.modules.setdefault("pydantic", types.SimpleNamespace(
 
 from app.detect.engine import run_detections_sync
 from app.ingest.parsers import normalize_row
+from app.rules import database as rules_database, profile as rules_profile
 from app.store import cases, database
 from app.store.database import Event, Finding, MemoryResult, Process
 
@@ -48,15 +49,20 @@ class MemProcFSCommandlineDetectionTests(unittest.TestCase):
         self.patches = [
             patch.object(cases, "get_cases_dir", return_value=self.root),
             patch.object(cases, "case_db_path", side_effect=lambda case_id: self.root / case_id / "case.db"),
+            patch.object(rules_database, "get_rules_dir", return_value=self.root / "rules"),
         ]
         for p in self.patches:
             p.start()
+        rules_database.dispose_rules_db()
+        rules_profile.invalidate_cache()
         self.case = cases.create_case("cmdlines")
         self.session = cases.get_session(self.case["id"])
 
     def tearDown(self) -> None:
         self.session.close()
         database.dispose_all_db_engines()
+        rules_database.dispose_rules_db()
+        rules_profile.invalidate_cache()
         for p in reversed(self.patches):
             p.stop()
         self.tmp.cleanup()

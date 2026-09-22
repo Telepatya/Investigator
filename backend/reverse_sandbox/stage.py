@@ -17,7 +17,7 @@ ARTIFACT_RE = re.compile(
     re.I,
 )
 MAX_CHUNK = 48 * 1024
-PROTOCOL_VERSION = "2"
+PROTOCOL_VERSION = "3"
 
 
 def fail(message: str) -> None:
@@ -87,12 +87,20 @@ def seal(namespace: str, name: str, size_text: str, expected_sha256: str) -> Non
             digest.update(chunk)
     if digest.hexdigest() != expected_sha256:
         fail("Staged artifact digest mismatch")
-    target.chmod(0o400)
+    target.chmod(0o440)
 
 
 def main() -> None:
     if len(sys.argv) == 2 and sys.argv[1] == "protocol-version":
         print(PROTOCOL_VERSION)
+        return
+    if os.geteuid() != 0:
+        fail("Staging requires the trusted host transport")
+    if len(sys.argv) == 2 and sys.argv[1] == "prepare":
+        for name in ("inputs", "context", "output", "tools"):
+            path = Path("/workspace") / name
+            path.mkdir(mode=0o750, exist_ok=True)
+            path.chmod(0o770 if name in {"output", "tools"} else 0o750)
         return
     if len(sys.argv) == 6 and sys.argv[1] == "write":
         write_chunk(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])

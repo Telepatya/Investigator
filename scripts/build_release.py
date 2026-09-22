@@ -25,6 +25,7 @@ ROOT_FILES = (
 BACKEND_FILES = (
     "backend/requirements.lock", "backend/requirements-memory.lock",
     "backend/requirements.txt",
+    "backend/requirements.in", "backend/requirements-memory.in",
 )
 TREES = ("backend/app", "backend/reverse_sandbox", "frontend/dist", "docs", "demo")
 
