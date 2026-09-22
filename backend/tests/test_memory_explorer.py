@@ -109,6 +109,8 @@ class _FakeVfs:
     def __init__(self):
         self.files = {
             "/sys/version.txt": b"build",
+            "/one/report.txt": b"first",
+            "/two/report.txt": b"second",
             "/pid/123/minidump/minidump.dmp": b"MDMPFULLPROCESS",
         }
 
@@ -131,6 +133,15 @@ class _FakeVfs:
             }
         if path == "/sys":
             return {"version.txt": {"name": "version.txt", "f_isdir": False, "size": 5}}
+        if path in {"/one", "/two"}:
+            source = f"{path}/report.txt"
+            return {
+                "report.txt": {
+                    "name": "report.txt",
+                    "f_isdir": False,
+                    "size": len(self.files[source]),
+                }
+            }
         return {}
 
     def read(self, path: str, length: int, offset: int = 0):
@@ -456,6 +467,20 @@ class MemoryExplorerTests(unittest.TestCase):
             explorer.extract_vfs_file("deadbeef", "mem-dump", "/sys/missing.txt")
         self.assertEqual(cm.exception.status_code, 404)
 
+    def test_vfs_downloads_with_same_basename_have_source_specific_cache_paths(self) -> None:
+        first = explorer.extract_vfs_file(
+            "deadbeef", "mem-dump", "/one/report.txt"
+        )
+        second = explorer.extract_vfs_file(
+            "deadbeef", "mem-dump", "/two/report.txt"
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), b"first")
+        self.assertEqual(second.read_bytes(), b"second")
+        self.assertIn(explorer._source_key("/one/report.txt"), first.name)
+        self.assertIn(explorer._source_key("/two/report.txt"), second.name)
+
     def test_extensionless_physicalmemory_upload_resolves_as_dump(self) -> None:
         (self.uploads / "PhysicalMemory").write_bytes(b"raw")
 
@@ -484,6 +509,48 @@ class MemoryExplorerTests(unittest.TestCase):
             manifest = json.loads(zf.read("manifest.json"))
         self.assertEqual(manifest[0]["source"], "/sys/version.txt")
         self.assertEqual(manifest[0]["status"], "ok")
+
+    def test_same_second_archive_requests_publish_distinct_complete_files(self) -> None:
+        with (
+            patch.object(explorer.time, "time", return_value=1_700_000_000),
+            patch.object(
+                explorer.secrets,
+                "token_hex",
+                side_effect=["a" * 32, "b" * 32],
+            ),
+        ):
+            first = explorer.archive_vfs_selection(
+                "deadbeef", "mem-dump", ["/sys"]
+            )
+            second = explorer.archive_vfs_selection(
+                "deadbeef", "mem-dump", ["/sys"]
+            )
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.is_file())
+        self.assertTrue(second.is_file())
+        for archive in (first, second):
+            with zipfile.ZipFile(archive) as zf:
+                self.assertEqual(zf.read("sys/version.txt"), b"build")
+        self.assertEqual(list(first.parent.glob(".*.partial-*.zip")), [])
+
+    def test_archive_failure_does_not_publish_partial_zip(self) -> None:
+        with patch.object(
+            zipfile.ZipFile,
+            "writestr",
+            side_effect=OSError("simulated archive failure"),
+        ):
+            with self.assertRaisesRegex(
+                explorer.MemoryExplorerError, "Could not create VFS archive"
+            ):
+                explorer.archive_vfs_selection("deadbeef", "mem-dump", ["/sys"])
+
+        output_dir = (
+            self.root / "deadbeef" / "derived" / "memprocfs" / "dump"
+            / "extracted" / "vfs"
+        )
+        self.assertEqual(list(output_dir.glob("*.zip")), [])
+        self.assertEqual(list(output_dir.glob(".*.partial-*.zip")), [])
 
 
 class MemoryExtractionCompletenessTests(unittest.TestCase):

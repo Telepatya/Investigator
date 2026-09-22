@@ -16,7 +16,8 @@ from app import config as app_config
 
 
 COOKIE_NAME = "investigator_session"
-OIDC_BINDING_COOKIE_NAME = "investigator_oidc_binding"
+OIDC_BINDING_COOKIE_NAME = "investigator_oidc_binding_v2"
+LEGACY_OIDC_BINDING_COOKIE_NAME = "investigator_oidc_binding"
 _db_lock = RLock()
 
 

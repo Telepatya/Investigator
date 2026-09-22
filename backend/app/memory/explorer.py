@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import tempfile
 import time
 import zipfile
@@ -325,7 +326,12 @@ def extract_vfs_file(case_id: str, session_id: str, vfs_path: str) -> Path:
             raise MemoryExplorerError(f"VFS path not found: {source}", 404)
         if entry is not None and _entry_is_dir(entry):
             raise MemoryExplorerError("VFS path is a directory; use archive download for folders")
-        output = _cache_path(case_id, dump.dump_stem, "vfs", f"{_safe_filename(_basename(source))}.extracted")
+        output = _cache_path(
+            case_id,
+            dump.dump_stem,
+            "vfs",
+            _vfs_output_filename(source),
+        )
         info = _copy_vfs_file(
             vmm,
             source,
@@ -342,31 +348,68 @@ def archive_vfs_selection(case_id: str, session_id: str, paths: list[str]) -> Pa
         raise MemoryExplorerError("No VFS paths selected")
     dump = resolve_memory_dump(case_id, session_id)
     safe_paths = list(dict.fromkeys(sanitize_vfs_path(p) for p in paths))
-    archive_name = f"memprocfs-selection-{int(time.time())}.zip"
+    selection_key = _source_key("\0".join(safe_paths))
+    archive_name = (
+        f"memprocfs-selection-{selection_key}-{int(time.time())}-"
+        f"{secrets.token_hex(16)}.zip"
+    )
     output = _cache_path(case_id, dump.dump_stem, "vfs", archive_name)
     manifest: list[dict[str, Any]] = []
     count = 0
-
-    with _open_vmm(dump.path) as vmm, zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
-        for source in safe_paths:
-            for file_path, entry in _walk_vfs(vmm, source):
-                if count >= MAX_ARCHIVE_FILES:
-                    manifest.append({"source": file_path, "status": "skipped", "error": "archive file limit reached"})
-                    break
-                arcname = _archive_name(file_path)
-                try:
-                    size, digest = _write_vfs_to_zip(vmm, zf, file_path, entry, arcname)
-                    manifest.append({
-                        "source": file_path,
-                        "archive_path": arcname,
-                        "size": size,
-                        "sha256": digest,
-                        "status": "ok",
-                    })
-                    count += 1
-                except Exception as exc:
-                    manifest.append({"source": file_path, "archive_path": arcname, "status": "failed", "error": str(exc)})
-        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+    descriptor, partial_name = tempfile.mkstemp(
+        dir=output.parent,
+        prefix=f".{output.name}.partial-",
+        suffix=".zip",
+    )
+    os.close(descriptor)
+    partial = Path(partial_name)
+    try:
+        with _open_vmm(dump.path) as vmm, zipfile.ZipFile(
+            partial, "w", zipfile.ZIP_DEFLATED
+        ) as zf:
+            for source in safe_paths:
+                for file_path, entry in _walk_vfs(vmm, source):
+                    if count >= MAX_ARCHIVE_FILES:
+                        manifest.append({
+                            "source": file_path,
+                            "status": "skipped",
+                            "error": "archive file limit reached",
+                        })
+                        break
+                    arcname = _archive_name(file_path)
+                    try:
+                        size, digest = _write_vfs_to_zip(
+                            vmm, zf, file_path, entry, arcname
+                        )
+                        manifest.append({
+                            "source": file_path,
+                            "archive_path": arcname,
+                            "size": size,
+                            "sha256": digest,
+                            "status": "ok",
+                        })
+                        count += 1
+                    except Exception as exc:
+                        manifest.append({
+                            "source": file_path,
+                            "archive_path": arcname,
+                            "status": "failed",
+                            "error": str(exc),
+                        })
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        os.replace(partial, output)
+    except Exception as exc:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "Could not remove partial VFS archive %s",
+                _sanitize_for_log(partial),
+                exc_info=True,
+            )
+        if isinstance(exc, MemoryExplorerError):
+            raise
+        raise MemoryExplorerError(f"Could not create VFS archive: {exc}", 500) from exc
 
     _record_manifest(case_id, dump.dump_stem, {
         "kind": "vfs_archive",
@@ -932,6 +975,17 @@ def _hash_file(path: Path) -> str:
 
 def _join_vfs(parent: str, name: str) -> str:
     return sanitize_vfs_path(f"{parent.rstrip('/')}/{name}")
+
+
+def _source_key(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+
+
+def _vfs_output_filename(source: str) -> str:
+    key = _source_key(source)
+    suffix = f"-{key}.extracted"
+    basename = _safe_filename(_basename(source))[: 180 - len(suffix)]
+    return f"{basename}{suffix}"
 
 
 def _archive_name(path: str) -> str:

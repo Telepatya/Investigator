@@ -13,6 +13,7 @@ from .config import get_auth_config
 from .oidc import OIDCError, authorization_url, exchange_code, pkce_verifier, validate_id_token
 from .session import (
     COOKIE_NAME,
+    LEGACY_OIDC_BINDING_COOKIE_NAME,
     OIDC_BINDING_COOKIE_NAME,
     consume_transaction,
     create_session,
@@ -48,9 +49,20 @@ def _binding_cookie_value(request: Request) -> str | None:
     return request.cookies.get(OIDC_BINDING_COOKIE_NAME)
 
 
+def _clear_oidc_binding_cookies(response: Response) -> None:
+    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path=OIDC_BINDING_COOKIE_PATH)
+    # The original binding cookie used the root path. Clear both legacy path
+    # variants during rollout so either prior deployment is upgraded safely.
+    response.delete_cookie(LEGACY_OIDC_BINDING_COOKIE_NAME, path="/")
+    response.delete_cookie(
+        LEGACY_OIDC_BINDING_COOKIE_NAME,
+        path=OIDC_BINDING_COOKIE_PATH,
+    )
+
+
 def _callback_failure(detail: str, status_code: int) -> JSONResponse:
     response = JSONResponse(status_code=status_code, content={"detail": detail})
-    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path=OIDC_BINDING_COOKIE_PATH)
+    _clear_oidc_binding_cookies(response)
     return response
 
 
@@ -98,6 +110,7 @@ async def auth_login(return_to: str | None = None) -> RedirectResponse:
         consume_transaction(state, browser_binding)
         raise HTTPException(502, "Identity provider is unavailable") from exc
     response = RedirectResponse(target, status_code=303)
+    _clear_oidc_binding_cookies(response)
     response.set_cookie(
         OIDC_BINDING_COOKIE_NAME,
         browser_binding,
@@ -148,7 +161,7 @@ async def auth_callback(
         absolute_seconds=config.absolute_seconds,
     )
     response = RedirectResponse(transaction["return_path"], status_code=303)
-    response.delete_cookie(OIDC_BINDING_COOKIE_NAME, path=OIDC_BINDING_COOKIE_PATH)
+    _clear_oidc_binding_cookies(response)
     response.set_cookie(
         COOKIE_NAME,
         token,

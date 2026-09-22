@@ -23,7 +23,16 @@ from app.auth.oidc import (
     identity_from_claims,
     validate_id_token,
 )
-from app.auth.session import clear_auth_state, consume_transaction, create_session, create_transaction, get_session, revoke_session
+from app.auth.session import (
+    LEGACY_OIDC_BINDING_COOKIE_NAME,
+    OIDC_BINDING_COOKIE_NAME,
+    clear_auth_state,
+    consume_transaction,
+    create_session,
+    create_transaction,
+    get_session,
+    revoke_session,
+)
 import app.config as app_config
 
 
@@ -455,7 +464,8 @@ class AuthBoundaryTests(unittest.TestCase):
         binding_cookie = next(
             value
             for value in started.headers.get_list("set-cookie")
-            if value.startswith("investigator_oidc_binding=")
+            if value.startswith(f"{OIDC_BINDING_COOKIE_NAME}=")
+            and "Max-Age=0" not in value
         )
         self.assertIn("HttpOnly", binding_cookie)
         self.assertIn("SameSite=lax", binding_cookie)
@@ -473,6 +483,75 @@ class AuthBoundaryTests(unittest.TestCase):
         self.assertEqual(callback.headers["location"], "/cases")
         replay = self.client.get(f"/api/auth/callback?code=code&state={state}", follow_redirects=False)
         self.assertEqual(replay.status_code, 400)
+
+    def test_rotated_binding_cookie_ignores_duplicate_legacy_root_cookie(self) -> None:
+        from app.auth import router as auth_router
+        from app.auth.oidc import Identity
+        from urllib.parse import parse_qs, urlsplit
+
+        async def fake_authorization_url(_config, **kwargs):
+            return "https://idp.example.test/authorize?state=" + kwargs["state"]
+
+        self.client.cookies.set(
+            LEGACY_OIDC_BINDING_COOKIE_NAME,
+            "stale-root-binding",
+            path="/",
+        )
+        with patch.object(
+            auth_router,
+            "authorization_url",
+            new=AsyncMock(side_effect=fake_authorization_url),
+        ):
+            started = self.client.get("/api/auth/login", follow_redirects=False)
+
+        set_cookie_headers = started.headers.get_list("set-cookie")
+        self.assertTrue(
+            any(
+                header.startswith(f"{LEGACY_OIDC_BINDING_COOKIE_NAME}=")
+                and "Max-Age=0" in header
+                and "Path=/" in header
+                for header in set_cookie_headers
+            )
+        )
+        binding_header = next(
+            header
+            for header in set_cookie_headers
+            if header.startswith(f"{OIDC_BINDING_COOKIE_NAME}=")
+            and "Max-Age=0" not in header
+        )
+        browser_binding = binding_header.split(";", 1)[0].split("=", 1)[1]
+        state = parse_qs(urlsplit(started.headers["location"]).query)["state"][0]
+
+        # Browsers order cookies by path length. Reproduce the problematic
+        # duplicate legacy name explicitly; the rotated cookie remains unique.
+        cookie_header = "; ".join(
+            (
+                f"{LEGACY_OIDC_BINDING_COOKIE_NAME}=stale-callback-binding",
+                f"{LEGACY_OIDC_BINDING_COOKIE_NAME}=stale-root-binding",
+                f"{OIDC_BINDING_COOKIE_NAME}={browser_binding}",
+            )
+        )
+        with (
+            patch.object(
+                auth_router,
+                "exchange_code",
+                new=AsyncMock(return_value={"id_token": "opaque-test-token"}),
+            ),
+            patch.object(
+                auth_router,
+                "validate_id_token",
+                new=AsyncMock(
+                    return_value=Identity("sub", "Analyst", None, False)
+                ),
+            ),
+        ):
+            callback = self.client.get(
+                f"/api/auth/callback?code=code&state={state}",
+                headers={"cookie": cookie_header},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(callback.status_code, 303)
 
     def test_login_transaction_is_bound_to_initiating_browser(self) -> None:
         from app.auth import router as auth_router
