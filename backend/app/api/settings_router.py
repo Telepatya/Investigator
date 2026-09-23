@@ -130,7 +130,8 @@ async def get_models(provider: str) -> list[ModelInfo]:
 
 
 @router.post("/llm/test/{provider}", response_model=ProviderTestResult)
-async def test_llm(provider: str) -> ProviderTestResult:
+async def test_llm(provider: str, request: Request) -> ProviderTestResult:
+    require_shared_admin(request)
     if provider not in LLM_PROVIDERS:
         raise HTTPException(400, "Unknown provider")
     ok, msg, models = await test_provider(provider)  # type: ignore[arg-type]

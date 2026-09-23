@@ -45,7 +45,6 @@ import app.config as config
 from app.memory import pipeline as memory_pipeline
 from app.store import cases
 from app.store import database
-from app.config import case_dir_path
 from app.store.database import ChatHistory, ChatSession, Event, MemoryResult, Process
 
 
@@ -102,7 +101,7 @@ class CaseStoreTests(unittest.TestCase):
             self.skipTest(f"Symlink creation is unavailable: {exc}")
 
         with self.assertRaisesRegex(ValueError, "symlink alias"):
-            case_dir_path(alias.name)
+            config.case_dir_path(alias.name)
 
     def test_chat_sessions_keep_independent_history_and_delete_cleanly(self) -> None:
         case = cases.create_case("chat sessions")

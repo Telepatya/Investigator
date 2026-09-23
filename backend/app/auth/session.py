@@ -123,6 +123,10 @@ class UserSession:
         }
 
 
+class AuthPolicyChanged(Exception):
+    """Raised when an in-flight login no longer matches stored auth policy."""
+
+
 def _ensure_auth_policy(db: sqlite3.Connection, fingerprint: str) -> bool:
     row = db.execute(
         "SELECT value FROM auth_metadata WHERE key = 'policy_fingerprint'"
@@ -252,6 +256,7 @@ def consume_transaction(state: str, browser_binding: str, now: float | None = No
 def create_session(
     *, subject: str, display_name: str | None, email: str | None, is_admin: bool,
     idle_seconds: int, absolute_seconds: int, now: float | None = None,
+    expected_policy_fingerprint: str | None = None,
 ) -> tuple[str, UserSession]:
     current = time.time() if now is None else now
     token = secrets.token_urlsafe(48)
@@ -266,6 +271,19 @@ def create_session(
         absolute_expires_at=current + absolute_seconds,
     )
     with _db_lock, _database() as db:
+        if expected_policy_fingerprint is not None:
+            # Fence callback completion against a policy update that landed
+            # while token exchange or claim validation was awaiting the IdP.
+            # Check and insert share one SQLite write transaction so a stale
+            # callback cannot mint a session under a newer policy marker.
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT value FROM auth_metadata WHERE key = 'policy_fingerprint'"
+            ).fetchone()
+            if row is None or not secrets.compare_digest(
+                str(row["value"]), expected_policy_fingerprint
+            ):
+                raise AuthPolicyChanged
         db.execute("DELETE FROM auth_sessions WHERE expires_at <= ? OR absolute_expires_at <= ?", (current, current))
         db.execute(
             "INSERT INTO auth_sessions(token_hash, subject, display_name, email, is_admin, created_at, last_seen, expires_at, absolute_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",

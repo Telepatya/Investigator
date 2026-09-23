@@ -76,6 +76,7 @@ class SharedAdminAccessTests(unittest.TestCase):
             patch.object(settings_router, "save_config") as save_config,
             patch.object(settings_router, "save_api_key") as save_api_key,
             patch.object(settings_router, "delete_api_key") as delete_api_key,
+            patch.object(settings_router, "test_provider", new=AsyncMock()) as test_provider,
         ):
             responses = [
                 self.client.put(
@@ -89,6 +90,7 @@ class SharedAdminAccessTests(unittest.TestCase):
                     headers=ORIGIN_HEADERS,
                 ),
                 self.client.delete("/api/settings/llm/key/openai", headers=ORIGIN_HEADERS),
+                self.client.post("/api/settings/llm/test/openai", headers=ORIGIN_HEADERS),
                 self.client.put(
                     "/api/settings/general",
                     json={"yara_rules_dir": "must-not-persist"},
@@ -101,11 +103,12 @@ class SharedAdminAccessTests(unittest.TestCase):
                 ),
             ]
 
-        self.assertEqual([response.status_code for response in responses], [403] * 5)
+        self.assertEqual([response.status_code for response in responses], [403] * 6)
         load_config.assert_not_called()
         save_config.assert_not_called()
         save_api_key.assert_not_called()
         delete_api_key.assert_not_called()
+        test_provider.assert_not_awaited()
         self.assertFalse(app_config.CONFIG_FILE.exists())
 
         access = self.client.get("/api/settings/access")
@@ -200,15 +203,15 @@ class SharedAdminAccessTests(unittest.TestCase):
 
     def test_admin_can_change_global_settings_and_credentials(self) -> None:
         from app.api import settings_router
-        from app.config import AppConfig
 
         self.set_user(is_admin=True)
-        cfg = AppConfig(cases_dir=str(app_config.DEFAULT_CASES_DIR))
+        cfg = app_config.AppConfig(cases_dir=str(app_config.DEFAULT_CASES_DIR))
         with (
             patch.object(settings_router, "load_config", return_value=cfg),
             patch.object(settings_router, "save_config") as save_config,
             patch.object(settings_router, "save_api_key") as save_api_key,
             patch.object(settings_router, "list_models_for_provider", new=AsyncMock(return_value=[])),
+            patch.object(settings_router, "test_provider", new=AsyncMock(return_value=(True, "ok", []))) as test_provider,
         ):
             general = self.client.put(
                 "/api/settings/general",
@@ -220,17 +223,22 @@ class SharedAdminAccessTests(unittest.TestCase):
                 json={"api_key": "admin-secret"},
                 headers=ORIGIN_HEADERS,
             )
+            provider_test = self.client.post(
+                "/api/settings/llm/test/openai",
+                headers=ORIGIN_HEADERS,
+            )
 
         self.assertEqual(general.status_code, 200, general.text)
         self.assertEqual(credential.status_code, 200, credential.text)
+        self.assertEqual(provider_test.status_code, 200, provider_test.text)
         self.assertGreaterEqual(save_config.call_count, 1)
         save_api_key.assert_called_once_with("openai", "admin-secret")
+        test_provider.assert_awaited_once_with("openai")
 
     def test_local_auth_and_sso_without_admin_claim_preserve_existing_access(self) -> None:
         from app.api import settings_router
-        from app.config import AppConfig
 
-        cfg = AppConfig(cases_dir=str(app_config.DEFAULT_CASES_DIR))
+        cfg = app_config.AppConfig(cases_dir=str(app_config.DEFAULT_CASES_DIR))
         with (
             patch.object(settings_router, "load_config", return_value=cfg),
             patch.object(settings_router, "save_config") as save_config,

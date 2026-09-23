@@ -947,7 +947,6 @@ def _record_manifest(case_id: str, dump_stem: str, entry: dict[str, Any]) -> Non
     if lock_requested.is_symlink():
         raise MemoryExplorerError("Unsafe extraction manifest lock", 500)
 
-    manifest_path = _contained_artifact_path(artifact_root, manifest_requested)
     lock_path = _contained_artifact_path(artifact_root, lock_requested)
     with _manifest_update_lock(lock_path):
         # A symlink at the manifest leaf would otherwise make a safe parent

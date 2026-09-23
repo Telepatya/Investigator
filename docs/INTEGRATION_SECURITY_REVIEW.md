@@ -51,6 +51,17 @@ mitigated or are false positives are dismissed only with per-alert evidence;
 changes on the PR branch are not considered fixed on `main` until merged and
 scanned there.
 
+The rules-profile cache alert (#166) and the validated case-path alert (#176)
+were dismissed as false positives after code review. The Reverse source-path
+alerts (#109–#113), contained memory copy/cache alerts (#154, #155, #157), and
+retired dynamic-scan flow-through alerts (#91, #92, #103–#106) were also
+dismissed individually with root-containment or non-sink evidence. The former
+OIDC binding-cookie alert (#108) was previously marked mitigated after the
+merged callback-cookie fix. Confirmed findings such as the manifest write
+(#156) remain represented by the PR changes until `main` is rescanned after a
+merge. The PR scan itself is the acceptance check for any newly introduced
+alerts.
+
 ## Validation limits
 
 The pull request records the exact reviewed revision, local test results, and
