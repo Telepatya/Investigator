@@ -18,6 +18,10 @@ from app import config as app_config
 COOKIE_NAME = "investigator_session"
 OIDC_BINDING_COOKIE_NAME = "investigator_oidc_binding_v2"
 LEGACY_OIDC_BINDING_COOKIE_NAME = "investigator_oidc_binding"
+LOGIN_LIMIT_WINDOW_SECONDS = 60
+LOGIN_LIMIT_PER_CLIENT = 120
+LOGIN_LIMIT_BUCKET_CAPACITY = 4096
+ACTIVE_TRANSACTION_LIMIT = 1024
 _db_lock = RLock()
 
 
@@ -65,8 +69,18 @@ def _connect() -> sqlite3.Connection:
             created_at REAL NOT NULL,
             expires_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS auth_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS oidc_login_limits (
+            client_hash TEXT PRIMARY KEY,
+            window_started_at REAL NOT NULL,
+            attempts INTEGER NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at);
         CREATE INDEX IF NOT EXISTS idx_oidc_transactions_expires ON oidc_transactions(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_oidc_login_limits_window ON oidc_login_limits(window_started_at);
         """
     )
     # Old auth databases may have transactions created before browser binding
@@ -109,13 +123,103 @@ class UserSession:
         }
 
 
-def create_transaction(
-    *, nonce: str, code_verifier: str, browser_binding: str, return_path: str, expires_at: float,
-) -> str:
-    state = secrets.token_urlsafe(32)
-    now = time.time()
+def _ensure_auth_policy(db: sqlite3.Connection, fingerprint: str) -> bool:
+    row = db.execute(
+        "SELECT value FROM auth_metadata WHERE key = 'policy_fingerprint'"
+    ).fetchone()
+    if row is not None and str(row["value"]) == fingerprint:
+        return False
+
+    # The initial read avoids taking SQLite's write lock on every request.
+    # Recheck after acquiring it because another worker may have applied this
+    # policy transition while this connection was waiting.
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute(
+        "SELECT value FROM auth_metadata WHERE key = 'policy_fingerprint'"
+    ).fetchone()
+    if row is not None and str(row["value"]) == fingerprint:
+        return False
+    db.execute("DELETE FROM auth_sessions")
+    db.execute("DELETE FROM oidc_transactions")
+    db.execute(
+        "INSERT INTO auth_metadata(key, value) VALUES ('policy_fingerprint', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (fingerprint,),
+    )
+    return True
+
+
+def sync_auth_policy(fingerprint: str) -> bool:
+    """Invalidate sessions and pending logins when the OIDC policy changes.
+
+    The fingerprint is a digest of the effective policy, never the policy
+    values themselves. SQLite serializes policy transitions across workers.
+    """
     with _db_lock, _database() as db:
+        return _ensure_auth_policy(db, fingerprint)
+
+
+def sync_auth_policy_if_store_exists(fingerprint: str) -> bool:
+    """Apply a disabled-policy transition without creating a default auth DB."""
+    if not _db_path().is_file():
+        return False
+    return sync_auth_policy(fingerprint)
+
+
+def create_transaction(
+    *, nonce: str, code_verifier: str, browser_binding: str, return_path: str,
+    expires_at: float, client_key: str | None = None,
+) -> str | None:
+    """Create a bounded, one-time login transaction.
+
+    Calls are limited per direct network peer and the number of live
+    transactions is capped. The peer limit is shared by clients behind the
+    same reverse proxy. The limits and insert happen in one SQLite write
+    transaction so concurrent workers cannot race past either bound.
+    """
+    now = time.time()
+    client_hash = _hash(client_key or "unknown-client")
+    with _db_lock, _database() as db:
+        db.execute("BEGIN IMMEDIATE")
         db.execute("DELETE FROM oidc_transactions WHERE expires_at <= ?", (now,))
+        db.execute(
+            "DELETE FROM oidc_login_limits WHERE window_started_at <= ?",
+            (now - LOGIN_LIMIT_WINDOW_SECONDS,),
+        )
+        active_count = int(
+            db.execute("SELECT COUNT(*) FROM oidc_transactions").fetchone()[0]
+        )
+        if active_count >= ACTIVE_TRANSACTION_LIMIT:
+            return None
+
+        limit_row = db.execute(
+            "SELECT window_started_at, attempts FROM oidc_login_limits WHERE client_hash = ?",
+            (client_hash,),
+        ).fetchone()
+        if limit_row is None:
+            bucket_count = int(
+                db.execute("SELECT COUNT(*) FROM oidc_login_limits").fetchone()[0]
+            )
+            if bucket_count >= LOGIN_LIMIT_BUCKET_CAPACITY:
+                return None
+            db.execute(
+                "INSERT INTO oidc_login_limits(client_hash, window_started_at, attempts) VALUES (?, ?, 1)",
+                (client_hash, now),
+            )
+        elif now - float(limit_row["window_started_at"]) >= LOGIN_LIMIT_WINDOW_SECONDS:
+            db.execute(
+                "UPDATE oidc_login_limits SET window_started_at = ?, attempts = 1 WHERE client_hash = ?",
+                (now, client_hash),
+            )
+        elif int(limit_row["attempts"]) >= LOGIN_LIMIT_PER_CLIENT:
+            return None
+        else:
+            db.execute(
+                "UPDATE oidc_login_limits SET attempts = attempts + 1 WHERE client_hash = ?",
+                (client_hash,),
+            )
+
+        state = secrets.token_urlsafe(32)
         db.execute(
             "INSERT INTO oidc_transactions(state_hash, binding_hash, nonce, code_verifier, return_path, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (_hash(state), _hash(browser_binding), nonce, code_verifier, return_path, now, expires_at),
@@ -170,11 +274,18 @@ def create_session(
     return token, session
 
 
-def get_session(token: str | None, *, idle_seconds: int, now: float | None = None) -> UserSession | None:
-    if not token or len(token) > 256:
+def get_session(
+    token: str | None, *, idle_seconds: int, now: float | None = None,
+    policy_fingerprint: str | None = None,
+) -> UserSession | None:
+    if (not token or len(token) > 256) and policy_fingerprint is None:
         return None
     current = time.time() if now is None else now
     with _db_lock, _database() as db:
+        if policy_fingerprint is not None:
+            _ensure_auth_policy(db, policy_fingerprint)
+        if not token or len(token) > 256:
+            return None
         row = db.execute("SELECT * FROM auth_sessions WHERE token_hash = ?", (_hash(token),)).fetchone()
         if row is None:
             return None

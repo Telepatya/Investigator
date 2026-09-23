@@ -59,6 +59,7 @@ async function req<T>(path: string, opts?: RequestInit): Promise<T> {
 export const api = {
   authBootstrap: () => req<AuthBootstrap>("/auth/bootstrap"),
   logout: () => req<{ ok: boolean }>("/auth/logout", { method: "POST" }),
+  getSettingsAccess: () => req<{ admin_required: boolean; can_manage_shared_state: boolean }>("/settings/access"),
 
   // Cases
   listCases: () => req<Case[]>("/cases"),

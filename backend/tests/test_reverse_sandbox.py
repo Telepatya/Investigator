@@ -21,6 +21,7 @@ from app.reverse.database import (
     get_reverse_session,
     init_reverse_db,
 )
+from app.reverse.command_policy import _is_symbolic_chmod_mode
 from app.reverse.sandbox import ReverseSandboxManager, _bounded_tool_output
 from app.reverse.store import contained_project_path, create_project
 from app.reverse.tools import parse_tool_call
@@ -68,9 +69,14 @@ class _Containers:
     def __init__(self):
         self.kwargs = None
         self.container = None
+        self.error = None
 
     def get(self, _name):
-        raise RuntimeError("not found")
+        if self.error:
+            raise self.error
+        from docker.errors import NotFound
+
+        raise NotFound("not found")
 
     def create(self, _image, **kwargs):
         self.kwargs = kwargs
@@ -122,6 +128,16 @@ class ReverseSandboxTests(unittest.TestCase):
         prepare = next(call for call in commands if call[0][0] == ["reverse-stage", "prepare"])
         self.assertEqual(prepare[1]["user"], "0:10001")
         self.assertGreater(args["pids_limit"], 0)
+
+    def test_stale_container_lookup_errors_are_not_silently_ignored(self) -> None:
+        project = create_project("sandbox lookup failure")
+        fake = _Docker()
+        fake.containers.error = RuntimeError("Docker API permission denied")
+        manager = ReverseSandboxManager()
+        with patch.object(manager, "_docker", return_value=fake):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                manager.ensure(project.id)
+        self.assertIsNone(fake.containers.kwargs)
 
     def test_truncated_disassembly_keeps_entrypoint_header_and_tail(self) -> None:
         value = "ENTRYPOINT\n" + ("instruction\n" * 1000) + "FINAL-BLOCK"
@@ -198,6 +214,14 @@ class ReverseSandboxTests(unittest.TestCase):
             "cmd": ["binwalk", "sample"],
             "cwd": "/workspace/inputs",
         }])))
+
+    def test_symbolic_chmod_mode_parser_matches_supported_single_clause_syntax(self) -> None:
+        for mode in ("u+x", "go-r", "a=rw", "ugoa+Xst"):
+            with self.subTest(mode=mode):
+                self.assertTrue(_is_symbolic_chmod_mode(mode))
+        for mode in ("+x", "u+", "u+x,go-r", "u+x;id", "u+xyz"):
+            with self.subTest(mode=mode):
+                self.assertFalse(_is_symbolic_chmod_mode(mode))
 
     def test_pyinstaller_inspector_command_has_bounded_output_mutation(self) -> None:
         allowed = parse_tool_call(json.dumps([{

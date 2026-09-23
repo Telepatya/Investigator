@@ -44,6 +44,8 @@ export default function SettingsPage() {
   const [yaraDir, setYaraDir] = useState("");
 
   const { data: health } = useQuery({ queryKey: ["health"], queryFn: api.health });
+  const { data: access } = useQuery({ queryKey: ["settings-access"], queryFn: api.getSettingsAccess });
+  const settingsLocked = !access || !access.can_manage_shared_state;
   const { data: general } = useQuery({
     queryKey: ["general-settings"],
     queryFn: api.getGeneralSettings,
@@ -149,6 +151,14 @@ export default function SettingsPage() {
         subtitle="Configure AI providers, detection paths, and local forensic engines."
       />
 
+      {access?.admin_required && !access.can_manage_shared_state && (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-300">
+          <ShieldAlert size={16} className="mt-0.5 shrink-0" />
+          <div>Only users with the configured SSO administrator role can change shared provider credentials or deployment settings.</div>
+        </div>
+      )}
+
+      <fieldset disabled={settingsLocked} className="contents">
       <Section title="AI Provider">
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 mb-5">
           {PROVIDERS.map((p) => (
@@ -331,6 +341,7 @@ export default function SettingsPage() {
           </span>
         )}
       </div>
+      </fieldset>
     </PageShell>
   );
 }

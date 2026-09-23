@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from sqlalchemy import select
 
+import app.config as config
 from app.ingest import evidence, pipeline
 from app.memory import explorer, forensics
 from app.memory.identity import memory_upload_key
@@ -25,8 +26,8 @@ class UploadAttributionTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.patches = [
             patch.object(cases, "get_cases_dir", return_value=self.root),
+            patch.object(config, "get_cases_dir", return_value=self.root),
             patch.object(cases, "case_db_path", side_effect=lambda cid: self.root / cid / "case.db"),
-            patch.object(forensics, "get_cases_dir", return_value=self.root),
             patch.object(evidence, "case_uploads_path", side_effect=lambda cid: self.root / cid / "uploads"),
             patch.object(explorer, "case_uploads_path", side_effect=lambda cid: self.root / cid / "uploads"),
             patch("app.detect.engine.run_detections_sync"),

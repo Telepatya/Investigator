@@ -34,6 +34,8 @@ export default function ReversePage({ caseId: fixedCaseId }: { caseId?: string }
   });
   const cases = useQuery({ queryKey: ["cases"], queryFn: api.listCases, enabled: showCreate && !caseId });
   const health = useQuery({ queryKey: ["reverse-health"], queryFn: api.getReverseHealth, staleTime: 30_000 });
+  const access = useQuery({ queryKey: ["settings-access"], queryFn: api.getSettingsAccess });
+  const deleteRestricted = access.data?.admin_required === true && !access.data.can_manage_shared_state;
   const create = useMutation({
     mutationFn: () => api.createReverseProject({
       name: name.trim(), description, linked_case_id: (caseId ?? linkedCaseId) || null,
@@ -56,6 +58,8 @@ export default function ReversePage({ caseId: fixedCaseId }: { caseId?: string }
         subtitle={caseId ? "Static reverse-engineering workspaces linked to this case." : "Sandboxed static analysis for binaries and suspicious artifacts."}
         right={<button className="btn-primary" onClick={() => setShowCreate(true)}><Plus size={16} /> New workspace</button>}
       />
+
+      {deleteRestricted && <div className="mb-4 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-300">An SSO administrator is required to delete shared Reverse workspaces.</div>}
 
       {health.data && !health.data.image_available && (
         <div className="card flex items-start gap-3 border-amber-400/30 bg-amber-400/10 p-4 text-sm text-amber-300">
@@ -84,7 +88,7 @@ export default function ReversePage({ caseId: fixedCaseId }: { caseId?: string }
                   <h3 className="mt-3 truncate text-lg font-semibold text-ink-50 transition group-hover:text-accent-blue">{project.name}</h3>
                   <p className="mt-1 min-h-[2.5rem] line-clamp-2 text-sm text-ink-400">{project.description || "No description"}</p>
                 </Link>
-                <button className="p-1 text-ink-500 opacity-0 transition hover:text-sev-critical group-hover:opacity-100" onClick={() => setPendingDelete(project)} title="Delete workspace"><Trash2 size={16} /></button>
+                <button className="p-1 text-ink-500 opacity-0 transition hover:text-sev-critical group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-30" onClick={() => setPendingDelete(project)} disabled={deleteRestricted} title={deleteRestricted ? "An SSO administrator is required to delete shared workspaces" : "Delete workspace"}><Trash2 size={16} /></button>
               </div>
               <div className="mt-4 flex items-center justify-between border-t border-white/5 pt-4 text-xs text-ink-400">
                 <span className="flex items-center gap-1.5"><Box size={13} /> {project.artifact_count} artifacts</span>

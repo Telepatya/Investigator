@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable
 
 from sqlalchemy import select
 
-from app.config import get_cases_dir, validate_case_id_component
+from app.config import case_dir_path
 from app.ingest.normalize import (
     extract_entity,
     extract_host,
@@ -29,16 +30,23 @@ BATCH_SIZE = 2000
 
 
 def memprocfs_artifact_dir(case_id: str, dump_stem: str) -> Path:
-    root = get_cases_dir().resolve()
-    case_root = (root / validate_case_id_component(case_id)).resolve()
-    if case_root.parent != root:
-        raise ValueError("Invalid case directory")
-    artifact_root = (case_root / "derived" / "memprocfs").resolve()
+    case_root = case_dir_path(case_id)
+    derived_path = case_root / "derived"
+    derived_root = derived_path.resolve()
+    if os.path.normcase(os.path.abspath(derived_root)) != os.path.normcase(os.path.abspath(derived_path)):
+        raise ValueError("Invalid MemProcFS derived directory")
+    memprocfs_path = derived_root / "memprocfs"
+    artifact_root = memprocfs_path.resolve()
+    if os.path.normcase(os.path.abspath(artifact_root)) != os.path.normcase(os.path.abspath(memprocfs_path)):
+        raise ValueError("Invalid MemProcFS artifact root")
     try:
         artifact_root.relative_to(case_root)
     except ValueError as exc:
         raise ValueError("Invalid MemProcFS artifact root") from exc
-    path = (artifact_root / _safe_dir_name(dump_stem)).resolve()
+    dump_path = artifact_root / _safe_dir_name(dump_stem)
+    path = dump_path.resolve()
+    if os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(dump_path)):
+        raise ValueError("Invalid MemProcFS artifact path")
     try:
         path.relative_to(artifact_root)
     except ValueError as exc:

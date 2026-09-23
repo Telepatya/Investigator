@@ -36,6 +36,8 @@ export default function CasesPage() {
     queryFn: api.listCases,
     refetchInterval: 4000,
   });
+  const { data: access } = useQuery({ queryKey: ["settings-access"], queryFn: api.getSettingsAccess });
+  const deleteRestricted = access?.admin_required === true && !access.can_manage_shared_state;
 
   const createMut = useMutation({
     mutationFn: () => api.createCase(name, desc),
@@ -68,6 +70,8 @@ export default function CasesPage() {
         }
       />
 
+      {deleteRestricted && <div className="mb-4 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-300">An SSO administrator is required to delete shared cases.</div>}
+
       {isLoading ? (
         <Spinner label="Loading cases…" />
       ) : !cases || cases.length === 0 ? (
@@ -84,7 +88,7 @@ export default function CasesPage() {
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
           {cases.map((c) => (
-            <CaseCard key={c.id} c={c} onDelete={() => setPendingDelete(c)} />
+            <CaseCard key={c.id} c={c} onDelete={() => setPendingDelete(c)} deleteDisabled={deleteRestricted} />
           ))}
         </div>
       )}
@@ -156,7 +160,7 @@ export default function CasesPage() {
   );
 }
 
-function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
+function CaseCard({ c, onDelete, deleteDisabled }: { c: Case; onDelete: () => void; deleteDisabled: boolean }) {
   const operationActive = c.status === "ingesting" || c.status === "analyzing";
   return (
     <div className="card interactive-lift group relative p-5 hover:border-accent-blue/30">
@@ -182,8 +186,8 @@ function CaseCard({ c, onDelete }: { c: Case; onDelete: () => void }) {
         <button
           className="text-ink-500 hover:text-sev-critical p-1 opacity-0 group-hover:opacity-100 transition disabled:cursor-not-allowed disabled:opacity-30"
           onClick={onDelete}
-          disabled={operationActive}
-          title={operationActive ? "Wait for the active case operation to finish" : "Delete case"}
+          disabled={operationActive || deleteDisabled}
+          title={deleteDisabled ? "An SSO administrator is required to delete shared cases" : operationActive ? "Wait for the active case operation to finish" : "Delete case"}
         >
           <Trash2 size={16} />
         </button>

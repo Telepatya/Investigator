@@ -10,11 +10,12 @@ import uuid
 from typing import Any
 
 import aiofiles
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, func, select
 
 from app.config import UPLOAD_STAGING_PREFIX, load_config
+from app.auth.access import require_shared_admin
 
 from .analysis import ACTIVE_STATUSES, analysis_manager, can_continue_investigation
 from .database import (
@@ -211,7 +212,8 @@ async def put_project_tools(
 
 
 @router.delete("/projects/{project_id}")
-async def remove_project(project_id: str) -> dict[str, bool]:
+async def remove_project(project_id: str, request: Request) -> dict[str, bool]:
+    require_shared_admin(request)
     try:
         validate_project_id(project_id)
     except ValueError as exc:
@@ -436,10 +438,10 @@ async def resume_analysis(project_id: str) -> ReverseRunResponse:
     _project_or_404(project_id)
     try:
         return _run_response(await analysis_manager.resume(project_id))
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(409, str(exc)) from exc
     except SandboxUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.post(
@@ -481,10 +483,10 @@ async def replay_analysis(project_id: str) -> ReverseRunResponse:
     _project_or_404(project_id)
     try:
         return _run_response(await analysis_manager.replay(project_id))
-    except (ValueError, RuntimeError) as exc:
-        raise HTTPException(409, str(exc)) from exc
     except SandboxUnavailable as exc:
         raise HTTPException(503, str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.get("/projects/{project_id}/report", response_model=ReverseReportResponse)

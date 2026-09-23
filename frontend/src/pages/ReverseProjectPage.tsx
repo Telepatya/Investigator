@@ -22,6 +22,8 @@ export default function ReverseProjectPage() {
   const [evidenceId, setEvidenceId] = useState<number | null>(null);
 
   const project = useQuery({ queryKey: ["reverse-project", projectId], queryFn: () => api.getReverseProject(projectId), refetchInterval: 4000 });
+  const access = useQuery({ queryKey: ["settings-access"], queryFn: api.getSettingsAccess });
+  const deleteRestricted = access.data?.admin_required === true && !access.data.can_manage_shared_state;
   const artifacts = useQuery({ queryKey: ["reverse-artifacts", projectId], queryFn: () => api.listReverseArtifacts(projectId), refetchInterval: 5000 });
   const status = useQuery({ queryKey: ["reverse-status", projectId], queryFn: () => api.getReverseStatus(projectId), refetchInterval: 2500 });
   const report = useQuery({ queryKey: ["reverse-report", projectId], queryFn: () => api.getReverseReport(projectId), retry: false, enabled: view === "report" || view === "chat" || project.data?.status === "completed" });
@@ -79,7 +81,7 @@ export default function ReverseProjectPage() {
 
   return (
     <PageShell>
-      <PageTitle icon={<Binary size={22} />} title={project.data.name} subtitle={<span className="flex flex-wrap items-center gap-2"><span>{project.data.description || "Static reverse-engineering workspace"}</span>{project.data.linked_case_id && <Link className="chip bg-accent-blue/10 text-accent-blue" to={`/cases/${project.data.linked_case_id}/reverse`}><Link2 size={11} /> Case {project.data.linked_case_id}</Link>}</span>} right={<button className="btn-ghost text-sev-critical" onClick={() => setConfirmDelete(true)}><Trash2 size={15} /> Delete</button>} />
+      <PageTitle icon={<Binary size={22} />} title={project.data.name} subtitle={<span className="flex flex-wrap items-center gap-2"><span>{project.data.description || "Static reverse-engineering workspace"}</span>{project.data.linked_case_id && <Link className="chip bg-accent-blue/10 text-accent-blue" to={`/cases/${project.data.linked_case_id}/reverse`}><Link2 size={11} /> Case {project.data.linked_case_id}</Link>}</span>} right={<button className="btn-ghost text-sev-critical" disabled={deleteRestricted} title={deleteRestricted ? "An SSO administrator is required to delete shared workspaces" : "Delete workspace"} onClick={() => setConfirmDelete(true)}><Trash2 size={15} /> Delete</button>} />
 
       <div className="glass flex max-w-full gap-1 overflow-x-auto rounded-full p-1.5">
         {(["workspace", "report", "chat", "provenance", "activity"] as View[]).map((item) => <button key={item} className={`btn whitespace-nowrap rounded-full px-4 py-2 text-sm capitalize ${view === item ? "bg-[rgb(var(--panel-strong))] text-accent-blue shadow-sm" : "text-ink-300"}`} onClick={() => setView(item)}>{item}</button>)}

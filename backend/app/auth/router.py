@@ -20,6 +20,7 @@ from .session import (
     create_transaction,
     get_session,
     revoke_session,
+    sync_auth_policy,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -87,8 +88,10 @@ def auth_session(request: Request) -> dict[str, object | None]:
 
 
 @router.get("/login")
-async def auth_login(return_to: str | None = None) -> RedirectResponse:
+async def auth_login(request: Request, return_to: str | None = None) -> RedirectResponse:
     config = get_auth_config()
+    if config.enabled:
+        sync_auth_policy(config.policy_fingerprint)
     if not config.configured:
         raise HTTPException(503, "Authentication is misconfigured")
     safe_return = _return_path(return_to)
@@ -97,13 +100,22 @@ async def auth_login(return_to: str | None = None) -> RedirectResponse:
     # This opaque, one-time browser correlation handle is stored only as a
     # hash server-side. It is not an identity-provider or application secret.
     browser_binding = secrets.token_urlsafe(32)
+    # Rate limit on the ASGI peer only. Forwarded address headers are
+    # intentionally ignored because they are not trusted at this boundary.
     state = create_transaction(
         nonce=nonce,
         code_verifier=verifier,
         browser_binding=browser_binding,
         return_path=safe_return,
         expires_at=time.time() + config.transaction_seconds,
+        client_key=request.client.host if request.client is not None else None,
     )
+    if state is None:
+        raise HTTPException(
+            429,
+            "Login is temporarily unavailable; retry later",
+            headers={"Retry-After": "60"},
+        )
     try:
         target = await authorization_url(config, state=state, nonce=nonce, verifier=verifier)
     except OIDCError as exc:
@@ -131,6 +143,8 @@ async def auth_callback(
     error: str | None = None,
 ) -> Response:
     config = get_auth_config()
+    if config.enabled:
+        sync_auth_policy(config.policy_fingerprint)
     if not config.configured:
         return _callback_failure("Authentication is misconfigured", 503)
     browser_binding = _binding_cookie_value(request)
