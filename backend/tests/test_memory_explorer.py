@@ -8,6 +8,8 @@ import tempfile
 import types
 import unittest
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,17 +27,20 @@ class _BaseModel:
         return "{}"
 
 
-sys.modules.setdefault("keyring", types.SimpleNamespace(
-    get_password=lambda *_args, **_kwargs: None,
-    set_password=lambda *_args, **_kwargs: None,
-    delete_password=lambda *_args, **_kwargs: None,
-    errors=types.SimpleNamespace(PasswordDeleteError=Exception),
-))
-sys.modules.setdefault("pydantic", types.SimpleNamespace(
-    BaseModel=_BaseModel,
-    Field=lambda default=None, default_factory=None, **_kwargs: default_factory() if default_factory else default,
-))
+if "keyring" not in sys.modules and find_spec("keyring") is None:
+    sys.modules.setdefault("keyring", types.SimpleNamespace(
+        get_password=lambda *_args, **_kwargs: None,
+        set_password=lambda *_args, **_kwargs: None,
+        delete_password=lambda *_args, **_kwargs: None,
+        errors=types.SimpleNamespace(PasswordDeleteError=Exception),
+    ))
+if "pydantic" not in sys.modules and find_spec("pydantic") is None:
+    sys.modules.setdefault("pydantic", types.SimpleNamespace(
+        BaseModel=_BaseModel,
+        Field=lambda default=None, default_factory=None, **_kwargs: default_factory() if default_factory else default,
+    ))
 
+import app.config as config
 from app.detect.entity_graph import entity_dossier
 from app.memory import explorer, forensics
 from app.store import cases, database
@@ -176,9 +181,9 @@ class MemoryExplorerTests(unittest.TestCase):
         self.patches = [
             patch.object(explorer, "case_uploads_path", return_value=self.uploads),
             patch.object(explorer, "get_cases_dir", return_value=self.root),
+            patch.object(config, "get_cases_dir", return_value=self.root),
             patch.object(cases, "get_cases_dir", return_value=self.root),
             patch.object(cases, "case_db_path", side_effect=lambda case_id: self.root / case_id / "case.db"),
-            patch.object(forensics, "get_cases_dir", return_value=self.root),
             patch.dict(sys.modules, {"memprocfs": types.SimpleNamespace(Vmm=_FakeVmm)}),
         ]
         for p in self.patches:
@@ -551,6 +556,129 @@ class MemoryExplorerTests(unittest.TestCase):
         )
         self.assertEqual(list(output_dir.glob("*.zip")), [])
         self.assertEqual(list(output_dir.glob(".*.partial-*.zip")), [])
+
+    def test_manifest_rejects_extracted_directory_symlink_escape(self) -> None:
+        artifact_root = self.root / "deadbeef" / "derived" / "memprocfs" / "dump"
+        artifact_root.mkdir(parents=True)
+        outside = self.root / "outside"
+        outside.mkdir()
+        try:
+            (artifact_root / "extracted").symlink_to(outside, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Symlink creation is unavailable: {exc}")
+
+        with self.assertRaisesRegex(explorer.MemoryExplorerError, "Unsafe extraction path"):
+            explorer._record_manifest("deadbeef", "dump", {"kind": "test"})
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_manifest_rejects_alias_to_another_case_dump(self) -> None:
+        artifact_root = self.root / "deadbeef" / "derived" / "memprocfs"
+        artifact_root.mkdir(parents=True)
+        target = artifact_root / "target"
+        target.mkdir()
+        alias = artifact_root / "dump"
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Symlink creation is unavailable: {exc}")
+
+        with self.assertRaisesRegex(ValueError, "Invalid MemProcFS artifact path"):
+            forensics.remove_memprocfs_artifacts("deadbeef", "dump")
+        self.assertTrue(target.is_dir())
+
+    def test_remove_memprocfs_artifacts_rejects_derived_alias(self) -> None:
+        target = self.root / "aaaaaaaa" / "derived"
+        target.mkdir(parents=True)
+        alias = self.root / "deadbeef" / "derived"
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Symlink creation is unavailable: {exc}")
+
+        with self.assertRaisesRegex(ValueError, "Invalid MemProcFS derived directory"):
+            forensics.remove_memprocfs_artifacts("deadbeef", "dump")
+        self.assertTrue(target.is_dir())
+
+    def test_remove_memprocfs_artifacts_rejects_memprocfs_alias(self) -> None:
+        derived = self.root / "deadbeef" / "derived"
+        derived.mkdir(parents=True)
+        target = self.root / "aaaaaaaa" / "memprocfs"
+        target.mkdir(parents=True)
+        alias = derived / "memprocfs"
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Symlink creation is unavailable: {exc}")
+
+        with self.assertRaisesRegex(ValueError, "Invalid MemProcFS artifact root"):
+            forensics.remove_memprocfs_artifacts("deadbeef", "dump")
+        self.assertTrue(target.is_dir())
+
+    def test_manifest_rejects_manifest_file_symlink_escape(self) -> None:
+        artifact_root = self.root / "deadbeef" / "derived" / "memprocfs" / "dump"
+        extracted = artifact_root / "extracted"
+        extracted.mkdir(parents=True)
+        outside = self.root / "outside-manifest.json"
+        outside.write_text('{"artifacts": []}', encoding="utf-8")
+        try:
+            (extracted / "manifest.json").symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"Symlink creation is unavailable: {exc}")
+
+        with self.assertRaisesRegex(explorer.MemoryExplorerError, "Unsafe extraction"):
+            explorer._record_manifest("deadbeef", "dump", {"kind": "test"})
+        self.assertEqual(json.loads(outside.read_text(encoding="utf-8")), {"artifacts": []})
+
+    def test_manifest_updates_are_atomic_and_keep_concurrent_entries(self) -> None:
+        extracted_dir = (
+            self.root / "deadbeef" / "derived" / "memprocfs" / "dump" / "extracted"
+        )
+        extracted_dir.mkdir(parents=True)
+
+        def record(index: int) -> None:
+            explorer._record_manifest(
+                "deadbeef", "dump", {"kind": "test", "index": index}
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(record, range(40)))
+
+        manifest_path = (
+            self.root / "deadbeef" / "derived" / "memprocfs" / "dump"
+            / "extracted" / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual({row["index"] for row in manifest["artifacts"]}, set(range(40)))
+        self.assertEqual(list(manifest_path.parent.glob(".manifest.json.partial-*")), [])
+
+    def test_manifest_publication_failure_preserves_previous_manifest(self) -> None:
+        explorer._record_manifest("deadbeef", "dump", {"kind": "first"})
+        manifest_path = (
+            self.root / "deadbeef" / "derived" / "memprocfs" / "dump"
+            / "extracted" / "manifest.json"
+        )
+        original = manifest_path.read_bytes()
+        with patch.object(explorer.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                explorer._record_manifest("deadbeef", "dump", {"kind": "second"})
+
+        self.assertEqual(manifest_path.read_bytes(), original)
+        self.assertEqual(list(manifest_path.parent.glob(".manifest.json.partial-*")), [])
+
+    def test_manifest_parse_failure_preserves_corrupt_forensic_record(self) -> None:
+        manifest_path = (
+            self.root / "deadbeef" / "derived" / "memprocfs" / "dump"
+            / "extracted" / "manifest.json"
+        )
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text("{truncated", encoding="utf-8")
+        original = manifest_path.read_bytes()
+
+        with self.assertRaisesRegex(explorer.MemoryExplorerError, "manifest is invalid"):
+            explorer._record_manifest("deadbeef", "dump", {"kind": "new"})
+
+        self.assertEqual(manifest_path.read_bytes(), original)
+        self.assertEqual(list(manifest_path.parent.glob(".manifest.json.partial-*")), [])
 
 
 class MemoryExtractionCompletenessTests(unittest.TestCase):

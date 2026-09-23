@@ -27,6 +27,35 @@ headers. Use HTTPS in a shared deployment. The client secret is required when
 SSO is enabled; an incomplete configuration fails closed with no silent
 fallback to anonymous access.
 
+## Private and organization deployment
+
+Run one backend process on a dedicated supported host under a service account
+that can access only its own Investigator data directory. The built-in server
+binds to `127.0.0.1` on `INVESTIGATOR_PORT` (default `8400`). Put a TLS reverse
+proxy on the same host in front of it and publish only the proxy. Route the
+entire site, including `/api` and WebSocket upgrades, to that loopback port
+without rewriting paths. Preserve the public `Host` header. The browser URL must
+exactly match `INVESTIGATOR_PUBLIC_ORIGIN`; register that origin's
+`/api/auth/callback` URL at the IdP. Investigator deliberately ignores forwarded
+host/protocol headers when deciding trusted origins. Do not use development
+reload or multiple backend workers against the same case directory.
+
+Provide the OIDC client secret through the service environment or a deployment
+secret store, with access limited to the service operator. Keep the data
+directory, backups, and proxy logs protected as forensic evidence. The backend
+must be able to reach its configured issuer's discovery, token, and key
+endpoints over trusted TLS. An isolated environment without an available IdP
+can use the default single-user loopback mode; it must not publish that mode to
+other machines.
+
+Before sharing a deployment, test a permitted account, a denied account, a
+denied cross-origin request, logout, and a fresh login after changing IdP
+policy. Use synthetic evidence for this check. Restrict IdP app assignment to
+the intended investigation team. Every permitted member can read and work in
+the same case, rule, and Reverse project pool; there is no tenant or per-case
+isolation. Keep separate deployments and data directories for teams that must
+not see each other's evidence.
+
 `INVESTIGATOR_OIDC_SCOPES` is a space-delimited list of safe OAuth scope
 tokens. `openid` is always added if omitted. Keep the list limited to scopes
 registered for this application; it is sent only in the authorization request.
@@ -46,8 +75,8 @@ SAML, SCIM, directory Graph calls, or API tokens.
    Connect**, **Web Application**, and Authorization Code. Enable PKCE if the
    tenant exposes that option; keep the client secret private.
 2. Add the exact sign-in redirect URI
-   `https://investigator.example.com/api/auth/callback`. Add the exact logout
-   URI/origin used by the deployment if your Okta policy requires it.
+   `https://investigator.example.com/api/auth/callback`. Investigator logout
+   ends its local session; it does not perform IdP-wide logout.
 3. Use the issuer for the authorization server assigned to the app (for the
    Default server this is `https://<org>.okta.com/oauth2/default`). Set the
    resulting client ID and secret as environment variables above.
@@ -57,6 +86,10 @@ SAML, SCIM, directory Graph calls, or API tokens.
    `INVESTIGATOR_SSO_CLAIMS=groups` and list the exact case-sensitive Okta group
    names in `INVESTIGATOR_SSO_ALLOWED_VALUES`. If administrators use a separate
    group, set the admin claim/value to `groups` and that exact group name.
+
+See Okta's [web app integration](https://help.okta.com/en-us/Content/Topics/Apps/Apps_App_Integration_Wizard_OIDC.htm)
+and [groups-claim](https://developer.okta.com/docs/guides/customize-tokens-groups-claim/main/)
+guides for the tenant-specific screens and claim filter.
 
 ## Microsoft Entra ID app registration
 
@@ -73,7 +106,9 @@ SAML, SCIM, directory Graph calls, or API tokens.
    `INVESTIGATOR_OIDC_SCOPES=openid profile email`; group claims are configured
    in the app registration and are not requested through an unconditional
    `groups` scope. Set `INVESTIGATOR_SSO_CLAIMS=groups` and allowlist the exact Entra group object
-   IDs (case-sensitive string comparison).
+   IDs (case-sensitive string comparison). The "Groups assigned to the
+   application" option includes direct group membership and requires the
+   relevant Entra licensing; use app roles if that option is unavailable.
 4. Alternatively define an **app role** such as `Investigator.Analyst` and
    assign it to users/groups. Configure `INVESTIGATOR_SSO_CLAIMS=roles` and
    allowlist the exact role value. The role claim is an array; do not use a
@@ -85,11 +120,21 @@ and does not request directory-wide permissions. Reduce assigned groups,
 prefer app roles, or use groups assigned to the application so the complete
 allowlisted claim fits in the ID token.
 
+See Microsoft's [group claims and app roles](https://learn.microsoft.com/en-us/security/zero-trust/develop/configure-tokens-group-claims-app-roles)
+guide for assignment and overage behavior.
+
 The optional `INVESTIGATOR_SSO_ADMIN_CLAIM` and
-`INVESTIGATOR_SSO_ADMIN_VALUE` settings produce an informational `is_admin`
-marker in the bootstrap identity. They do not grant additional permissions:
-SSO deployments intentionally use one shared pool and have no per-case RBAC or
-admin settings endpoint.
+`INVESTIGATOR_SSO_ADMIN_VALUE` settings identify operators allowed to change
+organization-wide settings and rules or delete shared cases or Reverse
+projects. If these settings are omitted, every permitted SSO member retains
+the shared-pool permissions of earlier releases. Configure a separate exact
+admin group or app role for a shared deployment. The admin marker does not
+create per-case RBAC:
+permitted members can still read and work in every case and project. Admins
+must also satisfy `INVESTIGATOR_SSO_ALLOWED_VALUES`; an admin claim alone does
+not grant sign-in. The application does not provide an immutable, per-user
+audit trail for every shared case or rule change. Deployments requiring that
+attribution need an external control or a future application feature.
 
 ## Operations and troubleshooting
 
@@ -104,9 +149,32 @@ admin settings endpoint.
   public origin. Missing/bad origins are denied while SSO is enabled.
 - The frontend keeps no token in localStorage. It uses same-origin credentials,
   centralizes 401 handling, validates relative return paths, and offers logout.
-- Changing environment configuration requires a process restart. Existing
-  server-side sessions remain bounded by their configured expiry; revoke them by
-  removing `~/.investigator/auth.db` only during a planned maintenance window.
+- Login initiation is bounded to 120 requests per minute per direct peer and
+  1,024 unexpired transactions overall. Excess requests receive `429` with
+  `Retry-After` before contacting the IdP. A same-host reverse proxy is the
+  direct peer for all remote browsers, so its users share that limit;
+  forwarded client-IP headers are deliberately ignored. Operators with larger
+  login bursts should add trusted rate controls at the proxy and account for
+  this application-wide limit.
+- Changing environment configuration requires a process restart. Changes to
+  the issuer, client, origin, or allowlisted group/role policy invalidate
+  existing sessions so users must sign in again. To revoke every session
+  independently of a policy change, stop the backend, back up the auth database
+  if required by policy, then remove `~/.investigator/auth.db` and any
+  `auth.db-wal`/`auth.db-shm` sidecars during a planned maintenance window.
+- Open WebSockets recheck the current session before each new client command
+  and before sending each progress or model-output event. Logout, session expiry,
+  or an authentication-policy change therefore blocks the next action or output.
+  An idle socket can remain connected until another action or event occurs. A
+  provider call already dispatched may continue until it yields its next event;
+  the backend checks the session before sending that event, but cannot undo work
+  already performed by the provider or retract earlier output.
+- Group or role removal at the IdP is checked at the next login, not on every
+  HTTP request or active WebSocket message. A current browser session can
+  remain valid until its absolute expiry or logout. Set
+  `INVESTIGATOR_SSO_ABSOLUTE_SECONDS` to match the
+  organization's offboarding window; use the maintenance procedure above to
+  revoke all sessions sooner. There is no SCIM or back-channel logout.
 
 
 ## Provider destinations and request limits

@@ -121,7 +121,9 @@ class HTTPBoundaryMiddleware:
             try:
                 await self.app(scope, limited_upload_receive, protected_send)
             except _UploadTooLarge:
-                pass
+                upload_too_large = False
+                await response(scope, receive, protected_send)
+                return
             if upload_too_large:
                 upload_too_large = False
                 await response(scope, receive, protected_send)

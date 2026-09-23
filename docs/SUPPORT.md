@@ -35,7 +35,9 @@ IdP per backend. Okta and Microsoft Entra web-app registrations are documented
 in [SSO.md](SSO.md). The SSO path is validated against the supported browser and
 Python runtimes above, but an IdP tenant, reverse proxy, TLS termination, and
 claim policy remain deployment-specific. SAML, SCIM, API tokens, multi-tenant
-isolation, and Entra Graph group expansion are not supported.
+isolation, and Entra Graph group expansion are not supported. A configured admin
+claim limits shared settings/rule changes and case/project deletion; it does not
+isolate case evidence between permitted members.
 
 ## Required Python dependencies
 

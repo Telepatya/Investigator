@@ -16,15 +16,18 @@ def main() -> int:
         return 2
     path = Path(sys.argv[1]).resolve(strict=True)
     command = ["/usr/bin/objdump", "--disassemble", "-M", "intel"]
+    start: int | None = None
     try:
         pe = pefile.PE(str(path), fast_load=True)
         start = int(pe.OPTIONAL_HEADER.ImageBase) + int(pe.OPTIONAL_HEADER.AddressOfEntryPoint)
+    except pefile.PEFormatError:
+        # Non-PE formats remain supported; objdump will inspect the complete file.
+        start = None
+    if start is not None:
         command.extend([
             f"--start-address={start}",
             f"--stop-address={start + 0x2000}",
         ])
-    except pefile.PEFormatError:
-        pass
     command.extend(["--", str(path)])
     completed = subprocess.run(
         command,

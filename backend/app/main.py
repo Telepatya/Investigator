@@ -18,8 +18,10 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from app.api import analysis_router, cases_router, settings_router
 from app.api.http_limits import HTTPBoundaryMiddleware
 from app.api.security import allowed_hosts, allowed_origins, authorize_http
+from app.auth.config import get_auth_config
 from app.auth.middleware import AuthMiddleware
 from app.auth.router import router as auth_router
+from app.auth.session import sync_auth_policy, sync_auth_policy_if_store_exists
 from app.config import ensure_dirs
 from app.store.cases import (
     CaseNotFoundError,
@@ -53,6 +55,11 @@ APP_CREDIT = "Made by Roei.f"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_dirs()
+    auth_config = get_auth_config()
+    if auth_config.enabled:
+        sync_auth_policy(auth_config.policy_fingerprint)
+    else:
+        sync_auth_policy_if_store_exists(auth_config.policy_fingerprint)
     init_reverse_db()
     for run_id in recover_interrupted_runs():
         logger.warning("Recovered interrupted Reverse run %s", run_id)

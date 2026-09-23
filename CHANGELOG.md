@@ -43,6 +43,15 @@ migration, and verification details live in `docs/releases/`.
 
 ### Fixed
 
+- Bound anonymous OIDC login initiation, invalidate browser sessions when the
+  configured identity policy changes, and enforce a configured SSO admin claim
+  for shared settings, global rule changes, and case/project deletion. The
+  [deployment guide](docs/SSO.md) now describes the private and organization
+  topology and remaining shared-case limits.
+- Preserve memory extraction manifests across concurrent updates and failed
+  writes, reject case-directory aliases, and make Reverse sandbox failures and
+  analyzer logs report safely. The [security review](docs/INTEGRATION_SECURITY_REVIEW.md)
+  tracks the related CodeQL findings.
 - Enforce upload request byte limits before multipart spooling, including chunked
   transfer, and require HTTPS for hosted non-loopback provider gateways.
 

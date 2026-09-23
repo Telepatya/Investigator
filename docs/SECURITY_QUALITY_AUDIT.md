@@ -1,5 +1,9 @@
 # Security and quality audit — 2026-09-22
 
+This is the historical record for pull requests #88 and #97. The later
+[integration and deployment security review](INTEGRATION_SECURITY_REVIEW.md)
+tracks the 2026-09-23 follow-up and current deployment boundaries.
+
 ## Scope and delivery
 
 Audit baseline: `5a4149865aca87d82acd15f6f51c7f4a66bf7120`, including 16 committed SSO changes ahead of the former remote `main` (`b6340fa2015a1ae6744532f1dbe0199d86772726`). Pull request #88 was merged as `6e70b1ec2abd586e6a040d2c36043aeecdce15d4`. The post-merge CodeQL follow-up uses branch `codex/codeql-follow-up`.

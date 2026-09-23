@@ -455,8 +455,12 @@ class ReplacementCancellationTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(request_task.done())
             self.assertFalse(ingestion_entered.is_set())
             release.set()
-            with self.assertRaises(asyncio.CancelledError):
+            try:
                 await request_task
+            except asyncio.CancelledError:
+                self.assertTrue(request_task.cancelled())
+            else:
+                self.fail("the request task should propagate cancellation")
             await asyncio.wait_for(ingestion_entered.wait(), 1)
             await asyncio.sleep(0)
 
@@ -477,17 +481,18 @@ class ReplacementCancellationTests(unittest.IsolatedAsyncioTestCase):
         destination: Path,
     ) -> None:
         self.router.manager._detections_pending.add(self.case_id)
-        with (
-            patch.object(
-                self.router.evidence_store,
-                "replace_file_data",
-                side_effect=RuntimeError("swap failed"),
-            ),
-            self.assertRaises(HTTPException) as caught,
+        with patch.object(
+            self.router.evidence_store,
+            "replace_file_data",
+            side_effect=RuntimeError("swap failed"),
         ):
-            await route_coroutine
+            try:
+                await route_coroutine
+            except HTTPException as caught:
+                self.assertEqual(caught.status_code, 500)
+            else:
+                self.fail("replacement failure should become an HTTP error")
 
-        self.assertEqual(caught.exception.status_code, 500)
         self.assertEqual(destination.read_bytes(), b"old")
         self.assertIn(self.case_id, self.router.manager._detections_pending)
         self.assertNotIn(self.case_id, self.router.manager._full_rebuild_pending)

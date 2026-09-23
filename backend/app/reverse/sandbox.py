@@ -119,11 +119,14 @@ class ReverseSandboxManager:
                 ) from exc
 
             name = f"investigator-reverse-{project_id}"
+            from docker.errors import NotFound
+
             try:
                 stale = client.containers.get(name)
+            except NotFound:
+                stale = None
+            if stale is not None:
                 stale.remove(force=True, v=True)
-            except Exception:
-                pass
 
             # No host paths, credentials, daemon socket, or network are exposed.
             container = client.containers.create(

@@ -1,18 +1,18 @@
 """HTTP API for the Rules page.
 
 All mutating routes sit behind the application-wide origin check installed in
-``app.main``, which is the same protection every other write in this local-only tool
-relies on. What is added here is input validation: a rule id must exist in the
-built-in catalog, a severity must be one the engine understands, and rule text must
-compile before it is stored.
+``app.main``. In SSO deployments with an administrator claim configured, shared
+catalog mutations also require an administrator session. Input validation still
+ensures rule ids exist, severity values are supported, and rule text compiles.
 """
 
 from __future__ import annotations
 
 import re
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, HTTPException, Request, Response
 
+from app.auth.access import require_shared_admin
 from app.rules import fork as fork_module
 from app.rules import profile, store
 from app.rules.database import CustomRule
@@ -209,7 +209,8 @@ def get_rule(rule_id: str) -> RuleDetail:
 
 
 @router.patch("/builtin/{rule_id}", response_model=MutationResponse)
-def update_builtin(rule_id: str, body: BuiltinRuleUpdate) -> MutationResponse:
+def update_builtin(rule_id: str, body: BuiltinRuleUpdate, request: Request) -> MutationResponse:
+    require_shared_admin(request)
     spec = _validated_builtin(rule_id)
     if body.severity_override is not None and "severity" not in spec.editable:
         raise HTTPException(
@@ -232,7 +233,8 @@ def update_builtin(rule_id: str, body: BuiltinRuleUpdate) -> MutationResponse:
 
 
 @router.post("/custom", response_model=MutationResponse)
-def create_custom(body: CustomRuleCreate) -> MutationResponse:
+def create_custom(body: CustomRuleCreate, request: Request) -> MutationResponse:
+    require_shared_admin(request)
     try:
         result = store.create_custom_rule(body.yaml_source, enabled=body.enabled)
     except SigmaUnavailableError as exc:
@@ -246,7 +248,8 @@ def create_custom(body: CustomRuleCreate) -> MutationResponse:
 
 
 @router.patch("/custom/{rule_id}", response_model=MutationResponse)
-def update_custom(rule_id: str, body: CustomRuleUpdate) -> MutationResponse:
+def update_custom(rule_id: str, body: CustomRuleUpdate, request: Request) -> MutationResponse:
+    require_shared_admin(request)
     _validated_custom_id(rule_id)
     changes = body.model_dump(exclude_unset=True)
     if not changes:
@@ -268,7 +271,8 @@ def update_custom(rule_id: str, body: CustomRuleUpdate) -> MutationResponse:
 
 
 @router.delete("/custom/{rule_id}", response_model=MutationResponse)
-def delete_custom(rule_id: str) -> MutationResponse:
+def delete_custom(rule_id: str, request: Request) -> MutationResponse:
+    require_shared_admin(request)
     _validated_custom_id(rule_id)
     if not store.delete_custom_rule(rule_id):
         raise HTTPException(404, "Rule not found")
@@ -304,8 +308,9 @@ def validate_rule(body: RuleValidateRequest) -> RuleValidateResponse:
 
 
 @router.post("/builtin/{rule_id}/fork", response_model=ForkResponse)
-def fork_builtin(rule_id: str, body: ForkRequest) -> ForkResponse:
+def fork_builtin(rule_id: str, body: ForkRequest, request: Request) -> ForkResponse:
     """Create an editable Sigma approximation of a built-in rule."""
+    require_shared_admin(request)
     spec = _validated_builtin(rule_id)
     if not spec.forkable:
         raise HTTPException(
@@ -343,12 +348,13 @@ def fork_builtin(rule_id: str, body: ForkRequest) -> ForkResponse:
 
 
 @router.post("/import", response_model=RuleImportResponse)
-def import_rules(body: RuleValidateRequest) -> RuleImportResponse:
+def import_rules(body: RuleValidateRequest, request: Request) -> RuleImportResponse:
     """Import a Sigma bundle.
 
     Rules are imported disabled and reported individually: one malformed document
     never prevents the rest of a bundle from loading.
     """
+    require_shared_admin(request)
     try:
         result = store.import_rules(body.yaml_source)
     except SigmaUnavailableError as exc:

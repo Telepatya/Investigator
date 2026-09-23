@@ -98,10 +98,12 @@ function buildYaml(draft: {
 
 export function RuleEditor({
   ruleId,
+  canManage,
   onClose,
   onSaved,
 }: {
   ruleId: string | null;
+  canManage: boolean;
   onClose: () => void;
   onSaved: () => void;
 }) {
@@ -435,7 +437,7 @@ export function RuleEditor({
               </button>
               <button
                 className="btn-primary"
-                disabled={busy || !source.trim()}
+                disabled={!canManage || busy || !source.trim()}
                 onClick={() => save.mutate()}
               >
                 {save.isPending ? "Saving…" : editing ? "Save changes" : "Create rule"}

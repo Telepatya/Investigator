@@ -7,6 +7,8 @@ application's regular settings export and backup paths.
 
 from __future__ import annotations
 
+import hmac
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -122,6 +124,36 @@ class AuthConfig:
         if not self.public_origin:
             return None
         return f"{self.public_origin}{self.callback_path}"
+
+    @property
+    def policy_fingerprint(self) -> str:
+        """Return a stable, non-reversible marker for the active auth policy.
+
+        Existing sessions are tied to the identity provider and authorization
+        rules that created them. The metadata stores only a domain-separated
+        HMAC, never the client secret or policy values.
+        """
+        policy = {
+            "enabled": self.enabled,
+            "configured": self.configured,
+            "issuer": self.issuer,
+            "client_id": self.client_id,
+            "public_origin": self.public_origin,
+            "claim_names": self.claim_names,
+            "allowed_values": self.allowed_values,
+            "admin_claim": self.admin_claim,
+            "admin_value": self.admin_value,
+            "scopes": self.scopes,
+            "idle_seconds": self.idle_seconds,
+            "absolute_seconds": self.absolute_seconds,
+            "transaction_seconds": self.transaction_seconds,
+        }
+        serialized = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+        return hmac.new(
+            (self.client_secret or "").encode("utf-8"),
+            b"investigator-auth-policy-v1\x00" + serialized.encode("utf-8"),
+            "sha256",
+        ).hexdigest()
 
 
 def get_auth_config() -> AuthConfig:

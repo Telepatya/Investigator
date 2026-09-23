@@ -119,6 +119,11 @@ also require a session. Static SPA assets remain public for the login shell. The
 opaque session cookie is HttpOnly, SameSite=Lax, Secure on HTTPS,
 and only its hash is stored; ID/access tokens and full claims are never stored
 or returned. Entra group-overage indicators fail closed without Graph calls.
+When an admin claim is configured, the server restricts shared settings and
+rules changes and case/project deletion to that claim. Permitted SSO members
+still share all evidence; there is no per-case isolation. Removing a member at
+the IdP does not revoke an existing browser session before its expiry or
+logout. See [the SSO deployment guide](docs/SSO.md) for revocation steps.
 
 **Changing the bind address.** Disabled mode is intended for loopback only. If
 you deliberately expose the backend on a non-loopback hostname, configure SSO
@@ -296,3 +301,5 @@ The project is intended to use:
 
 These protections are enforced through repository settings and the workflows in
 `.github/workflows/`.
+The current [integration and deployment security review](docs/INTEGRATION_SECURITY_REVIEW.md)
+records the 2026-09-23 CodeQL disposition and deployment boundaries.

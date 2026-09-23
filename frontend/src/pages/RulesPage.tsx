@@ -11,7 +11,7 @@ import {
   Upload,
 } from "lucide-react";
 import { clsx } from "clsx";
-import { rulesApi, rulesExportUrl } from "../lib/api";
+import { api, rulesApi, rulesExportUrl } from "../lib/api";
 import type { RuleDetail, RuleListResponse, RuleSummary } from "../lib/types";
 import {
   ConfirmDialog,
@@ -53,6 +53,9 @@ export default function RulesPage() {
     queryFn: () => rulesApi.list(),
     staleTime: 60_000,
   });
+  const access = useQuery({ queryKey: ["settings-access"], queryFn: api.getSettingsAccess });
+  const canManage = access.data?.can_manage_shared_state ?? false;
+  const adminRestricted = access.data?.admin_required === true && !canManage;
 
   const toggle = useMutation({
     mutationFn: (rule: RuleSummary) =>
@@ -122,12 +125,13 @@ export default function RulesPage() {
             <a className="btn-ghost" href={rulesExportUrl()} title="Download custom rules as Sigma">
               <Download size={15} /> Export
             </a>
-            <button className="btn-ghost" disabled={!sigmaReady} onClick={() => setImportOpen(true)}>
+            <button className="btn-ghost" disabled={!sigmaReady || !canManage} title={!canManage ? "An SSO administrator is required to change shared rules" : undefined} onClick={() => setImportOpen(true)}>
               <Upload size={15} /> Import
             </button>
             <button
               className="btn-primary"
-              disabled={!sigmaReady}
+              disabled={!sigmaReady || !canManage}
+              title={!canManage ? "An SSO administrator is required to change shared rules" : undefined}
               onClick={() => {
                 setSelectedId(null);
                 setEditorOpen(true);
@@ -138,6 +142,8 @@ export default function RulesPage() {
           </div>
         }
       />
+
+      {adminRestricted && <div className="mb-4 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-300">The shared detection catalog is read-only. An SSO administrator is required to change rules.</div>}
 
       {summary && !summary.sigma_available && (
         <div className="card flex items-start gap-3 border-amber-400/30 bg-amber-400/10 p-4 text-sm text-amber-300">
@@ -264,7 +270,7 @@ export default function RulesPage() {
                       <input
                         type="checkbox"
                         checked={rule.enabled}
-                        disabled={toggle.isPending}
+                        disabled={!canManage || toggle.isPending}
                         onChange={() => toggle.mutate(rule)}
                         title={rule.enabled ? "Disable this rule" : "Enable this rule"}
                       />
@@ -328,6 +334,7 @@ export default function RulesPage() {
         <RuleDetailDrawer
           ruleId={selectedId}
           sigmaReady={sigmaReady}
+          canManage={canManage}
           onClose={() => setSelectedId(null)}
           onEdit={() => setEditorOpen(true)}
           onDelete={(rule) => setPendingDelete(rule)}
@@ -337,6 +344,7 @@ export default function RulesPage() {
       {editorOpen && (
         <RuleEditor
           ruleId={selectedId && selectedId.includes("-") && selectedId.length === 36 ? selectedId : null}
+          canManage={canManage}
           onClose={() => setEditorOpen(false)}
           onSaved={() => {
             setEditorOpen(false);
@@ -347,6 +355,7 @@ export default function RulesPage() {
 
       {importOpen && (
         <ImportDialog
+          canManage={canManage}
           onClose={() => setImportOpen(false)}
           onDone={() => qc.invalidateQueries({ queryKey: ["rules"] })}
         />
@@ -397,12 +406,14 @@ function FilterChip({
 function RuleDetailDrawer({
   ruleId,
   sigmaReady,
+  canManage,
   onClose,
   onEdit,
   onDelete,
 }: {
   ruleId: string;
   sigmaReady: boolean;
+  canManage: boolean;
   onClose: () => void;
   onEdit: () => void;
   onDelete: (rule: RuleSummary) => void;
@@ -477,7 +488,7 @@ function RuleDetailDrawer({
                 className="input"
                 id={`rule-severity-${ruleId}`}
                 value={rule.severity_override ?? ""}
-                disabled={severity.isPending}
+                disabled={!canManage || severity.isPending}
                 onChange={(event) => severity.mutate(event.target.value)}
               >
                 <option value="">Default ({rule.severity})</option>
@@ -517,10 +528,10 @@ function RuleDetailDrawer({
           <div className="flex flex-wrap gap-2 border-t border-white/5 pt-4">
             {rule.source === "custom" && (
               <>
-                <button className="btn-primary" onClick={onEdit}>
+                <button className="btn-primary" disabled={!canManage} onClick={onEdit}>
                   <FileCode2 size={15} /> Edit
                 </button>
-                <button className="btn-ghost text-sev-critical" onClick={() => onDelete(rule)}>
+                <button className="btn-ghost text-sev-critical" disabled={!canManage} onClick={() => onDelete(rule)}>
                   <Trash2 size={15} /> Delete
                 </button>
               </>
@@ -528,8 +539,8 @@ function RuleDetailDrawer({
             {rule.source === "builtin" && rule.forkable && (
               <button
                 className="btn-primary"
-                disabled={!sigmaReady}
-                title={sigmaReady ? undefined : "Forking needs the pysigma package"}
+                disabled={!sigmaReady || !canManage}
+                title={!canManage ? "An SSO administrator is required to change shared rules" : sigmaReady ? undefined : "Forking needs the pysigma package"}
                 onClick={() => setForkOpen(true)}
               >
                 <GitFork size={15} /> Fork to Sigma
@@ -568,7 +579,7 @@ function RuleDetailDrawer({
   );
 }
 
-function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
+function ImportDialog({ onClose, onDone, canManage }: { onClose: () => void; onDone: () => void; canManage: boolean }) {
   const [text, setText] = useState("");
   const sourceId = useId();
   const importer = useMutation({
@@ -614,7 +625,7 @@ function ImportDialog({ onClose, onDone }: { onClose: () => void; onDone: () => 
           </button>
           <button
             className="btn-primary"
-            disabled={!text.trim() || importer.isPending}
+            disabled={!canManage || !text.trim() || importer.isPending}
             onClick={() => importer.mutate()}
           >
             {importer.isPending ? "Importing…" : "Import"}

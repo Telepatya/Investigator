@@ -9,13 +9,15 @@ import os
 import re
 import secrets
 import tempfile
+import threading
 import time
 import zipfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.config import case_uploads_path, get_cases_dir
+from app.config import case_dir_path, case_uploads_path, get_cases_dir
 from app.memory.forensics import memprocfs_artifact_dir
 from app.memory.identity import is_memory_upload, memory_upload_key
 from app.memory.memprocfs_runner import (
@@ -31,6 +33,8 @@ MAX_ARCHIVE_DEPTH = 6
 MAX_ARCHIVE_FILES = 1000
 MAX_MODULE_HASH_BYTES = 512 * 1024 * 1024
 logger = logging.getLogger(__name__)
+_MANIFEST_LOCKS: dict[str, threading.Lock] = {}
+_MANIFEST_LOCKS_GUARD = threading.Lock()
 
 
 class MemoryExplorerError(RuntimeError):
@@ -921,15 +925,112 @@ def _vfs_entry(vmm, path: str) -> Any | None:
 
 
 def _record_manifest(case_id: str, dump_stem: str, entry: dict[str, Any]) -> None:
-    manifest_path = memprocfs_artifact_dir(case_id, dump_stem) / "extracted" / "manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {"artifacts": []}
-    except json.JSONDecodeError:
-        manifest = {"artifacts": []}
-    entry = {**entry, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    manifest.setdefault("artifacts", []).append(entry)
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    case_root = case_dir_path(case_id)
+    artifact_root = _contained_artifact_path(
+        case_root, memprocfs_artifact_dir(case_id, dump_stem)
+    )
+
+    # Like the other extractors, path checks assume the app-owned cases tree
+    # cannot be mutated by a separate local process during the operation.
+    extracted_requested = artifact_root / "extracted"
+    if extracted_requested.is_symlink():
+        raise MemoryExplorerError("Unsafe extraction path", 500)
+    extracted_dir = _contained_artifact_path(artifact_root, extracted_requested)
+    extracted_dir.mkdir(parents=True, exist_ok=True)
+    # Resolve again after mkdir so a pre-existing or substituted symlink cannot
+    # redirect manifest work outside the case's artifact tree.
+    if extracted_requested.is_symlink():
+        raise MemoryExplorerError("Unsafe extraction path", 500)
+    extracted_dir = _contained_artifact_path(artifact_root, extracted_requested)
+    manifest_requested = extracted_dir / "manifest.json"
+    lock_requested = extracted_dir / ".manifest.json.lock"
+    if lock_requested.is_symlink():
+        raise MemoryExplorerError("Unsafe extraction manifest lock", 500)
+
+    lock_path = _contained_artifact_path(artifact_root, lock_requested)
+    with _manifest_update_lock(lock_path):
+        # A symlink at the manifest leaf would otherwise make a safe parent
+        # write follow an attacker-selected file, even when it remains in-root.
+        if manifest_requested.is_symlink():
+            raise MemoryExplorerError("Unsafe extraction manifest path", 500)
+        manifest_path = _contained_artifact_path(artifact_root, manifest_requested)
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                # Do not replace a corrupt forensic record with an empty one.
+                raise MemoryExplorerError("Existing extraction manifest is invalid", 500) from exc
+            if not isinstance(manifest, dict) or not isinstance(manifest.get("artifacts"), list):
+                raise MemoryExplorerError("Existing extraction manifest has an invalid structure", 500)
+        else:
+            manifest = {"artifacts": []}
+
+        entry = {**entry, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        manifest["artifacts"].append(entry)
+        descriptor, partial_name = tempfile.mkstemp(
+            dir=extracted_dir,
+            prefix=".manifest.json.partial-",
+        )
+        partial = Path(partial_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # The staging file is created by mkstemp in the contained directory;
+            # re-check the replace destination immediately before publication.
+            _contained_artifact_path(artifact_root, partial)
+            manifest_path = _contained_artifact_path(artifact_root, manifest_requested)
+            os.replace(partial, manifest_path)
+        except Exception:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Could not remove partial extraction manifest %s",
+                    _sanitize_for_log(partial),
+                    exc_info=True,
+                )
+            raise
+
+
+@contextmanager
+def _manifest_update_lock(lock_path: Path):
+    """Serialize manifest updates between threads and cooperating processes."""
+    key = os.path.normcase(os.path.abspath(lock_path))
+    with _MANIFEST_LOCKS_GUARD:
+        thread_lock = _MANIFEST_LOCKS.setdefault(key, threading.Lock())
+    with thread_lock:
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"\0")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+                locked = True
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locked = True
+            yield
+        finally:
+            if locked:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
 
 def _contained_artifact_path(allowed_root: Path, candidate: Path) -> Path:

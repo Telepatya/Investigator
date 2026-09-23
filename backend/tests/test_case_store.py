@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from importlib.util import find_spec
 from pathlib import Path
 from threading import Event as ThreadEvent, Thread
 from unittest.mock import patch
@@ -26,19 +27,21 @@ class _BaseModel:
         return "{}"
 
 
-sys.modules.setdefault("keyring", types.SimpleNamespace(
-    get_password=lambda *_args, **_kwargs: None,
-    set_password=lambda *_args, **_kwargs: None,
-    delete_password=lambda *_args, **_kwargs: None,
-    errors=types.SimpleNamespace(PasswordDeleteError=Exception),
-))
-sys.modules.setdefault("pydantic", types.SimpleNamespace(
-    BaseModel=_BaseModel,
-    Field=lambda default=None, default_factory=None, **_kwargs: default_factory() if default_factory else default,
-))
+if "keyring" not in sys.modules and find_spec("keyring") is None:
+    sys.modules.setdefault("keyring", types.SimpleNamespace(
+        get_password=lambda *_args, **_kwargs: None,
+        set_password=lambda *_args, **_kwargs: None,
+        delete_password=lambda *_args, **_kwargs: None,
+        errors=types.SimpleNamespace(PasswordDeleteError=Exception),
+    ))
+if "pydantic" not in sys.modules and find_spec("pydantic") is None:
+    sys.modules.setdefault("pydantic", types.SimpleNamespace(
+        BaseModel=_BaseModel,
+        Field=lambda default=None, default_factory=None, **_kwargs: default_factory() if default_factory else default,
+    ))
 
 from app.ingest import evidence
-from app.memory import forensics
+import app.config as config
 from app.memory import pipeline as memory_pipeline
 from app.store import cases
 from app.store import database
@@ -51,8 +54,8 @@ class CaseStoreTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.patches = [
             patch.object(cases, "get_cases_dir", return_value=self.root),
+            patch.object(config, "get_cases_dir", return_value=self.root),
             patch.object(cases, "case_db_path", side_effect=lambda case_id: self.root / case_id / "case.db"),
-            patch.object(forensics, "get_cases_dir", return_value=self.root),
         ]
         for p in self.patches:
             p.start()
@@ -87,6 +90,18 @@ class CaseStoreTests(unittest.TestCase):
 
         self.assertIn(db_path, database._ENGINE_CACHE)
         self.assertEqual(len(database._ENGINE_CACHE), 1)
+
+    def test_case_directory_rejects_alias_to_another_case(self) -> None:
+        target = self.root / "aaaaaaaa"
+        target.mkdir()
+        alias = self.root / "bbbbbbbb"
+        try:
+            alias.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"Symlink creation is unavailable: {exc}")
+
+        with self.assertRaisesRegex(ValueError, "symlink alias"):
+            config.case_dir_path(alias.name)
 
     def test_chat_sessions_keep_independent_history_and_delete_cleanly(self) -> None:
         case = cases.create_case("chat sessions")

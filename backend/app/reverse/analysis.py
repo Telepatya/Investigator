@@ -1325,7 +1325,6 @@ Keep your report concise but technically rigorous."""
                 # Analysis methodology is model-directed. The progress controller only
                 # prevents a demonstrably stalled method until an independent assumption
                 # has been checked; it never requires an artifact-specific command sequence.
-                structured_rejection = None
                 semantic_profile = _semantic_tool_profile(call)
                 semantic_family = semantic_profile["family"]
                 diagnostic_rejection = _diagnostic_rejection(controller, call)
@@ -1335,14 +1334,6 @@ Keep your report concise but technically rigorous."""
                         "error": diagnostic_rejection,
                         "tool": call.tool,
                         "diagnostic_pivot_required": True,
-                    }
-                    no_progress_turns += 1
-                elif structured_rejection:
-                    tool_result = {
-                        "success": False,
-                        "error": structured_rejection,
-                        "tool": call.tool,
-                        "structured_format_rejected": True,
                     }
                     no_progress_turns += 1
                 elif call.tool not in _approved_tools(project_id):
@@ -1397,7 +1388,6 @@ Keep your report concise but technically rigorous."""
                         "target": target,
                         "request_signature": request_signature,
                         "duplicate_rejected": duplicate,
-                        "structured_format_rejected": bool(structured_rejection),
                         "diagnostic_pivot_rejected": bool(diagnostic_rejection),
                         "semantic_family": semantic_family,
                         "semantic_key": semantic_profile["key"],
@@ -1480,7 +1470,7 @@ Keep your report concise but technically rigorous."""
             await self._mark_stopped(project_id, run_id, "Stopped by analyst")
             raise
         except Exception as exc:
-            logger.exception("Reverse analysis failed for %s", project_id)
+            logger.exception("Reverse analysis failed")
             await self._mark_failed(project_id, run_id, str(exc))
 
     async def _extract_ioc_inventory(
@@ -1508,7 +1498,7 @@ Keep your report concise but technically rigorous."""
             if isinstance(raw, str) and raw.strip():
                 return _parse_ioc_inventory(raw, valid_ids)
         except Exception:
-            logger.warning("Reverse IOC inventory step failed for %s", project_id, exc_info=True)
+            logger.warning("Reverse IOC inventory step failed", exc_info=True)
         return "", []
 
     async def _revise_report(
@@ -1690,7 +1680,7 @@ Keep your report concise but technically rigorous."""
         try:
             await self._attempt_report_signature(project_id, run_id)
         except Exception:
-            logger.exception("Unexpected Reverse signing persistence failure for %s", project_id)
+            logger.exception("Unexpected Reverse signing persistence failure")
         return "published"
 
     async def _review_report(
@@ -1773,7 +1763,7 @@ Keep your report concise but technically rigorous."""
                 db.commit()
             return current, decision
         except Exception as exc:
-            logger.warning("Reverse report verification failed for %s", project_id, exc_info=True)
+            logger.warning("Reverse report verification failed", exc_info=True)
             return current, {
                 "status": "failed",
                 "action": "publish",
@@ -1932,7 +1922,7 @@ Keep your report concise but technically rigorous."""
                     "error_type": type(exc).__name__,
                 }, db=db)
                 db.commit()
-            logger.warning("Reverse report signing failed for %s: %s", project_id, safe_error)
+            logger.warning("Reverse report signing failed (%s)", type(exc).__name__)
             return False
         algorithm = key_info["algorithm"]
         with get_reverse_session() as db:
@@ -2096,8 +2086,7 @@ Keep your report concise but technically rigorous."""
                 await self._attempt_report_signature(project_id, run_id)
             except Exception:
                 logger.exception(
-                    "Unexpected Reverse signing failure after report review for %s",
-                    project_id,
+                    "Unexpected Reverse signing failure after report review"
                 )
             with get_reverse_session() as db:
                 return db.get(ReverseRun, run_id)
@@ -2209,8 +2198,7 @@ Keep your report concise but technically rigorous."""
                 )
             except TimeoutError:
                 logger.warning(
-                    "Reverse task %s did not cancel within %s seconds",
-                    project_id,
+                    "Reverse task did not cancel within %s seconds",
                     _STOP_CANCEL_TIMEOUT_SECONDS,
                 )
                 await self._mark_stopped(
@@ -2467,7 +2455,7 @@ Keep your report concise but technically rigorous."""
                 allow_continue=False,
             )
         except Exception as exc:
-            logger.exception("Reverse finalization failed for %s", project_id)
+            logger.exception("Reverse finalization failed")
             await self._mark_failed(project_id, run_id, str(exc))
 
     async def replay(self, project_id: str) -> ReverseRun:

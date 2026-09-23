@@ -162,9 +162,12 @@ def _ensure_contained(base: Path, target: Path) -> Path:
 
 def case_dir_path(case_id: str, config: AppConfig | None = None) -> Path:
     root = get_cases_dir(config).resolve()
-    path = (root / validate_case_id_component(case_id)).resolve()
+    requested_path = root / validate_case_id_component(case_id)
+    path = requested_path.resolve()
     if path.parent != root:
         raise ValueError("Invalid case directory")
+    if os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(requested_path)):
+        raise ValueError("Case directory cannot be a symlink alias")
     return _ensure_contained(root, path)
 
 

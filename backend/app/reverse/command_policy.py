@@ -87,6 +87,17 @@ def normalize_workspace_path(value: str, cwd: str = WORKSPACE) -> str:
     return normalized
 
 
+def _is_symbolic_chmod_mode(value: str) -> bool:
+    """Match one symbolic chmod clause without a backtracking regex."""
+    index = 0
+    while index < len(value) and value[index] in "ugoa":
+        index += 1
+    if index == 0 or index >= len(value) or value[index] not in "+-=":
+        return False
+    index += 1
+    return index < len(value) and all(char in "rwxXst" for char in value[index:])
+
+
 def _mutation_targets(executable: str, args: list[str], cwd: str) -> list[str]:
     targets: list[str] = []
     output_next = False
@@ -118,7 +129,7 @@ def _mutation_targets(executable: str, args: list[str], cwd: str) -> list[str]:
             continue
         if executable == "chmod" and index == 0 and re.fullmatch(r"[0-7]{3,4}", arg):
             continue
-        if executable == "chmod" and index == 0 and re.fullmatch(r"[ugoa]+[+=-][rwxXst]+", arg):
+        if executable == "chmod" and index == 0 and _is_symbolic_chmod_mode(arg):
             continue
         if executable in {"binwalk", "7z", "7za", "p7zip", "unzip", "unrar", "upx"}:
             # Input artifacts are legitimate non-option operands. Explicit output

@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Annotated
 
 import aiofiles
-from fastapi import APIRouter, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
-from app.api.security import authorize_ws
+from app.api.security import authorize_ws, require_ws_session
+from app.auth.access import require_shared_admin
 from app.config import (
     UPLOAD_STAGING_PREFIX,
     case_dir_path,
@@ -131,7 +132,8 @@ def get_case(case_id: str) -> dict:
 
 
 @router.delete("/{case_id}")
-async def delete_case(case_id: str) -> dict:
+async def delete_case(case_id: str, request: Request) -> dict:
+    require_shared_admin(request)
     if not await asyncio.to_thread(case_store.case_exists, case_id):
         raise HTTPException(404, "Case not found")
     async with coordinator.run(case_id, "case deletion"):
@@ -258,7 +260,7 @@ async def _finish_replacement(
     )
     try:
         worker = asyncio.create_task(worker_coroutine)
-    except BaseException:
+    except Exception:
         worker_coroutine.close()
         ingestion_task.cancel()
         await asyncio.gather(ingestion_task, return_exceptions=True)
@@ -269,12 +271,12 @@ async def _finish_replacement(
             await asyncio.shield(worker)
         except asyncio.CancelledError as exc:
             cancellation = cancellation or exc
-        except BaseException:
+        except Exception:
             break
 
     try:
         worker.result()
-    except BaseException:
+    except (Exception, asyncio.CancelledError):
         ingestion_task.cancel()
         await asyncio.gather(ingestion_task, return_exceptions=True)
         if cancellation is not None:
@@ -567,12 +569,15 @@ async def ingestion_ws(websocket: WebSocket, case_id: str) -> None:
     await websocket.accept()
     queue = manager.subscribe(case_id)
     try:
+        await require_ws_session(websocket)
         # send current status immediately
         current = manager.get_status(case_id)
         if current:
+            await require_ws_session(websocket)
             await websocket.send_json(current)
         while True:
             payload = await queue.get()
+            await require_ws_session(websocket)
             await websocket.send_json(payload)
             if payload.get("done"):
                 # keep open a moment for final message delivery

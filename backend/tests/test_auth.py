@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -24,6 +25,9 @@ from app.auth.oidc import (
     validate_id_token,
 )
 from app.auth.session import (
+    COOKIE_NAME,
+    LOGIN_LIMIT_PER_CLIENT,
+    LOGIN_LIMIT_WINDOW_SECONDS,
     LEGACY_OIDC_BINDING_COOKIE_NAME,
     OIDC_BINDING_COOKIE_NAME,
     clear_auth_state,
@@ -32,6 +36,8 @@ from app.auth.session import (
     create_transaction,
     get_session,
     revoke_session,
+    sync_auth_policy,
+    sync_auth_policy_if_store_exists,
 )
 import app.config as app_config
 
@@ -109,6 +115,18 @@ class AuthConfigTests(unittest.TestCase):
             cfg = get_auth_config()
         self.assertFalse(cfg.configured)
         self.assertIn("scope", (cfg.error or "").lower())
+
+    def test_policy_fingerprint_changes_with_authorization_policy(self) -> None:
+        initial = _auth_config()
+        self.assertEqual(initial.policy_fingerprint, _auth_config().policy_fingerprint)
+        self.assertNotEqual(
+            initial.policy_fingerprint,
+            _auth_config(allowed_values=("Administrators",)).policy_fingerprint,
+        )
+        self.assertNotEqual(
+            initial.policy_fingerprint,
+            _auth_config(client_secret="rotated-secret").policy_fingerprint,
+        )
 
     def test_auth_disabled_does_not_discover_an_idp(self) -> None:
         from fastapi.testclient import TestClient
@@ -369,6 +387,162 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(consume_transaction(state, "binding", now=150), {"nonce": "nonce", "code_verifier": "verifier", "return_path": "/cases"})
         self.assertIsNone(consume_transaction(state, "binding", now=150))
 
+    def test_login_initiation_limit_is_bounded_and_recovers_after_window(self) -> None:
+        def start_login() -> str | None:
+            return create_transaction(
+                nonce="nonce",
+                code_verifier="verifier",
+                browser_binding="binding",
+                return_path="/cases",
+                expires_at=1200,
+                client_key="192.0.2.40",
+            )
+
+        with patch("app.auth.session.time.time", return_value=1000):
+            accepted = [start_login() for _ in range(LOGIN_LIMIT_PER_CLIENT)]
+            rejected = start_login()
+        self.assertTrue(all(accepted))
+        self.assertIsNone(rejected)
+        with closing(sqlite3.connect(app_config.DEFAULT_CONFIG_DIR / "auth.db")) as db:
+            transaction_count = db.execute("SELECT COUNT(*) FROM oidc_transactions").fetchone()[0]
+        self.assertEqual(transaction_count, LOGIN_LIMIT_PER_CLIENT)
+
+        with patch(
+            "app.auth.session.time.time",
+            return_value=1000 + LOGIN_LIMIT_WINDOW_SECONDS,
+        ):
+            recovered = start_login()
+        self.assertIsNotNone(recovered)
+
+    def test_live_transaction_capacity_is_enforced_atomically(self) -> None:
+        def start_login(expiry: float) -> str | None:
+            return create_transaction(
+                nonce="nonce",
+                code_verifier="verifier",
+                browser_binding="binding",
+                return_path="/cases",
+                expires_at=expiry,
+                client_key="192.0.2.41",
+            )
+
+        with (
+            patch("app.auth.session.time.time", return_value=2000),
+            patch("app.auth.session.ACTIVE_TRANSACTION_LIMIT", 1),
+        ):
+            first = start_login(2060)
+            second = start_login(2061)
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+
+        with (
+            patch("app.auth.session.time.time", return_value=2060),
+            patch("app.auth.session.ACTIVE_TRANSACTION_LIMIT", 1),
+        ):
+            after_expiry = start_login(2120)
+        self.assertIsNotNone(after_expiry)
+
+    def test_concurrent_login_starts_cannot_exceed_per_client_limit(self) -> None:
+        def start_login(_index: int) -> str | None:
+            return create_transaction(
+                nonce="nonce",
+                code_verifier="verifier",
+                browser_binding=f"binding-{_index}",
+                return_path="/cases",
+                expires_at=time.time() + 60,
+                client_key="192.0.2.42",
+            )
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            results = list(pool.map(start_login, range(LOGIN_LIMIT_PER_CLIENT + 10)))
+        self.assertEqual(sum(state is not None for state in results), LOGIN_LIMIT_PER_CLIENT)
+        with closing(sqlite3.connect(app_config.DEFAULT_CONFIG_DIR / "auth.db")) as db:
+            transaction_count = db.execute("SELECT COUNT(*) FROM oidc_transactions").fetchone()[0]
+        self.assertEqual(transaction_count, LOGIN_LIMIT_PER_CLIENT)
+
+    def test_policy_change_invalidates_sessions_and_pending_transactions(self) -> None:
+        self.assertTrue(sync_auth_policy("policy-a"))
+        token, _session = create_session(
+            subject="sub",
+            display_name="Analyst",
+            email=None,
+            is_admin=False,
+            idle_seconds=60,
+            absolute_seconds=3600,
+        )
+        state = create_transaction(
+            nonce="nonce",
+            code_verifier="verifier",
+            browser_binding="binding",
+            return_path="/cases",
+            expires_at=time.time() + 60,
+        )
+        self.assertIsNotNone(state)
+        self.assertFalse(sync_auth_policy("policy-a"))
+        self.assertEqual(get_session(token, idle_seconds=60).subject, "sub")
+
+        self.assertTrue(sync_auth_policy("policy-b"))
+        self.assertIsNone(get_session(token, idle_seconds=60))
+        self.assertIsNone(consume_transaction(state, "binding"))
+
+    def test_disabled_policy_sync_does_not_create_missing_auth_db(self) -> None:
+        path = app_config.DEFAULT_CONFIG_DIR / "auth.db"
+        path.unlink(missing_ok=True)
+        self.assertFalse(sync_auth_policy_if_store_exists("disabled-policy"))
+        self.assertFalse(path.exists())
+
+    def test_legacy_auth_db_migration_invalidates_unversioned_sessions(self) -> None:
+        path = app_config.DEFAULT_CONFIG_DIR / "auth.db"
+        path.unlink(missing_ok=True)
+        token = "legacy-session-token"
+        state = "legacy-transaction-state"
+        now = time.time()
+        with closing(sqlite3.connect(path)) as db:
+            db.executescript(
+                """
+                CREATE TABLE auth_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    display_name TEXT,
+                    email TEXT,
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    last_seen REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    absolute_expires_at REAL NOT NULL
+                );
+                CREATE TABLE oidc_transactions (
+                    state_hash TEXT PRIMARY KEY,
+                    nonce TEXT NOT NULL,
+                    code_verifier TEXT NOT NULL,
+                    return_path TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
+                """
+            )
+            db.execute(
+                "INSERT INTO auth_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (hashlib.sha256(token.encode()).hexdigest(), "legacy-sub", None, None, 0, now, now, now + 60, now + 3600),
+            )
+            db.execute(
+                "INSERT INTO oidc_transactions VALUES (?, ?, ?, ?, ?, ?)",
+                (hashlib.sha256(state.encode()).hexdigest(), "nonce", "verifier", "/cases", now, now + 60),
+            )
+            db.commit()
+
+        self.assertTrue(sync_auth_policy("migrated-policy"))
+        self.assertIsNone(get_session(token, idle_seconds=60))
+        self.assertIsNone(consume_transaction(state, "binding"))
+        with closing(sqlite3.connect(path)) as db:
+            migrated_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(oidc_transactions)")
+            }
+            remaining_transactions = db.execute(
+                "SELECT COUNT(*) FROM oidc_transactions"
+            ).fetchone()[0]
+        self.assertIn("binding_hash", migrated_columns)
+        self.assertEqual(remaining_transactions, 0)
+
     def test_transaction_persists_only_hashes_of_browser_values(self) -> None:
         browser_binding = "unique-browser-binding"
         state = create_transaction(
@@ -442,16 +616,302 @@ class AuthBoundaryTests(unittest.TestCase):
                 pass
 
     def test_authenticated_session_and_origin_policy(self) -> None:
+        sync_auth_policy(get_auth_config().policy_fingerprint)
         token, _ = create_session(subject="sub", display_name="Analyst", email=None, is_admin=False, idle_seconds=60, absolute_seconds=3600)
         self.client.cookies.set("investigator_session", token)
+        self.assertEqual(self.client.get("/api/auth/bootstrap").json()["authenticated"], True)
         self.assertEqual(self.client.get("/api/auth/session").json()["authenticated"], True)
         self.assertEqual(self.client.post("/api/auth/logout").status_code, 403)
         self.assertEqual(self.client.post("/api/auth/logout", headers={"origin": "http://localhost:8400"}).status_code, 200)
+
+    def _create_websocket_session(self) -> str:
+        sync_auth_policy(get_auth_config().policy_fingerprint)
+        token, _ = create_session(
+            subject="sub",
+            display_name="Analyst",
+            email=None,
+            is_admin=False,
+            idle_seconds=60,
+            absolute_seconds=3600,
+        )
+        self.client.cookies.set(COOKIE_NAME, token)
+        return token
+
+    def _websocket_headers(self, token: str) -> dict[str, str]:
+        # TestClient's WebSocket helper targets ``ws://testserver`` regardless
+        # of its HTTP base URL, so provide the SSO origin/host and cookie.
+        return {
+            "origin": "http://localhost:8400",
+            "host": "localhost:8400",
+            "cookie": f"{COOKIE_NAME}={token}",
+        }
+
+    def test_logout_revokes_open_chat_socket_before_next_model_or_case_work(self) -> None:
+        from app.api import analysis_router
+        from starlette.websockets import WebSocketDisconnect
+
+        token = self._create_websocket_session()
+        with patch.object(analysis_router.case_store, "case_exists", return_value=True) as exists:
+            with patch.object(analysis_router, "chat_stream") as chat:
+                with self.client.websocket_connect(
+                    "/api/cases/deadbeef/chat-ws",
+                    headers=self._websocket_headers(token),
+                ) as websocket:
+                    logout = self.client.post(
+                        "/api/auth/logout",
+                        headers={"origin": "http://localhost:8400"},
+                    )
+                    self.assertEqual(logout.status_code, 200)
+                    websocket.send_json({"message": "run this", "chat_id": "chat"})
+                    with self.assertRaises(WebSocketDisconnect) as closed:
+                        websocket.receive_json()
+                    self.assertEqual(closed.exception.code, 1008)
+                chat.assert_not_called()
+            exists.assert_called_once_with("deadbeef")
+
+    def test_logout_suppresses_queued_analysis_progress_for_open_socket(self) -> None:
+        from app.api import analysis_router
+        from starlette.websockets import WebSocketDisconnect
+
+        token = self._create_websocket_session()
+        with patch.object(analysis_router.case_store, "case_exists", return_value=True):
+            with self.client.websocket_connect(
+                "/api/cases/deadbeef/analyze-ws",
+                headers=self._websocket_headers(token),
+            ) as websocket:
+                self.assertEqual(websocket.receive_json()["phase"], "connected")
+                logout = self.client.post(
+                    "/api/auth/logout",
+                    headers={"origin": "http://localhost:8400"},
+                )
+                self.assertEqual(logout.status_code, 200)
+                websocket.portal.call(
+                    analysis_router._broadcast_analysis,
+                    "deadbeef",
+                    {"phase": "done", "message": "must not be disclosed", "percent": 100},
+                )
+                with self.assertRaises(WebSocketDisconnect) as closed:
+                    websocket.receive_json()
+                self.assertEqual(closed.exception.code, 1008)
+
+    def test_policy_change_revokes_open_entity_socket_before_provider_dispatch(self) -> None:
+        from app.api import analysis_router
+        from starlette.websockets import WebSocketDisconnect
+
+        token = self._create_websocket_session()
+        with patch.object(analysis_router.case_store, "case_exists", return_value=True):
+            with patch.object(analysis_router, "investigate_entity_stream") as investigate:
+                with self.client.websocket_connect(
+                    "/api/cases/deadbeef/investigate-entity-ws",
+                    headers=self._websocket_headers(token),
+                ) as websocket:
+                    with patch.dict(os.environ, {"INVESTIGATOR_SSO_ALLOWED_VALUES": "Administrators"}):
+                        websocket.send_json({"entity_id": "host-1"})
+                        with self.assertRaises(WebSocketDisconnect) as closed:
+                            websocket.receive_json()
+                    self.assertEqual(closed.exception.code, 1008)
+                investigate.assert_not_called()
+
+    def test_public_health_and_static_requests_skip_middleware_session_lookup(self) -> None:
+        from app.auth import middleware as auth_middleware
+
+        cookie = f"{COOKIE_NAME}=untrusted-session"
+        with patch.object(
+            auth_middleware,
+            "get_session",
+            side_effect=AssertionError("public request should not look up a session"),
+        ):
+            health = self.client.get("/api/health", headers={"cookie": cookie})
+            static = self.client.get("/", headers={"cookie": cookie})
+
+        self.assertEqual(health.status_code, 200)
+        self.assertIn(static.status_code, (200, 404))
+
+    def test_oidc_allowlist_change_invalidates_existing_browser_session(self) -> None:
+        sync_auth_policy(get_auth_config().policy_fingerprint)
+        token, _ = create_session(
+            subject="sub",
+            display_name="Analyst",
+            email=None,
+            is_admin=False,
+            idle_seconds=60,
+            absolute_seconds=3600,
+        )
+        self.client.cookies.set("investigator_session", token)
+
+        with patch.dict(os.environ, {"INVESTIGATOR_SSO_ALLOWED_VALUES": "Administrators"}):
+            denied = self.client.get("/api/cases")
+
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(denied.json(), {"detail": "Authentication required"})
+
+    def test_disable_then_reenable_auth_revokes_existing_session(self) -> None:
+        sync_auth_policy(get_auth_config().policy_fingerprint)
+        token, _ = create_session(
+            subject="sub",
+            display_name="Analyst",
+            email=None,
+            is_admin=False,
+            idle_seconds=60,
+            absolute_seconds=3600,
+        )
+        self.client.cookies.set("investigator_session", token)
+
+        with patch.dict(os.environ, {"INVESTIGATOR_AUTH_ENABLED": "false"}):
+            disabled = self.client.get("/api/auth/bootstrap")
+        self.assertFalse(disabled.json()["enabled"])
+
+        reenabled = self.client.get("/api/cases")
+        self.assertEqual(reenabled.status_code, 401)
+        self.assertEqual(reenabled.json(), {"detail": "Authentication required"})
+
+    def test_malformed_callbacks_do_not_sync_policy_or_open_auth_db(self) -> None:
+        from app.auth import router as auth_router
+        from app.auth import session as auth_session
+
+        malformed_paths = (
+            "/api/auth/callback",
+            "/api/auth/callback?state=state",
+            "/api/auth/callback?code=code",
+            "/api/auth/callback?code=code&state=" + ("x" * 257),
+            "/api/auth/callback?error=access_denied",
+        )
+        cookie = "; ".join(
+            (
+                f"{COOKIE_NAME}=stale-session",
+                f"{OIDC_BINDING_COOKIE_NAME}=binding",
+            )
+        )
+        with (
+            patch.object(auth_router, "sync_auth_policy") as sync_policy,
+            patch.object(auth_router, "consume_transaction") as consume,
+            patch.object(auth_session, "_connect", side_effect=AssertionError("unexpected auth DB access")) as connect,
+        ):
+            for path in malformed_paths:
+                with self.subTest(path=path[:100]):
+                    response = self.client.get(path, headers={"cookie": cookie}, follow_redirects=False)
+                    self.assertEqual(response.status_code, 400)
+
+        sync_policy.assert_not_called()
+        consume.assert_not_called()
+        connect.assert_not_called()
+
+    def test_provider_denial_skips_database_and_leaves_transaction_to_expire(self) -> None:
+        from app.auth import router as auth_router
+        from app.auth import session as auth_session
+
+        cookie = "; ".join(
+            (
+                f"{COOKIE_NAME}=stale-session",
+                f"{OIDC_BINDING_COOKIE_NAME}=" + ("B" * 43),
+            )
+        )
+        with (
+            patch.object(auth_router, "sync_auth_policy") as sync_policy,
+            patch.object(auth_router, "consume_transaction") as consume,
+            patch.object(auth_session, "_connect", side_effect=AssertionError("unexpected auth DB access")) as connect,
+        ):
+            response = self.client.get(
+                "/api/auth/callback?error=access_denied&state=" + ("S" * 43),
+                headers={"cookie": cookie},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 400)
+        sync_policy.assert_not_called()
+        consume.assert_not_called()
+        connect.assert_not_called()
+
+    def test_callback_policy_change_during_exchange_cannot_mint_stale_session(self) -> None:
+        from app.auth import router as auth_router
+        from app.auth import session as auth_session
+        from app.auth.oidc import Identity
+
+        auth_config = get_auth_config()
+        sync_auth_policy(auth_config.policy_fingerprint)
+        events: list[str] = []
+        real_sync = auth_router.sync_auth_policy
+
+        def record_sync(fingerprint: str) -> bool:
+            events.append("sync")
+            return real_sync(fingerprint)
+
+        def consume(_state: str, _binding: str):
+            events.append("consume")
+            return {"nonce": "nonce", "code_verifier": "verifier", "return_path": "/cases"}
+
+        async def change_policy_during_exchange(_config, **_kwargs):
+            events.append("exchange")
+            auth_session.sync_auth_policy("newer-policy")
+            return {"id_token": "opaque-test-token"}
+
+        async def validate(_config, **_kwargs):
+            events.append("validate")
+            return Identity("subject", "Analyst", None, False)
+
+        with (
+            patch.object(auth_router, "sync_auth_policy", side_effect=record_sync),
+            patch.object(auth_router, "consume_transaction", side_effect=consume),
+            patch.object(auth_router, "exchange_code", new=AsyncMock(side_effect=change_policy_during_exchange)),
+            patch.object(auth_router, "validate_id_token", new=AsyncMock(side_effect=validate)),
+        ):
+            response = self.client.get(
+                "/api/auth/callback?code=code&state=" + ("S" * 43),
+                headers={"cookie": f"{OIDC_BINDING_COOKIE_NAME}=" + ("B" * 43)},
+                follow_redirects=False,
+            )
+
+        self.assertEqual(events, ["sync", "consume", "exchange", "validate"])
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("policy changed", response.json()["detail"])
+        with closing(sqlite3.connect(app_config.DEFAULT_CONFIG_DIR / "auth.db")) as db:
+            session_count = db.execute("SELECT COUNT(*) FROM auth_sessions").fetchone()[0]
+            policy = db.execute(
+                "SELECT value FROM auth_metadata WHERE key = 'policy_fingerprint'"
+            ).fetchone()[0]
+        self.assertEqual(session_count, 0)
+        self.assertEqual(policy, "newer-policy")
+
+    def test_rate_limited_login_does_not_contact_identity_provider_or_store_transaction(self) -> None:
+        from app.auth import router as auth_router
+        from app.auth import session as auth_session
+        from urllib.parse import urlencode
+
+        async def fake_authorization_url(_config, **kwargs):
+            return "https://idp.example.test/authorize?" + urlencode({"state": kwargs["state"]})
+
+        with patch.object(auth_session, "LOGIN_LIMIT_PER_CLIENT", 1), patch.object(
+            auth_router,
+            "authorization_url",
+            new=AsyncMock(side_effect=fake_authorization_url),
+        ) as authorization:
+            first = self.client.get("/api/auth/login", follow_redirects=False)
+            self.assertEqual(first.status_code, 303)
+            authorization.reset_mock()
+            limited = self.client.get("/api/auth/login", follow_redirects=False)
+
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.headers["retry-after"], "60")
+        authorization.assert_not_awaited()
+        with closing(sqlite3.connect(app_config.DEFAULT_CONFIG_DIR / "auth.db")) as db:
+            transaction_count = db.execute("SELECT COUNT(*) FROM oidc_transactions").fetchone()[0]
+        self.assertEqual(transaction_count, 1)
 
     def test_login_return_path_state_and_callback_replay_protection(self) -> None:
         from app.auth.oidc import Identity
         from app.auth import router as auth_router
         from urllib.parse import urlencode
+
+        sync_auth_policy(get_auth_config().policy_fingerprint)
+        old_token, _ = create_session(
+            subject="previous-subject",
+            display_name="Previous analyst",
+            email=None,
+            is_admin=False,
+            idle_seconds=60,
+            absolute_seconds=3600,
+        )
+        self.client.cookies.set(COOKIE_NAME, old_token)
 
         async def fake_authorization_url(_config, **kwargs):
             return "https://idp.example.test/authorize?" + urlencode({"state": kwargs["state"]})
@@ -481,6 +941,7 @@ class AuthBoundaryTests(unittest.TestCase):
             callback = self.client.get(f"/api/auth/callback?code=code&state={state}", follow_redirects=False)
         self.assertEqual(callback.status_code, 303)
         self.assertEqual(callback.headers["location"], "/cases")
+        self.assertIsNone(get_session(old_token, idle_seconds=60))
         replay = self.client.get(f"/api/auth/callback?code=code&state={state}", follow_redirects=False)
         self.assertEqual(replay.status_code, 400)
 

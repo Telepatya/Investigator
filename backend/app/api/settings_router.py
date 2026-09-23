@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
 
+from app.auth.access import can_manage_shared_state, require_shared_admin, shared_admin_required
 from app.config import (
     delete_api_key,
     has_api_key,
@@ -27,6 +28,16 @@ from app.reverse.tools import TOOL_DESCRIPTIONS
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 LLM_PROVIDERS = ("ollama", "openai", "openrouter", "gemini", "anthropic")
 API_KEY_PROVIDERS = ("openai", "openrouter", "gemini", "anthropic")
+
+
+@router.get("/access")
+async def get_settings_access(request: Request, response: Response) -> dict[str, bool]:
+    """Return the caller's shared-deployment administration capability."""
+    response.headers["Cache-Control"] = "no-store"
+    return {
+        "admin_required": shared_admin_required(),
+        "can_manage_shared_state": can_manage_shared_state(request),
+    }
 
 
 @router.get("/llm", response_model=LLMConfigResponse)
@@ -53,7 +64,8 @@ async def get_llm_config() -> LLMConfigResponse:
 
 
 @router.put("/llm", response_model=LLMConfigResponse)
-async def update_llm_config(update: LLMConfigUpdate) -> LLMConfigResponse:
+async def update_llm_config(update: LLMConfigUpdate, request: Request) -> LLMConfigResponse:
+    require_shared_admin(request)
     cfg = load_config().model_copy(deep=True)
     try:
         for provider in ("ollama", "openrouter"):
@@ -118,7 +130,8 @@ async def get_models(provider: str) -> list[ModelInfo]:
 
 
 @router.post("/llm/test/{provider}", response_model=ProviderTestResult)
-async def test_llm(provider: str) -> ProviderTestResult:
+async def test_llm(provider: str, request: Request) -> ProviderTestResult:
+    require_shared_admin(request)
     if provider not in LLM_PROVIDERS:
         raise HTTPException(400, "Unknown provider")
     ok, msg, models = await test_provider(provider)  # type: ignore[arg-type]
@@ -126,7 +139,8 @@ async def test_llm(provider: str) -> ProviderTestResult:
 
 
 @router.post("/llm/key/{provider}")
-async def set_api_key(provider: str, body: APIKeyUpdate) -> dict:
+async def set_api_key(provider: str, body: APIKeyUpdate, request: Request) -> dict:
+    require_shared_admin(request)
     if provider not in API_KEY_PROVIDERS:
         raise HTTPException(400, "This provider does not use an API key")
     key = body.api_key
@@ -137,7 +151,8 @@ async def set_api_key(provider: str, body: APIKeyUpdate) -> dict:
 
 
 @router.delete("/llm/key/{provider}")
-async def remove_api_key(provider: str) -> dict:
+async def remove_api_key(provider: str, request: Request) -> dict:
+    require_shared_admin(request)
     if provider not in API_KEY_PROVIDERS:
         raise HTTPException(400, "This provider does not use an API key")
     delete_api_key(provider)  # type: ignore[arg-type]
@@ -151,7 +166,8 @@ async def get_general_settings() -> dict:
 
 
 @router.put("/general")
-async def update_general_settings(body: GeneralSettingsUpdate) -> dict:
+async def update_general_settings(body: GeneralSettingsUpdate, request: Request) -> dict:
+    require_shared_admin(request)
     cfg = load_config()
     if "yara_rules_dir" in body.model_fields_set:
         cfg.yara_rules_dir = body.yara_rules_dir or ""
@@ -176,7 +192,8 @@ async def get_reverse_settings() -> dict:
 
 
 @router.put("/reverse")
-async def update_reverse_settings(body: ReverseSettingsUpdate) -> dict:
+async def update_reverse_settings(body: ReverseSettingsUpdate, request: Request) -> dict:
+    require_shared_admin(request)
     cfg = load_config()
     changes = body.model_dump(exclude_unset=True)
     if "enabled_tools" in changes:
