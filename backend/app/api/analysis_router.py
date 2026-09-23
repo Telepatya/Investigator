@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from app.models.schemas import ChatCreate, ChatTurn, EntityInvestigation
 
-from app.api.security import authorize_ws
+from app.api.security import authorize_ws, require_ws_session
 from app.llm.orchestrator import analyze_case, chat_stream, investigate_entity_stream
 from app.store import cases as case_store
 from app.detect import overrides
@@ -79,6 +79,7 @@ async def analyze_ws(websocket: WebSocket, case_id: str) -> None:
     queue: asyncio.Queue = asyncio.Queue(maxsize=100)
     _analysis_listeners.setdefault(case_id, []).append(queue)
     try:
+        await require_ws_session(websocket)
         await websocket.send_json({
             "case_id": case_id, "phase": "connected",
             "message": "running" if case_id in _analysis_running else "idle",
@@ -86,6 +87,7 @@ async def analyze_ws(websocket: WebSocket, case_id: str) -> None:
         })
         while True:
             payload = await queue.get()
+            await require_ws_session(websocket)
             await websocket.send_json(payload)
     except WebSocketDisconnect:
         return
@@ -147,6 +149,7 @@ async def _validated_ws_message(websocket: WebSocket, schema):
     frame = await websocket.receive()
     if frame["type"] == "websocket.disconnect":
         raise WebSocketDisconnect(code=frame.get("code", 1000))
+    await require_ws_session(websocket)
     raw = frame.get("text")
     if not isinstance(raw, str):
         await websocket.close(code=1003, reason="Expected a JSON text message")
@@ -174,18 +177,25 @@ async def chat_ws(websocket: WebSocket, case_id: str) -> None:
             question = data.message
             chat_id = data.chat_id
             if not question or not chat_id:
+                await require_ws_session(websocket)
                 await websocket.send_json({"type": "error", "content": "A chat session is required"})
                 continue
+            await require_ws_session(websocket)
             await websocket.send_json({"type": "start"})
             try:
                 async for chunk in chat_stream(case_id, chat_id, question):
+                    await require_ws_session(websocket)
                     if isinstance(chunk, dict):
                         # pre-typed events (e.g. {"type": "tool", ...}) pass through
                         await websocket.send_json(chunk)
                     else:
                         await websocket.send_json({"type": "chunk", "content": chunk})
+            except WebSocketDisconnect:
+                raise
             except Exception as e:
+                await require_ws_session(websocket)
                 await websocket.send_json({"type": "error", "content": str(e)})
+            await require_ws_session(websocket)
             await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
         return
@@ -204,12 +214,18 @@ async def investigate_entity_ws(websocket: WebSocket, case_id: str) -> None:
             entity_id = data.entity_id
             if not entity_id:
                 continue
+            await require_ws_session(websocket)
             await websocket.send_json({"type": "start"})
             try:
                 async for chunk in investigate_entity_stream(case_id, entity_id):
+                    await require_ws_session(websocket)
                     await websocket.send_json({"type": "chunk", "content": chunk})
+            except WebSocketDisconnect:
+                raise
             except Exception as e:
+                await require_ws_session(websocket)
                 await websocket.send_json({"type": "error", "content": str(e)})
+            await require_ws_session(websocket)
             await websocket.send_json({"type": "done"})
     except WebSocketDisconnect:
         return

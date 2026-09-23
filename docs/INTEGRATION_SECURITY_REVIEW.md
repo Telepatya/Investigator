@@ -11,7 +11,7 @@ Reverse container was used.
 | Issue | Change |
 | --- | --- |
 | [#98](https://github.com/Telepatya/Investigator/issues/98) | Bound anonymous OIDC login initiation and pending transactions. |
-| [#99](https://github.com/Telepatya/Investigator/issues/99) | Invalidate sessions and pending logins when identity policy changes. |
+| [#99](https://github.com/Telepatya/Investigator/issues/99) | Invalidate sessions and pending logins when identity policy changes, and enforce revocation on active WebSockets. |
 | [#100](https://github.com/Telepatya/Investigator/issues/100) | Enforce the configured SSO administrator role on shared settings, rules, and destructive case/workspace operations. |
 | [#101](https://github.com/Telepatya/Investigator/issues/101) | Resolve CodeQL control-flow and error-handling findings. |
 | [#102](https://github.com/Telepatya/Investigator/issues/102) | Remove untrusted project identifiers from Reverse log messages. |

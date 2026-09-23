@@ -162,9 +162,17 @@ attribution need an external control or a future application feature.
   independently of a policy change, stop the backend, back up the auth database
   if required by policy, then remove `~/.investigator/auth.db` and any
   `auth.db-wal`/`auth.db-shm` sidecars during a planned maintenance window.
+- Open WebSockets recheck the current session before each new client command
+  and before sending each progress or model-output event. Logout, session expiry,
+  or an authentication-policy change therefore blocks the next action or output.
+  An idle socket can remain connected until another action or event occurs. A
+  provider call already dispatched may continue until it yields its next event;
+  the backend checks the session before sending that event, but cannot undo work
+  already performed by the provider or retract earlier output.
 - Group or role removal at the IdP is checked at the next login, not on every
-  request. A current browser session can remain valid until its absolute
-  expiry or logout. Set `INVESTIGATOR_SSO_ABSOLUTE_SECONDS` to match the
+  HTTP request or active WebSocket message. A current browser session can
+  remain valid until its absolute expiry or logout. Set
+  `INVESTIGATOR_SSO_ABSOLUTE_SECONDS` to match the
   organization's offboarding window; use the maintenance procedure above to
   revoke all sessions sooner. There is no SCIM or back-channel logout.
 

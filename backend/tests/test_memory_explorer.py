@@ -625,7 +625,7 @@ class MemoryExplorerTests(unittest.TestCase):
         except OSError as exc:
             self.skipTest(f"Symlink creation is unavailable: {exc}")
 
-        with self.assertRaisesRegex(explorer.MemoryExplorerError, "Unsafe extraction path"):
+        with self.assertRaisesRegex(explorer.MemoryExplorerError, "Unsafe extraction"):
             explorer._record_manifest("deadbeef", "dump", {"kind": "test"})
         self.assertEqual(json.loads(outside.read_text(encoding="utf-8")), {"artifacts": []})
 

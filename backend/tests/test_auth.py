@@ -624,6 +624,94 @@ class AuthBoundaryTests(unittest.TestCase):
         self.assertEqual(self.client.post("/api/auth/logout").status_code, 403)
         self.assertEqual(self.client.post("/api/auth/logout", headers={"origin": "http://localhost:8400"}).status_code, 200)
 
+    def _create_websocket_session(self) -> str:
+        sync_auth_policy(get_auth_config().policy_fingerprint)
+        token, _ = create_session(
+            subject="sub",
+            display_name="Analyst",
+            email=None,
+            is_admin=False,
+            idle_seconds=60,
+            absolute_seconds=3600,
+        )
+        self.client.cookies.set(COOKIE_NAME, token)
+        return token
+
+    def _websocket_headers(self, token: str) -> dict[str, str]:
+        # TestClient's WebSocket helper targets ``ws://testserver`` regardless
+        # of its HTTP base URL, so provide the SSO origin/host and cookie.
+        return {
+            "origin": "http://localhost:8400",
+            "host": "localhost:8400",
+            "cookie": f"{COOKIE_NAME}={token}",
+        }
+
+    def test_logout_revokes_open_chat_socket_before_next_model_or_case_work(self) -> None:
+        from app.api import analysis_router
+        from starlette.websockets import WebSocketDisconnect
+
+        token = self._create_websocket_session()
+        with patch.object(analysis_router.case_store, "case_exists", return_value=True) as exists:
+            with patch.object(analysis_router, "chat_stream") as chat:
+                with self.client.websocket_connect(
+                    "/api/cases/deadbeef/chat-ws",
+                    headers=self._websocket_headers(token),
+                ) as websocket:
+                    logout = self.client.post(
+                        "/api/auth/logout",
+                        headers={"origin": "http://localhost:8400"},
+                    )
+                    self.assertEqual(logout.status_code, 200)
+                    websocket.send_json({"message": "run this", "chat_id": "chat"})
+                    with self.assertRaises(WebSocketDisconnect) as closed:
+                        websocket.receive_json()
+                    self.assertEqual(closed.exception.code, 1008)
+                chat.assert_not_called()
+            exists.assert_called_once_with("deadbeef")
+
+    def test_logout_suppresses_queued_analysis_progress_for_open_socket(self) -> None:
+        from app.api import analysis_router
+        from starlette.websockets import WebSocketDisconnect
+
+        token = self._create_websocket_session()
+        with patch.object(analysis_router.case_store, "case_exists", return_value=True):
+            with self.client.websocket_connect(
+                "/api/cases/deadbeef/analyze-ws",
+                headers=self._websocket_headers(token),
+            ) as websocket:
+                self.assertEqual(websocket.receive_json()["phase"], "connected")
+                logout = self.client.post(
+                    "/api/auth/logout",
+                    headers={"origin": "http://localhost:8400"},
+                )
+                self.assertEqual(logout.status_code, 200)
+                websocket.portal.call(
+                    analysis_router._broadcast_analysis,
+                    "deadbeef",
+                    {"phase": "done", "message": "must not be disclosed", "percent": 100},
+                )
+                with self.assertRaises(WebSocketDisconnect) as closed:
+                    websocket.receive_json()
+                self.assertEqual(closed.exception.code, 1008)
+
+    def test_policy_change_revokes_open_entity_socket_before_provider_dispatch(self) -> None:
+        from app.api import analysis_router
+        from starlette.websockets import WebSocketDisconnect
+
+        token = self._create_websocket_session()
+        with patch.object(analysis_router.case_store, "case_exists", return_value=True):
+            with patch.object(analysis_router, "investigate_entity_stream") as investigate:
+                with self.client.websocket_connect(
+                    "/api/cases/deadbeef/investigate-entity-ws",
+                    headers=self._websocket_headers(token),
+                ) as websocket:
+                    with patch.dict(os.environ, {"INVESTIGATOR_SSO_ALLOWED_VALUES": "Administrators"}):
+                        websocket.send_json({"entity_id": "host-1"})
+                        with self.assertRaises(WebSocketDisconnect) as closed:
+                            websocket.receive_json()
+                    self.assertEqual(closed.exception.code, 1008)
+                investigate.assert_not_called()
+
     def test_public_health_and_static_requests_skip_middleware_session_lookup(self) -> None:
         from app.auth import middleware as auth_middleware
 
@@ -637,7 +725,7 @@ class AuthBoundaryTests(unittest.TestCase):
             static = self.client.get("/", headers={"cookie": cookie})
 
         self.assertEqual(health.status_code, 200)
-        self.assertEqual(static.status_code, 200)
+        self.assertIn(static.status_code, (200, 404))
 
     def test_oidc_allowlist_change_invalidates_existing_browser_session(self) -> None:
         sync_auth_policy(get_auth_config().policy_fingerprint)

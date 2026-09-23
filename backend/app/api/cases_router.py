@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, WebSoc
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
-from app.api.security import authorize_ws
+from app.api.security import authorize_ws, require_ws_session
 from app.auth.access import require_shared_admin
 from app.config import (
     UPLOAD_STAGING_PREFIX,
@@ -569,12 +569,15 @@ async def ingestion_ws(websocket: WebSocket, case_id: str) -> None:
     await websocket.accept()
     queue = manager.subscribe(case_id)
     try:
+        await require_ws_session(websocket)
         # send current status immediately
         current = manager.get_status(case_id)
         if current:
+            await require_ws_session(websocket)
             await websocket.send_json(current)
         while True:
             payload = await queue.get()
+            await require_ws_session(websocket)
             await websocket.send_json(payload)
             if payload.get("done"):
                 # keep open a moment for final message delivery

@@ -14,6 +14,7 @@ import os
 from urllib.parse import urlsplit
 
 from fastapi import Request, WebSocket
+from starlette.websockets import WebSocketDisconnect
 
 from app.store import cases as case_store
 from app.auth.config import get_auth_config
@@ -102,6 +103,39 @@ def authorize_http(request: Request) -> bool:
     return has_allowed_origin(request.headers.get("origin"))
 
 
+async def authorize_ws_session(websocket: WebSocket) -> bool:
+    """Recheck a WebSocket's browser session against the active auth policy.
+
+    WebSocket handshakes are authenticated once by the ASGI middleware, but a
+    connection can outlive its session. Routes call this before accepting new
+    client work and before sending progress/model output.
+    """
+    config = get_auth_config()
+    if not has_allowed_origin(websocket.headers.get("origin")):
+        await websocket.close(code=1008)
+        return False
+    if not config.enabled:
+        return True
+    if not config.configured or not has_allowed_public_host(websocket.headers.get("host")):
+        await websocket.close(code=1008)
+        return False
+    token = websocket.cookies.get(COOKIE_NAME)
+    if get_session(
+        token,
+        idle_seconds=config.idle_seconds,
+        policy_fingerprint=config.policy_fingerprint,
+    ) is None:
+        await websocket.close(code=1008)
+        return False
+    return True
+
+
+async def require_ws_session(websocket: WebSocket) -> None:
+    """Close and stop route work when a WebSocket session is no longer valid."""
+    if not await authorize_ws_session(websocket):
+        raise WebSocketDisconnect(code=1008)
+
+
 async def authorize_ws(websocket: WebSocket, case_id: str) -> bool:
     """Reject a WebSocket handshake from a disallowed origin or unknown case.
 
@@ -111,18 +145,8 @@ async def authorize_ws(websocket: WebSocket, case_id: str) -> bool:
     ``Origin`` means a non-browser client, which cannot be a cross-site vector.
     Closing before ``accept()`` denies the handshake with an HTTP 403.
     """
-    if not has_allowed_origin(websocket.headers.get("origin")):
-        await websocket.close(code=1008)
+    if not await authorize_ws_session(websocket):
         return False
-    config = get_auth_config()
-    if config.enabled and config.configured:
-        if not has_allowed_public_host(websocket.headers.get("host")):
-            await websocket.close(code=1008)
-            return False
-        token = websocket.cookies.get(COOKIE_NAME)
-        if get_session(token, idle_seconds=config.idle_seconds) is None:
-            await websocket.close(code=1008)
-            return False
     if not case_store.case_exists(case_id):
         await websocket.close(code=1008)
         return False
