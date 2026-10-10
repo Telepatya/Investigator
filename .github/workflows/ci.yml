@@ -54,7 +54,9 @@ jobs:
       # machine. Recompile each lock in place and fail on any difference.
       - name: Check dependency locks are current
         run: |
-          python -m pip install uv
+          # Pin uv: a release that changes lock output formatting would otherwise
+          # fail this drift check on every unrelated pull request.
+          python -m pip install uv==0.11.32
           # Recompile in place, exactly as scripts/update-locks.sh does, then let git
           # report any change. Compiling to a temporary path instead would always
           # differ, because uv records the -o argument in the file header.
@@ -85,8 +87,12 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
+      # The launcher installs requirements-memory.lock (a superset of
+      # requirements.lock that adds the native memory-analysis packages), so audit
+      # that closure. --disable-pip audits the hashed lock directly instead of
+      # building a throwaway virtual environment to resolve it.
       - name: Audit Python dependencies
-        run: pip-audit -r requirements.lock
+        run: pip-audit --disable-pip -r requirements-memory.lock
 
   frontend:
     name: Frontend
