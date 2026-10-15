@@ -18,7 +18,7 @@
     "react-router-dom": "^7.18.2",
     "reactflow": "^11.11.4",
     "vis-data": "^7.1.9",
-    "vis-timeline": "^7.7.3"
+    "vis-timeline": "^8.5.2"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
